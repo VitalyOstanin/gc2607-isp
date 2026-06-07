@@ -174,6 +174,148 @@ pub fn rgb_to_yuyv_crop(
     });
 }
 
+/// Spatially denoise the chroma of a packed YUYV frame in place, leaving luma
+/// untouched.
+///
+/// Low-light sensor noise shows up most objectionably as coloured speckle
+/// (chroma noise), amplified by the CCM's off-diagonal terms. Smoothing only the
+/// Cb/Cr samples removes the speckle while keeping luma — hence perceived
+/// sharpness — intact. `radius` is the box-blur half-width on the chroma grid
+/// and `strength` (0..1) blends the blurred chroma back over the original.
+///
+/// The chroma is already horizontally subsampled by the 4:2:2 packing, so this
+/// operates on the `(w/2) x h` chroma grid: each `[Y0 Cb Y1 Cr]` group is one
+/// chroma sample. `radius == 0` or `strength <= 0` is a no-op.
+pub fn denoise_chroma_yuyv(buf: &mut [u8], w: usize, h: usize, radius: usize, strength: f64) {
+    debug_assert_eq!(buf.len(), w * h * 2);
+    debug_assert!(w % 2 == 0);
+    if radius == 0 || strength <= 0.0 {
+        return;
+    }
+    let cw = w / 2;
+    let mut cb = vec![0u16; cw * h];
+    let mut cr = vec![0u16; cw * h];
+    for y in 0..h {
+        let row = y * w * 2;
+        for c in 0..cw {
+            cb[y * cw + c] = buf[row + 4 * c + 1] as u16;
+            cr[y * cw + c] = buf[row + 4 * c + 3] as u16;
+        }
+    }
+    let cb_b = box_blur_plane(&cb, cw, h, radius);
+    let cr_b = box_blur_plane(&cr, cw, h, radius);
+    let s = strength.clamp(0.0, 1.0);
+    let inv = 1.0 - s;
+    for y in 0..h {
+        let row = y * w * 2;
+        for c in 0..cw {
+            let i = y * cw + c;
+            let nb = (cb[i] as f64 * inv + cb_b[i] as f64 * s).round().clamp(0.0, 255.0) as u8;
+            let nr = (cr[i] as f64 * inv + cr_b[i] as f64 * s).round().clamp(0.0, 255.0) as u8;
+            buf[row + 4 * c + 1] = nb;
+            buf[row + 4 * c + 3] = nr;
+        }
+    }
+}
+
+/// Separable box blur of a single-channel `w x h` plane (values 0..=255 in
+/// `u16`), clamping at the borders. Row passes run in parallel.
+fn box_blur_plane(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
+    // Horizontal pass.
+    let mut tmp = vec![0u16; w * h];
+    tmp.par_chunks_mut(w).enumerate().for_each(|(y, trow)| {
+        let srow = &src[y * w..y * w + w];
+        for (x, t) in trow.iter_mut().enumerate() {
+            let x0 = x.saturating_sub(r);
+            let x1 = (x + r).min(w - 1);
+            let mut sum = 0u32;
+            for v in &srow[x0..=x1] {
+                sum += *v as u32;
+            }
+            *t = (sum / (x1 - x0 + 1) as u32) as u16;
+        }
+    });
+    // Vertical pass.
+    let mut out = vec![0u16; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
+        let y0 = y.saturating_sub(r);
+        let y1 = (y + r).min(h - 1);
+        let n = (y1 - y0 + 1) as u32;
+        for (x, o) in orow.iter_mut().enumerate() {
+            let mut sum = 0u32;
+            for yy in y0..=y1 {
+                sum += tmp[yy * w + x] as u32;
+            }
+            *o = (sum / n) as u16;
+        }
+    });
+    out
+}
+
+/// Temporally denoise the luma of a packed YUYV frame in place, blending each
+/// pixel with the running history in `prev_y`, leaving chroma untouched.
+///
+/// Spatial blur cannot remove temporal luma grain at high gain (per-frame random
+/// noise), so this averages each Y sample against the previous filtered frame
+/// (an IIR low-pass over time), which suppresses grain on a static scene without
+/// softening spatial detail. A per-pixel motion gate fades the blend out where
+/// the frame changes (`|cur - prev| > motion`), so moving regions take the live
+/// pixel and do not ghost.
+///
+/// `prev_y` holds the filtered luma of the previous frame (`w*h` bytes); it is
+/// (re)initialised from the current frame when empty or mismatched, and updated
+/// in place every call so the history stays current even when `alpha == 0`.
+/// `alpha` (0..1) is the maximum temporal weight of the history.
+pub fn temporal_denoise_luma_yuyv(
+    buf: &mut [u8],
+    prev_y: &mut Vec<u8>,
+    w: usize,
+    h: usize,
+    alpha: f64,
+    motion: f64,
+) {
+    debug_assert_eq!(buf.len(), w * h * 2);
+    let n = w * h;
+
+    // First frame (or a size change): seed history, no blend this frame.
+    if prev_y.len() != n {
+        prev_y.clear();
+        prev_y.resize(n, 0);
+        prev_y
+            .par_chunks_mut(w)
+            .zip(buf.par_chunks(w * 2))
+            .for_each(|(prow, brow)| {
+                for (x, p) in prow.iter_mut().enumerate() {
+                    *p = brow[2 * x];
+                }
+            });
+        return;
+    }
+
+    let a = alpha.clamp(0.0, 1.0);
+    let mthr = motion.max(1.0);
+    buf.par_chunks_mut(w * 2)
+        .zip(prev_y.par_chunks_mut(w))
+        .for_each(|(brow, prow)| {
+            for x in 0..w {
+                let cur = brow[2 * x] as f64;
+                if a <= 0.0 {
+                    // Disabled this frame: keep history fresh, leave luma as-is.
+                    prow[x] = brow[2 * x];
+                    continue;
+                }
+                let prev = prow[x] as f64;
+                let diff = (cur - prev).abs();
+                // Motion gate: full weight when still, fading to 0 past `motion`.
+                let gate = (1.0 - diff / mthr).clamp(0.0, 1.0);
+                let eff = a * gate;
+                let y = (cur * (1.0 - eff) + prev * eff).round().clamp(0.0, 255.0) as u8;
+                brow[2 * x] = y;
+                prow[x] = y; // IIR: history is the filtered output
+            }
+        });
+}
+
 /// Full-range BT.601 (JFIF) RGB -> YCbCr.
 #[inline]
 fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
@@ -188,4 +330,120 @@ fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
         cb.round().clamp(0.0, 255.0) as u8,
         cr.round().clamp(0.0, 255.0) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A YUYV frame with a per-pixel luma ramp and a checkerboard chroma. After
+    /// chroma denoise the luma must be byte-identical and the chroma must move
+    /// toward its local mean (128), without touching the frame's byte length.
+    #[test]
+    fn chroma_denoise_smooths_chroma_keeps_luma() {
+        let (w, h) = (8usize, 4usize);
+        let mut buf = vec![0u8; w * h * 2];
+        for y in 0..h {
+            let row = y * w * 2;
+            for c in 0..w / 2 {
+                buf[row + 4 * c] = (10 * c) as u8; // Y0
+                buf[row + 4 * c + 2] = (10 * c + 5) as u8; // Y1
+                // Checkerboard chroma around the 128 neutral: 100 / 156.
+                let v = if (c + y) % 2 == 0 { 100u8 } else { 156u8 };
+                buf[row + 4 * c + 1] = v; // Cb
+                buf[row + 4 * c + 3] = 255 - v; // Cr (also 155 / 99)
+            }
+        }
+        let luma_before: Vec<u8> = (0..w * h).map(|p| buf[p * 2]).collect();
+
+        denoise_chroma_yuyv(&mut buf, w, h, 1, 1.0);
+
+        // Luma (every even byte) untouched.
+        let luma_after: Vec<u8> = (0..w * h).map(|p| buf[p * 2]).collect();
+        assert_eq!(luma_before, luma_after, "luma must be preserved");
+
+        // An interior chroma sample must be pulled toward the 128 neutral.
+        let c = 2usize; // interior column
+        let yq = 1usize; // interior row
+        let cb = buf[yq * w * 2 + 4 * c + 1];
+        assert!(
+            (100..=156).contains(&cb) && (cb as i32 - 128).abs() < (100i32 - 128).abs(),
+            "chroma {cb} should move toward 128 from the 100/156 extremes"
+        );
+    }
+
+    /// Radius 0 (or zero strength) is a no-op.
+    #[test]
+    fn chroma_denoise_zero_radius_is_noop() {
+        let (w, h) = (4usize, 2usize);
+        let mut buf: Vec<u8> = (0..(w * h * 2) as u8).collect();
+        let orig = buf.clone();
+        denoise_chroma_yuyv(&mut buf, w, h, 0, 1.0);
+        assert_eq!(buf, orig);
+        denoise_chroma_yuyv(&mut buf, w, h, 2, 0.0);
+        assert_eq!(buf, orig);
+    }
+
+    /// Build a single-row YUYV frame with the given per-pixel luma; chroma is set
+    /// to a constant marker so the test can confirm it is never touched.
+    fn yuyv_row(luma: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; luma.len() * 2];
+        for (p, &y) in luma.iter().enumerate() {
+            buf[2 * p] = y;
+            buf[2 * p + 1] = 64; // Cb/Cr marker (also covers Cr at odd pairs)
+        }
+        buf
+    }
+
+    /// The first call seeds history without blending; a later static frame is
+    /// pulled toward the history; chroma is preserved throughout.
+    #[test]
+    fn temporal_denoise_blends_luma_keeps_chroma() {
+        let (w, h) = (2usize, 1usize);
+        let mut prev = Vec::new();
+
+        // Seed: history := [200, 200], frame unchanged.
+        let mut buf = yuyv_row(&[200, 200]);
+        temporal_denoise_luma_yuyv(&mut buf, &mut prev, w, h, 0.5, 1000.0);
+        assert_eq!(prev, vec![200, 200]);
+        assert_eq!(buf, yuyv_row(&[200, 200]));
+
+        // New frame luma 100; alpha 0.5, large motion threshold -> gate ~1.
+        // diff=100, gate=1-100/1000=0.9, eff=0.45 -> 100*0.55 + 200*0.45 = 145.
+        let mut buf = yuyv_row(&[100, 100]);
+        temporal_denoise_luma_yuyv(&mut buf, &mut prev, w, h, 0.5, 1000.0);
+        assert_eq!(buf[0], 145);
+        assert_eq!(buf[2], 145);
+        assert_eq!(prev, vec![145, 145]);
+        // Chroma markers intact.
+        assert_eq!(buf[1], 64);
+        assert_eq!(buf[3], 64);
+    }
+
+    /// Motion beyond the threshold disables the blend (gate -> 0), so a fast
+    /// change passes through as the live pixel.
+    #[test]
+    fn temporal_denoise_motion_gate_passes_live_pixel() {
+        let (w, h) = (1usize, 1usize);
+        let mut prev = Vec::new();
+        let mut buf = yuyv_row(&[10]);
+        temporal_denoise_luma_yuyv(&mut buf, &mut prev, w, h, 0.8, 8.0); // seed -> 10
+        let mut buf = yuyv_row(&[200]); // diff 190 >> motion 8 -> gate 0
+        temporal_denoise_luma_yuyv(&mut buf, &mut prev, w, h, 0.8, 8.0);
+        assert_eq!(buf[0], 200);
+        assert_eq!(prev, vec![200]);
+    }
+
+    /// alpha 0 keeps history current but leaves luma unchanged.
+    #[test]
+    fn temporal_denoise_alpha_zero_refreshes_history_only() {
+        let (w, h) = (2usize, 1usize);
+        let mut prev = Vec::new();
+        let mut buf = yuyv_row(&[50, 60]);
+        temporal_denoise_luma_yuyv(&mut buf, &mut prev, w, h, 0.0, 8.0); // seed
+        let mut buf = yuyv_row(&[80, 90]);
+        temporal_denoise_luma_yuyv(&mut buf, &mut prev, w, h, 0.0, 8.0);
+        assert_eq!(buf, yuyv_row(&[80, 90])); // luma untouched
+        assert_eq!(prev, vec![80, 90]); // history advanced
+    }
 }

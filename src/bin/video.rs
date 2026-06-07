@@ -40,7 +40,9 @@ use libcamera::{
 };
 
 use gc2607_isp::ae::{self, AeConfig, AeState};
-use gc2607_isp::output::{rgb_to_yuyv_crop, LoopbackOutput};
+use gc2607_isp::output::{
+    denoise_chroma_yuyv, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv, LoopbackOutput,
+};
 use gc2607_isp::pipeline::{DebayerMode, Processor};
 use gc2607_isp::sensor::Sensor;
 
@@ -111,6 +113,8 @@ struct Args {
     threads: usize,
     lca: bool,
     measure: bool,
+    denoise: f64,
+    temporal: f64,
 }
 
 fn parse_args() -> Args {
@@ -128,6 +132,12 @@ fn parse_args() -> Args {
     let mut lca = true;
     // Sensor apply-delay measurement mode (no loopback, no ISP output).
     let mut measure = false;
+    // Gain-adaptive chroma-denoise strength scaler (0 disables; 1 is the tuned
+    // default; >1 strengthens). See `chroma_denoise_for_gain`.
+    let mut denoise = 1.0f64;
+    // Gain-adaptive temporal luma-denoise scaler (0 disables; 1 is the default;
+    // >1 strengthens). See `temporal_luma_for_gain`.
+    let mut temporal = 1.0f64;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -156,6 +166,10 @@ fn parse_args() -> Args {
             },
             "--no-ae" => ae = false,
             "--no-lca" => lca = false,
+            "--no-denoise" => denoise = 0.0,
+            "--denoise" => denoise = it.next().and_then(|s| s.parse().ok()).unwrap_or(denoise).max(0.0),
+            "--no-temporal" => temporal = 0.0,
+            "--temporal" => temporal = it.next().and_then(|s| s.parse().ok()).unwrap_or(temporal).max(0.0),
             "--measure-delay" => measure = true,
             "--target" => target = it.next().and_then(|s| s.parse().ok()).unwrap_or(target),
             "--max-gain" => max_gain = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_gain),
@@ -163,8 +177,10 @@ fn parse_args() -> Args {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: gc2607-video [--device /dev/videoN] [--backend auto|cpu|gpu] \
-                     [--debayer half|mhc] [--no-ae] [--no-lca] [--target <0..1>] \
-                     [--max-gain <idx>] [--threads <n>] [--measure-delay]"
+                     [--debayer half|mhc] [--no-ae] [--no-lca] [--no-denoise] \
+                     [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
+                     [--target <0..1>] [--max-gain <idx>] [--threads <n>] \
+                     [--measure-delay]"
                 );
                 std::process::exit(0);
             }
@@ -184,8 +200,45 @@ fn parse_args() -> Args {
         threads,
         lca,
         measure,
+        denoise,
+        temporal,
     }
 }
+
+/// Chroma-denoise parameters (box-blur radius on the chroma grid, blend strength
+/// 0..1) for an analogue-gain LUT index, multiplied by the `--denoise` scaler.
+///
+/// Noise grows with analogue gain, so denoise only kicks in as the AE raises
+/// gain in dim light and stays off at low gain to preserve fidelity. The table
+/// is keyed by the gain LUT index (0..16, which doubles every four steps).
+fn chroma_denoise_for_gain(gain_index: u8, scale: f64) -> (usize, f64) {
+    let (radius, base) = match gain_index {
+        0..=3 => (0usize, 0.0f64), // ~1x..1.7x gain: clean enough, no denoise
+        4..=7 => (1, 0.5),         // ~2x..3x
+        8..=11 => (2, 0.7),        // ~4x..7x
+        _ => (3, 0.85),            // ~8x..16x
+    };
+    (radius, (base * scale).clamp(0.0, 1.0))
+}
+
+/// Maximum temporal-blend weight (alpha, 0..1) for an analogue-gain LUT index,
+/// multiplied by the `--temporal` scaler. Off at low gain; ramps up with gain.
+fn temporal_luma_for_gain(gain_index: u8, scale: f64) -> f64 {
+    if scale <= 0.0 {
+        return 0.0;
+    }
+    let base = match gain_index {
+        0..=3 => 0.0f64,
+        4..=7 => 0.40,
+        8..=11 => 0.55,
+        _ => 0.70,
+    };
+    (base * scale).clamp(0.0, 0.95)
+}
+
+/// Motion gate threshold (luma codes) for temporal denoise: above this per-pixel
+/// frame-to-frame change the blend fades out to avoid ghosting on motion.
+const TEMPORAL_MOTION: f64 = 12.0;
 
 /// Output (cropped) size for a debayer mode: a standard 16:9 size centred in
 /// the slightly larger ISP output.
@@ -594,6 +647,13 @@ fn main() {
     let mut report_frames = 0u64;
     // Last metered output luma (0..1), for the periodic telemetry line.
     let mut last_luma = 0f64;
+    // Scratch for the denoise post-pass (only filled when a denoise stage runs),
+    // the temporal-denoise luma history, and the last applied strengths (for
+    // telemetry).
+    let mut denoise_buf: Vec<u8> = Vec::new();
+    let mut prev_y: Vec<u8> = Vec::new();
+    let mut last_dn = 0usize;
+    let mut last_ta = 0f64;
 
     // AE settling: the sensor applies a new exposure/gain with a delay. If we
     // re-meter every frame we issue several corrections before the first takes
@@ -638,7 +698,41 @@ fn main() {
         let processed = match engine.process(buf) {
             Ok(yuyv) => {
                 luma = Some(mean_luma_norm(yuyv));
-                match out.write_frame(yuyv) {
+                // Gain-adaptive denoise on the produced frame. Applied here
+                // (post-process) so it covers both the CPU and GPU backends
+                // uniformly. Chroma is spatial, luma is temporal; both ramp with
+                // analogue gain and are no-ops at low gain (the well-lit common
+                // case), so this whole block is skipped and the frame is written
+                // straight through. When idle the temporal history is dropped so
+                // it re-seeds cleanly (no ghosting) when gain rises again.
+                let (dr, ds) = chroma_denoise_for_gain(state.gain_index, args.denoise);
+                let ta = temporal_luma_for_gain(state.gain_index, args.temporal);
+                last_dn = dr;
+                last_ta = ta;
+                let chroma_on = dr > 0 && ds > 0.0;
+                let temporal_on = ta > 0.0;
+                let frame: &[u8] = if chroma_on || temporal_on {
+                    denoise_buf.clear();
+                    denoise_buf.extend_from_slice(yuyv);
+                    if chroma_on {
+                        denoise_chroma_yuyv(&mut denoise_buf, dst_w, dst_h, dr, ds);
+                    }
+                    if temporal_on {
+                        temporal_denoise_luma_yuyv(
+                            &mut denoise_buf,
+                            &mut prev_y,
+                            dst_w,
+                            dst_h,
+                            ta,
+                            TEMPORAL_MOTION,
+                        );
+                    }
+                    &denoise_buf
+                } else {
+                    prev_y.clear();
+                    yuyv
+                };
+                match out.write_frame(frame) {
                     Ok(()) => true,
                     Err(e) => {
                         eprintln!("loopback write failed: {e}");
@@ -677,7 +771,7 @@ fn main() {
             let fps = report_frames as f64 / last_report.elapsed().as_secs_f64();
             println!(
                 "{frames} frames, {fps:.1} fps processed, {dropped} dropped, \
-                 exposure={} gain_idx={} ({:.1} fps sensor), Y={last_luma:.3}",
+                 exposure={} gain_idx={} ({:.1} fps sensor), Y={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}",
                 state.exposure,
                 state.gain_index,
                 ae::frame_rate(state.vblank),
