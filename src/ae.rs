@@ -22,6 +22,10 @@
 /// (the same table backs the libcamera `CameraSensorHelper`). It is a geometric
 /// progression that doubles every four steps (1.0, 2.0, 4.0, 8.0, 16.0); this
 /// was confirmed empirically (index 8 yields ~4x the mean signal).
+// The first entry is written `64.0 / 64.0` (not `1.0`) to keep the raw register
+// numerator visible in the column, like every other row; clippy::eq_op flags the
+// identical operands, which is intentional here.
+#[allow(clippy::eq_op)]
 pub const GAIN_TABLE: [f64; 17] = [
     64.0 / 64.0,
     75.0 / 64.0,

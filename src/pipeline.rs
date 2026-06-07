@@ -3,7 +3,7 @@
 
 use crate::raw::{RawFrame, H, MAXLIN, W};
 use crate::tuning;
-use crate::tuning_data::{CCM, CCM_CT, CCM_LOCUS, LSC_CHROMA, LSC_GH, LSC_GW, LSC_NUM_LS, NUM_CCM};
+use crate::tuning_data::{CCM, CCM_CT, CCM_LOCUS, LSC_CHROMA, LSC_GH, LSC_GW, NUM_CCM};
 
 #[cfg(feature = "video")]
 use rayon::prelude::*;
@@ -168,8 +168,8 @@ fn interp_ccm(cct: f64) -> [f64; 9] {
     let c = cct.clamp(lo, hi);
     // searchsorted: first index j with CCM_CT[j] >= c (numpy default 'left')
     let mut j = NUM_CCM;
-    for k in 0..NUM_CCM {
-        if (CCM_CT[k] as f64) >= c {
+    for (k, &ct) in CCM_CT.iter().enumerate() {
+        if (ct as f64) >= c {
             j = k;
             break;
         }
@@ -181,9 +181,10 @@ fn interp_ccm(cct: f64) -> [f64; 9] {
         return f9(&CCM[NUM_CCM - 1]);
     }
     let t = (c - CCM_CT[j - 1] as f64) / (CCM_CT[j] as f64 - CCM_CT[j - 1] as f64);
+    let (lo, hi) = (&CCM[j - 1], &CCM[j]);
     let mut out = [0f64; 9];
-    for k in 0..9 {
-        out[k] = CCM[j - 1][k] as f64 * (1.0 - t) + CCM[j][k] as f64 * t;
+    for (o, (&a, &b)) in out.iter_mut().zip(lo.iter().zip(hi.iter())) {
+        *o = a as f64 * (1.0 - t) + b as f64 * t;
     }
     out
 }
@@ -198,8 +199,8 @@ fn f9(m: &[f32; 9]) -> [f64; 9] {
 
 fn select_ls(rg: f64, bg: f64) -> usize {
     let mut best = (f64::INFINITY, 0usize);
-    for k in 0..LSC_NUM_LS {
-        let d = (LSC_CHROMA[k][0] as f64 - rg).hypot(LSC_CHROMA[k][1] as f64 - bg);
+    for (k, c) in LSC_CHROMA.iter().enumerate() {
+        let d = (c[0] as f64 - rg).hypot(c[1] as f64 - bg);
         if d < best.0 {
             best = (d, k);
         }
@@ -614,7 +615,7 @@ fn fill_cfa_lscwb_from_bytes(bytes: &[u8], cfa: &mut [f32], grids: &Grids, gains
     cfa.par_chunks_mut(w).enumerate().for_each(|(y, crow)| {
         let iy = y / 2;
         let r0 = y * STRIDE_SAMPLES;
-        for x in 0..w {
+        for (x, cell) in crow.iter_mut().enumerate() {
             let ix = x / 2;
             let i = (r0 + x) * 2;
             let v = (u16::from_le_bytes([bytes[i], bytes[i + 1]]) as f64 - BLACK as f64).max(0.0);
@@ -624,7 +625,7 @@ fn fill_cfa_lscwb_from_bytes(bytes: &[u8], cfa: &mut [f32], grids: &Grids, gains
                 (1, 0) => (grids.g_b[iy * ww + ix], gains[2]),  // B
                 _ => (grids.g_gb[iy * ww + ix], gains[1]),      // Gb
             };
-            crow[x] = (v * lsc * wb) as f32;
+            *cell = (v * lsc * wb) as f32;
         }
     });
 }

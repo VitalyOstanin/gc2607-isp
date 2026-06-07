@@ -47,7 +47,7 @@ fn json_scalar(json: &str, key: &str) -> f64 {
     let colon = after.find(':').expect("expected ':'");
     let tail = &after[colon + 1..];
     let end = tail
-        .find(|c: char| c == ',' || c == '}' || c == '\n')
+        .find([',', '}', '\n'])
         .unwrap_or(tail.len());
     tail[..end].trim().parse::<f64>().expect("scalar")
 }

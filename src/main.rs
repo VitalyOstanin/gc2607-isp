@@ -70,5 +70,5 @@ fn write_png(path: &str, w: usize, h: usize, rgb: &[u8]) -> io::Result<()> {
     let buf: image::RgbImage = image::ImageBuffer::from_raw(w as u32, h as u32, rgb.to_vec())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffer size mismatch"))?;
     buf.save(path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))
 }

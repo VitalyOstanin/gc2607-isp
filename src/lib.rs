@@ -18,5 +18,10 @@ pub mod sensor;
 #[cfg(feature = "video")]
 pub mod output;
 
+// GPU backend (wgpu / Vulkan): per-pixel ISP stages as compute shaders. Gated to
+// keep the host build dependency-light when not used.
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 pub use pipeline::Estimate;
 pub use raw::{RawFrame, H, MAXLIN, W};

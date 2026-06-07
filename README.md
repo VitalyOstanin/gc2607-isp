@@ -66,12 +66,15 @@ Rust data is generated from the sources by [tools/gen_tuning.py](tools/gen_tunin
 | [src/ae.rs](src/ae.rs) | auto-exposure logic (exposure-priority), std-only, unit-tested |
 | [src/sensor.rs](src/sensor.rs) | V4L2 subdev control (exposure/gain/vblank) via raw ioctls (`video` feature) |
 | [src/output.rs](src/output.rs) | v4l2loopback output, RGB->YUYV pack (`video` feature) |
+| [src/gpu.rs](src/gpu.rs) | GPU backend: `GpuProcessor` + WGSL compute shaders (unpack/LSC/WB, MHC, CCM, gamma, YUYV) (`gpu` feature) |
 | [src/main.rs](src/main.rs) | offline CLI: raw -> PNG/PPM |
 | [src/bin/capture.rs](src/bin/capture.rs) | `gc2607-capture`: grab raw frames via libcamera (`capture` feature) |
-| [src/bin/video.rs](src/bin/video.rs) | `gc2607-video`: live webcam daemon (`capture` feature) |
+| [src/bin/video.rs](src/bin/video.rs) | `gc2607-video`: live webcam daemon (`capture` feature; `--backend gpu` adds `gpu`) |
+| [src/bin/gpu_probe.rs](src/bin/gpu_probe.rs) | `gpu-probe`: minimal Vulkan compute sanity check (`gpu` feature) |
 | [tools/reference_pipeline.py](tools/reference_pipeline.py) | reference pipeline (Python) |
 | [tools/gen_golden.py](tools/gen_golden.py) | golden artifact generation |
 | [tests/golden.rs](tests/golden.rs) | checks the Rust output against the Python reference + reference MHC crate |
+| [tests/gpu.rs](tests/gpu.rs) | checks the GPU backend matches the CPU MHC path within 1 LSB (`gpu`+`video`) |
 
 ## Build and run (offline CLI)
 
@@ -113,7 +116,10 @@ regular webcam.
 ### Build
 
 `gc2607-video` needs the `capture` feature (the `libcamera` crate + clang), so
-it is built in a podman container (Ubuntu 26.04), not on the host:
+it is built in a podman container (Ubuntu 26.04), not on the host. Build with
+`capture,gpu` so the default `auto` backend can use the GPU (the `gpu` feature is
+self-contained — wgpu/Vulkan, mesa ANV on the Intel iGPU — and needs no extra
+runtime beyond a working Vulkan driver):
 
 ```sh
 # build inside the container (image built once from Containerfile)
@@ -122,7 +128,7 @@ podman run --rm --http-proxy=false \
   -v gc2607-cargo-registry:/root/.cargo/registry \
   -v gc2607-cargo-target:/work/target \
   localhost/gc2607-isp-build:latest \
-  cargo build --release --features capture --bin gc2607-video
+  cargo build --release --features capture,gpu --bin gc2607-video
 
 # copy the binary out of the container's target volume to the host
 podman run --rm \
@@ -133,10 +139,14 @@ podman run --rm \
 
 (Build the image first if needed: `podman build -t gc2607-isp-build:latest -f Containerfile .`)
 
+To build a CPU-only binary, drop the `gpu` feature (`--features capture`); then
+`auto` resolves to the CPU path and `--backend gpu` reports an error.
+
 ### Run
 
 ```sh
-./gc2607-video                 # defaults: --debayer mhc --threads 8 (1080p, 30 fps)
+./gc2607-video                 # default: --backend auto (prefer GPU, fall back to CPU), full-res 1080p
+./gc2607-video --backend cpu   # force the CPU path (--debayer mhc --threads 8 by default)
 ```
 
 Then open the loopback node (`/dev/video0` "Virtual Camera") in any app, or
@@ -151,16 +161,23 @@ ffplay -f v4l2 /dev/video0
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--device /dev/videoN` | `/dev/video0` | v4l2loopback output node |
-| `--debayer half\|mhc` | `mhc` | `mhc` = full-res 1920x1080; `half` = 960x540, lighter |
-| `--threads N` | `8` | ISP worker threads (CPU budget; see note) |
+| `--backend auto\|cpu\|gpu` | `auto` | `auto` prefers the GPU and falls back to the CPU if none is available. `gpu` forces the GPU (per-pixel stages as Vulkan compute, AWB on CPU; always full-res MHC, ignores `--debayer`) and fails if it cannot initialise. `cpu` forces the CPU path. GPU needs the `gpu` build feature; without it `auto` is CPU and `gpu` errors. |
+| `--debayer half\|mhc` | `mhc` | `mhc` = full-res 1920x1080; `half` = 960x540, lighter (CPU backend only) |
+| `--threads N` | `8` | ISP worker threads (CPU budget; see note). On the GPU backend only the occasional CPU-side AWB uses them. |
 | `--no-ae` | (AE on) | disable auto-exposure (use current sensor settings) |
 | `--target <0..1>` | `0.35` | AE target mean brightness |
 | `--max-gain <idx>` | `16` | AE max analogue-gain LUT index |
 
 Performance (Core Ultra 185H): `mhc` sustains the sensor's 30 fps at 8 threads
 (~29 at 4); `half` reaches 30 fps at 4 threads (~27 single-threaded). The
-default (`mhc`, 8 threads) maximises quality; lower `--threads` or use `--half`
-to reduce CPU load and heat on a thermally constrained laptop.
+default (`mhc`, 8 threads) maximises quality; lower `--threads` or use
+`--debayer half` to reduce CPU load and heat on a thermally constrained laptop.
+
+The GPU backend produces the same full-res MHC output (validated against the CPU
+path to within 1 LSB, `tests/gpu.rs`) while offloading the per-pixel work. In one
+fixed scene the whole-process CPU use dropped from ~154% (CPU `mhc`, 8 threads)
+to ~37% (GPU) at the same frame rate — roughly a 4x CPU reduction, which matters
+on this thermally constrained laptop.
 
 ## Correctness check (golden)
 
@@ -189,4 +206,4 @@ the tests skip instead of failing. To run them, place a raw frame at
 | 4. AE loop | done | auto-exposure, exposure-priority (target ~35%), hardware-validated |
 | 5. Output | done | write to v4l2loopback `/dev/video0` (binary only, no systemd service) |
 | 6. Performance | done | `Processor` (buffer reuse, AWB/grid caching), parallel front-end + MHC + YUYV pack; 30 fps at full-res |
-| 7. GPU offload | planned | move the pipeline to the iGPU (wgpu/Vulkan compute) |
+| 7. GPU offload | done | `--backend gpu`: per-pixel stages (unpack/BLC/LSC/WB, MHC, CCM, gamma, YUYV pack) as Vulkan compute shaders; AWB on the CPU. ~4x lower CPU at the same frame rate |

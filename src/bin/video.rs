@@ -6,10 +6,16 @@
 //! `--debayer half` and/or fewer `--threads` to trade quality for lower CPU use.
 //! Stale frames are dropped so latency stays low when the ISP falls behind.
 //!
+//! With `--backend gpu` (requires the `gpu` build feature) the per-pixel stages
+//! run as Vulkan compute shaders on the iGPU and AWB stays on the CPU; this
+//! offloads the CPU and always produces full-res 1920x1080 (the `--debayer`
+//! option is ignored on the GPU path).
+//!
 //! Usage:
-//!   gc2607-video [--device /dev/videoN] [--debayer half|mhc] [--no-ae]
-//!                [--target <0..1>] [--max-gain <idx>] [--threads <n>]
+//!   gc2607-video [--device /dev/videoN] [--backend cpu|gpu] [--debayer half|mhc]
+//!                [--no-ae] [--target <0..1>] [--max-gain <idx>] [--threads <n>]
 
+use std::io;
 use std::time::{Duration, Instant};
 
 use libcamera::{
@@ -28,6 +34,48 @@ use gc2607_isp::output::{rgb_to_yuyv_crop, LoopbackOutput};
 use gc2607_isp::pipeline::{DebayerMode, Processor};
 use gc2607_isp::sensor::Sensor;
 
+#[cfg(feature = "gpu")]
+use gc2607_isp::gpu::GpuProcessor;
+
+/// Requested ISP backend. `Auto` (the default) prefers the GPU (Vulkan compute,
+/// full-res MHC) and falls back to the CPU if no GPU is available; `Cpu` forces
+/// the CPU path (rayon, half|mhc); `Gpu` forces the GPU and fails if it cannot
+/// be initialised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+/// Either ISP engine, producing a packed YUYV frame from raw capture bytes. The
+/// CPU engine renders RGB then packs (with the centre crop); the GPU engine
+/// packs YUYV directly in the shader.
+enum Engine {
+    Cpu {
+        proc: Processor,
+        yuyv: Vec<u8>,
+        dst_w: usize,
+        dst_h: usize,
+    },
+    #[cfg(feature = "gpu")]
+    Gpu(GpuProcessor),
+}
+
+impl Engine {
+    fn process(&mut self, buf: &[u8]) -> io::Result<&[u8]> {
+        match self {
+            Engine::Cpu { proc, yuyv, dst_w, dst_h } => {
+                let (w, h, rgb) = proc.process(buf)?;
+                rgb_to_yuyv_crop(rgb, w, h, yuyv, *dst_w, *dst_h);
+                Ok(yuyv)
+            }
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => p.process(buf),
+        }
+    }
+}
+
 const WIDTH: u32 = 1928;
 const HEIGHT: u32 = 1088;
 
@@ -38,6 +86,7 @@ const AWB_INTERVAL: u64 = 8;
 
 struct Args {
     device: String,
+    backend: Backend,
     mode: DebayerMode,
     ae: bool,
     target: f64,
@@ -47,8 +96,10 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut device = "/dev/video0".to_string();
-    // Defaults chosen experimentally (#24): full-res MHC at 8 threads sustains
-    // 30 fps (the sensor cap). Both are overridable via --debayer / --threads.
+    // Default backend is Auto: prefer the GPU (full-res MHC, ~4x lower CPU) and
+    // fall back to the CPU path if no GPU is available. The CPU defaults (#24)
+    // are full-res MHC at 8 threads, overridable via --debayer / --threads.
+    let mut backend = Backend::Auto;
     let mut mode = DebayerMode::Mhc;
     let mut ae = true;
     let mut target = AeConfig::default().target;
@@ -63,6 +114,15 @@ fn parse_args() -> Args {
                     device = v;
                 }
             }
+            "--backend" => match it.next().as_deref() {
+                Some("auto") => backend = Backend::Auto,
+                Some("cpu") => backend = Backend::Cpu,
+                Some("gpu") => backend = Backend::Gpu,
+                other => {
+                    eprintln!("unknown backend: {other:?} (use auto|cpu|gpu)");
+                    std::process::exit(1);
+                }
+            },
             "--debayer" => match it.next().as_deref() {
                 Some("half") => mode = DebayerMode::HalfRes,
                 Some("mhc") => mode = DebayerMode::Mhc,
@@ -77,8 +137,9 @@ fn parse_args() -> Args {
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads).max(1),
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: gc2607-video [--device /dev/videoN] [--debayer half|mhc] \
-                     [--no-ae] [--target <0..1>] [--max-gain <idx>] [--threads <n>]"
+                    "usage: gc2607-video [--device /dev/videoN] [--backend auto|cpu|gpu] \
+                     [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>] \
+                     [--threads <n>]"
                 );
                 std::process::exit(0);
             }
@@ -90,6 +151,7 @@ fn parse_args() -> Args {
     }
     Args {
         device,
+        backend,
         mode,
         ae,
         target,
@@ -107,17 +169,66 @@ fn output_size(mode: DebayerMode) -> (usize, usize) {
     }
 }
 
+/// Resolve the requested backend into a concrete engine, returning it with its
+/// output size. `Auto` tries the GPU first and falls back to the CPU; `Gpu`
+/// exits if the GPU cannot be initialised (or the feature is not compiled).
+fn build_engine(args: &Args) -> (Engine, usize, usize) {
+    #[cfg(feature = "gpu")]
+    if matches!(args.backend, Backend::Auto | Backend::Gpu) {
+        match GpuProcessor::new(AWB_INTERVAL) {
+            Ok(p) => {
+                if args.mode == DebayerMode::HalfRes {
+                    eprintln!("note: GPU backend is always full-res MHC (--debayer half ignored)");
+                }
+                let (w, h) = p.out_dims();
+                println!("isp backend: gpu (full-res MHC)");
+                return (Engine::Gpu(p), w, h);
+            }
+            Err(e) => {
+                if args.backend == Backend::Gpu {
+                    eprintln!("GPU backend requested but unavailable: {e}");
+                    std::process::exit(1);
+                }
+                eprintln!("note: GPU backend unavailable ({e}); falling back to CPU");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    if args.backend == Backend::Gpu {
+        eprintln!("this binary was built without the `gpu` feature; rebuild with --features capture,gpu");
+        std::process::exit(1);
+    }
+
+    // CPU backend (forced, or the Auto fallback).
+    let (dst_w, dst_h) = output_size(args.mode);
+    println!("isp backend: cpu ({:?}, {} threads)", args.mode, args.threads);
+    (
+        Engine::Cpu {
+            proc: Processor::new(args.mode, AWB_INTERVAL),
+            yuyv: vec![0u8; dst_w * dst_h * 2],
+            dst_w,
+            dst_h,
+        },
+        dst_w,
+        dst_h,
+    )
+}
+
 fn main() {
     let args = parse_args();
-    let (dst_w, dst_h) = output_size(args.mode);
 
     // Bound the ISP thread pool to the requested count (the CPU budget is the
-    // user's to set; default is 1).
+    // user's to set). The GPU backend does its pixel work on the iGPU, so the
+    // pool is only used by the occasional CPU-side AWB estimate.
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
         .expect("build rayon pool");
-    println!("isp threads: {}", args.threads);
+
+    // Resolve the backend now (Auto may fall back to CPU), so the output size is
+    // known before the loopback is opened.
+    let (mut engine, dst_w, dst_h) = build_engine(&args);
 
     let sensor = match Sensor::open_gc2607() {
         Ok(s) => {
@@ -196,8 +307,6 @@ fn main() {
         cam.queue_request(req).map_err(|(_, e)| e).unwrap();
     }
 
-    let mut proc = Processor::new(args.mode, AWB_INTERVAL);
-    let mut yuyv = vec![0u8; dst_w * dst_h * 2];
     let mut frames = 0u64;
     let mut dropped = 0u64;
     let mut last_report = Instant::now();
@@ -226,14 +335,19 @@ fn main() {
         let bytes_used = fb.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
         let buf = &plane[..bytes_used];
 
-        // ISP (reuses buffers, caches AWB/CCM across frames).
-        if let Ok((w, h, rgb)) = proc.process(buf) {
-            rgb_to_yuyv_crop(rgb, w, h, &mut yuyv, dst_w, dst_h);
-            if let Err(e) = out.write_frame(&yuyv) {
-                eprintln!("loopback write failed: {e}");
-                break;
-            }
-
+        // ISP (reuses buffers, caches AWB/CCM across frames). The engine returns
+        // a packed YUYV frame (CPU renders RGB then packs; GPU packs in-shader).
+        let processed = match engine.process(buf) {
+            Ok(yuyv) => match out.write_frame(yuyv) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("loopback write failed: {e}");
+                    break;
+                }
+            },
+            Err(_) => false,
+        };
+        if processed {
             // AE from the same frame's brightness.
             if args.ae {
                 if let (Some(m), Some(s)) =

@@ -19,6 +19,13 @@ nix = { version = "0.31", optional = true, default-features = false, features = 
 # Data-parallel ISP for the live runtime. Optional: the offline ISP stays
 # single-threaded and std-only. Thread count is set at runtime (--threads).
 rayon = { version = "1.12", optional = true }
+# GPU backend: the per-pixel pipeline stages run as Vulkan compute shaders via
+# wgpu (mesa ANV on the Intel iGPU). Optional and self-contained — builds on the
+# host without libcamera. pollster blocks on wgpu's async API; bytemuck packs
+# the uniform/buffer structs.
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 # Live video runtime: V4L2 sensor control (AE), v4l2loopback output, and
@@ -26,6 +33,8 @@ rayon = { version = "1.12", optional = true }
 video = ["dep:nix", "dep:rayon"]
 # Raw capture via libcamera (gc2607-capture). Pulls in `video` for AE. Off by default.
 capture = ["dep:libcamera", "video"]
+# GPU backend (wgpu/Vulkan). Self-contained; selectable at runtime (--backend gpu).
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dev-dependencies]
 # Reference Malvar-He-Cutler implementation. Used only by the validation test
@@ -50,6 +59,11 @@ required-features = ["capture"]
 name = "gc2607-video"
 path = "src/bin/video.rs"
 required-features = ["capture"]
+
+[[bin]]
+name = "gpu-probe"
+path = "src/bin/gpu_probe.rs"
+required-features = ["gpu"]
 
 [profile.release]
 opt-level = 3
