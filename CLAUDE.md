@@ -51,15 +51,18 @@ raw SGRBG10 1928x1088
   -> LSC (per Bayer channel, source by scene)  uses data/lsc_grids.bin
   -> AWB robust-neutral (median chroma)
   -> debayer  (half-res now; MHC stage 2)
-  -> CCM (interpolated by CCT)
+  -> CCM hue-sectored (24 sectors), interpolated by CCT   docs/acm-color-model.md
   -> sRGB gamma
   -> RGB8
 ```
 
 WB gains, CCT and the LSC light source are estimated on the post-BLC frame,
 before LSC. Estimation lives in `pipeline::estimate`; the deterministic render
-(LSC -> debayer -> WB -> CCM -> gamma) in `pipeline::render`. Keep these two
-separable — the golden test exercises them independently.
+(LSC -> debayer -> WB -> hue-sectored CCM -> gamma) in `pipeline::render`. Keep
+these two separable — the golden test exercises them independently. The colour
+step (`pipeline::acm_color`, mirrored in `gpu.rs` WGSL and the Python reference)
+applies 24 per-hue-sector matrices, fading to the global CCM near neutral; see
+[docs/acm-color-model.md](docs/acm-color-model.md).
 
 ## Tuning data
 

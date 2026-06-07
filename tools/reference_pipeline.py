@@ -80,6 +80,84 @@ def load_lsc():
     return d["grids"].astype(np.float64), d["chroma"].astype(np.float64)
 
 
+# Hue-sectored colour correction (ACM). Constants mirror pipeline.rs /
+# tuning_data.rs; ACM_HUE0/STEP are derived from the sector edges in the npz.
+ACM_SAT_KNEE = 0.10
+
+
+def load_acm():
+    """Per-sector matrices sorted by CCT (to align with the CCMs), plus the
+    sector-centre hue origin/step. Returns (ccts, advanced, hue0, hue_step) or
+    None if the file is absent."""
+    path = os.path.join(DATA, "gc2607_acm.npz")
+    if not os.path.exists(path):
+        return None
+    z = np.load(path, allow_pickle=True)
+    order = np.argsort(z["cct"].astype(np.int64))
+    ccts = z["cct"].astype(np.float64)[order]
+    advanced = z["advanced"].astype(np.float64)[order]      # (L,S,3,3)
+    edges = np.concatenate([[0], z["hues"].astype(np.float64)])
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    return ccts, advanced, float(centres[0]), float(centres[1] - centres[0])
+
+
+def interp_acm(cct, ccts, advanced):
+    """Interpolate the per-sector matrices by CCT (same bracket as interp_ccm).
+    Returns (S,3,3)."""
+    cct = float(np.clip(cct, ccts[0], ccts[-1]))
+    j = int(np.searchsorted(ccts, cct))
+    if j <= 0:
+        return advanced[0]
+    if j >= len(ccts):
+        return advanced[-1]
+    t = (cct - ccts[j - 1]) / (ccts[j] - ccts[j - 1])
+    return advanced[j - 1] * (1 - t) + advanced[j] * t
+
+
+def apply_acm(rgb01, ccm, sectors, hue0, hue_step):
+    """Hue-sectored colour correction (mirrors pipeline::acm_color). `rgb01` is
+    white-balanced linear RGB (..,3); `ccm` the global 3x3; `sectors` the (S,3,3)
+    per-sector matrices for this CCT. The sector is chosen by the hue of the
+    globally-corrected colour; the result fades to the global CCM at low
+    saturation."""
+    flat = rgb01.reshape(-1, 3)
+    glob = flat @ ccm.T                                     # (P,3) global-corrected
+    linc = np.clip(glob, 0.0, None)
+    r, g, b = linc[:, 0], linc[:, 1], linc[:, 2]
+    mx = linc.max(axis=1)
+    mn = linc.min(axis=1)
+    d = mx - mn
+
+    safe = d > 0.0
+    dd = np.where(safe, d, 1.0)
+    is_r = (r >= g) & (r >= b)
+    is_g = (~is_r) & (g >= b)
+    hr = (g - b) / dd
+    hg = 2.0 + (b - r) / dd
+    hb = 4.0 + (r - g) / dd
+    h = np.where(is_r, hr, np.where(is_g, hg, hb)) * 60.0
+    h = np.where(h < 0.0, h + 360.0, h)
+    h = np.where(safe, h, 0.0)
+
+    sat = np.where(mx > 0.0, d / np.where(mx > 0.0, mx, 1.0), 0.0)
+    w = np.clip(sat / ACM_SAT_KNEE, 0.0, 1.0)
+    w = np.where(safe & (mx > 0.0), w, 0.0)                 # achromatic -> global
+
+    nsec = sectors.shape[0]
+    pos = (h - hue0) / hue_step
+    fi = np.floor(pos)
+    frac = pos - fi
+    ia = (fi.astype(np.int64) % nsec + nsec) % nsec
+    ib = (ia + 1) % nsec
+    sflat = sectors.reshape(nsec, 9)
+    ms = sflat[ia] * (1.0 - frac)[:, None] + sflat[ib] * frac[:, None]   # (P,9)
+    ccmf = ccm.reshape(9)
+    meff = ccmf[None, :] * (1.0 - w)[:, None] + ms * w[:, None]          # (P,9)
+    m = meff.reshape(-1, 3, 3)
+    out = np.einsum("pij,pj->pi", m, flat)
+    return out.reshape(rgb01.shape)
+
+
 def project_to_locus(chroma, locus):
     best = (1e18, locus[0], 0, 0.0)
     p = np.array(chroma)
@@ -138,10 +216,25 @@ def srgb_gamma(x):
                     1.055 * np.power(x, 1 / 2.4) - 0.055)
 
 
+# Highlight-desaturation knee; must match pipeline::HIGHLIGHT_KNEE (Rust/WGSL).
+HIGHLIGHT_KNEE = 0.95
+
+
+def desaturate_highlight(lin):
+    """Blend each pixel toward its max channel as the max approaches full scale,
+    so blown highlights converge to neutral white instead of taking a colour
+    cast (green clips first -> otherwise bright whites tint magenta/purple).
+    `lin` is linear post-white-balance RGB in 0..1 scale."""
+    m = lin.max(axis=-1, keepdims=True)
+    t = np.clip((m - HIGHLIGHT_KNEE) / (1.0 - HIGHLIGHT_KNEE), 0.0, 1.0)
+    return lin + (m - lin) * t
+
+
 def process(raw_path):
     """Run the full pipeline; return (rgb8, meta dict)."""
     ccts, locus, ccms = load_ccm_tuning()
     grids, lsc_chroma = load_lsc()
+    acm = load_acm()
 
     raw = black_level(load_raw(raw_path))
     gr, r, b, gb = bayer_planes(raw)
@@ -158,7 +251,14 @@ def process(raw_path):
     grc, rc, bc, gbc = gr * gmaps[0], r * gmaps[1], b * gmaps[2], gb * gmaps[3]
 
     rgb = planes_to_rgb(grc, rc, bc, gbc) * gains[None, None, :]
-    out = srgb_gamma(apply_ccm(rgb / MAXLIN, ccm))
+    lin = desaturate_highlight(rgb / MAXLIN)
+    if acm is not None:
+        a_ccts, advanced, hue0, hue_step = acm
+        sectors = interp_acm(cct, a_ccts, advanced)
+        corrected = apply_acm(lin, ccm, sectors, hue0, hue_step)
+    else:
+        corrected = apply_ccm(lin, ccm)
+    out = srgb_gamma(corrected)
     rgb8 = (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 
     meta = {

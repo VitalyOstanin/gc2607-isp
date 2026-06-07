@@ -3,7 +3,10 @@
 
 use crate::raw::{RawFrame, H, MAXLIN, W};
 use crate::tuning;
-use crate::tuning_data::{CCM, CCM_CT, CCM_LOCUS, LSC_CHROMA, LSC_GH, LSC_GW, NUM_CCM};
+use crate::tuning_data::{
+    ACM, ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, CCM, CCM_CT, CCM_LOCUS, LCA_CELL_X, LCA_CELL_Y, LCA_GH,
+    LCA_GW, LSC_CHROMA, LSC_GH, LSC_GW, NUM_CCM,
+};
 
 #[cfg(feature = "video")]
 use rayon::prelude::*;
@@ -92,9 +95,46 @@ fn median(values: &mut [f32]) -> f64 {
     }
 }
 
+/// Temporal AWB smoothing factor (exponential moving average on the scene
+/// chroma). The live runtimes re-estimate every few frames; without smoothing
+/// each estimate is applied as a hard step, which reads as the white balance
+/// "resetting" periodically. `new = old + ALPHA * (measured - old)`; smaller is
+/// smoother (slower to follow a real lighting change). Stateless callers
+/// (`estimate`, the golden path) do not smooth.
+pub(crate) const AWB_SMOOTH_ALPHA: f32 = 0.3;
+
+/// LSC light-source switch hysteresis. The chosen source only changes when a
+/// different one is at least `1/LS_HYST` times closer in chroma than the current
+/// one; otherwise the current source is kept. Prevents the whole lens-shading
+/// grid (and its field-wide brightness/colour) from flipping back and forth when
+/// the scene chroma sits between two calibrated sources.
+pub(crate) const LS_HYST: f64 = 0.8;
+
+/// Highlight-desaturation knee in linear post-white-balance scale (0..1). Above
+/// this level a pixel is blended toward its own max channel, so blown highlights
+/// converge to neutral white instead of taking a colour cast — green clips first
+/// (highest sensitivity), so without this, bright whites pick up a magenta/purple
+/// tint once R and B are gained past the clipped green.
+pub(crate) const HIGHLIGHT_KNEE: f64 = 0.95;
+
+/// Blend a linear (post-WB, 0..1-scale) RGB triple toward its max channel as the
+/// max approaches full scale, removing the colour cast on near-clipped
+/// highlights. Below [`HIGHLIGHT_KNEE`] it is a no-op. Mirrored in the WGSL
+/// shader (`gpu.rs`) and the Python reference so all render paths agree.
+#[inline(always)]
+pub(crate) fn desaturate_highlight(r: &mut f64, g: &mut f64, b: &mut f64) {
+    let m = r.max(*g).max(*b);
+    if m > HIGHLIGHT_KNEE {
+        let t = ((m - HIGHLIGHT_KNEE) / (1.0 - HIGHLIGHT_KNEE)).clamp(0.0, 1.0);
+        *r += (m - *r) * t;
+        *g += (m - *g) * t;
+        *b += (m - *b) * t;
+    }
+}
+
 /// Robust-neutral AWB: median chroma over bright, non-clipped pixels, with
 /// graceful fallbacks so the selection never collapses to empty.
-fn robust_neutral(p: &Planes) -> (f32, f32) {
+pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
     let n = p.hh * p.ww;
     let green: Vec<f32> = (0..n).map(|i| 0.5 * (p.gr[i] + p.gb[i])).collect();
     let clip = 0.95 * MAXLIN;
@@ -197,25 +237,182 @@ fn f9(m: &[f32; 9]) -> [f64; 9] {
     o
 }
 
-fn select_ls(rg: f64, bg: f64) -> usize {
+// ---------------------------------------------------------------------------
+// Advanced colour matrices (ACM): hue-sectored colour correction.
+//
+// Beyond the single global CCM, the tuning carries 24 per-hue-sector 3x3
+// matrices (tuning_data::ACM, one set per calibration CCT). Each is a full,
+// luminance-preserving colour matrix that refines the correction for colours in
+// its hue range; the global CCM is the achromatic/neutral fallback. Per pixel we
+// pick the matrix by the hue of the globally-corrected colour, blend the two
+// neighbouring sectors, and fade toward the global CCM as saturation drops (the
+// hue of a near-grey pixel is ill-defined and noisy). The exact device hue model
+// is fixed-function in the camera's image processor and is not reproduced
+// bit-for-bit; this is a faithful, fully-parameterised software equivalent. The
+// arithmetic here is mirrored in the WGSL shader (`gpu.rs`) and the Python
+// reference (`tools/reference_pipeline.py`) so all render paths agree.
+// ---------------------------------------------------------------------------
+
+/// Saturation knee for ACM: below this HSV saturation the global CCM is used,
+/// ramping linearly to full per-sector correction at/above it. Keeps near-grey
+/// pixels (whose hue is dominated by noise) on the stable global matrix.
+pub(crate) const ACM_SAT_KNEE: f64 = 0.10;
+
+/// The 24 per-sector colour matrices interpolated to one scene CCT, ready to
+/// apply per pixel. Built once per frame by [`interp_acm`].
+pub struct AcmFrame {
+    pub mats: [[f64; 9]; ACM_NSEC],
+}
+
+/// Interpolate the per-sector matrices by CCT, identically to [`interp_ccm`]
+/// (same calibration CCTs, same `searchsorted` bracket and linear blend).
+pub fn interp_acm(cct: f64) -> AcmFrame {
+    let lo = CCM_CT[0] as f64;
+    let hi = CCM_CT[NUM_CCM - 1] as f64;
+    let c = cct.clamp(lo, hi);
+    let mut j = NUM_CCM;
+    for (k, &ct) in CCM_CT.iter().enumerate() {
+        if (ct as f64) >= c {
+            j = k;
+            break;
+        }
+    }
+    let mut mats = [[0f64; 9]; ACM_NSEC];
+    if j == 0 {
+        for (s, m) in mats.iter_mut().enumerate() {
+            *m = f9(&ACM[0][s]);
+        }
+        return AcmFrame { mats };
+    }
+    if j >= NUM_CCM {
+        for (s, m) in mats.iter_mut().enumerate() {
+            *m = f9(&ACM[NUM_CCM - 1][s]);
+        }
+        return AcmFrame { mats };
+    }
+    let t = (c - CCM_CT[j - 1] as f64) / (CCM_CT[j] as f64 - CCM_CT[j - 1] as f64);
+    for (s, m) in mats.iter_mut().enumerate() {
+        let (a, b) = (&ACM[j - 1][s], &ACM[j][s]);
+        for k in 0..9 {
+            m[k] = a[k] as f64 * (1.0 - t) + b[k] as f64 * t;
+        }
+    }
+    AcmFrame { mats }
+}
+
+/// Apply the hue-sectored colour correction to one white-balanced linear pixel
+/// `(rl, gl, bl)` (0..1 scale, post-highlight-desaturation). `ccm` is the global
+/// matrix; `acm` the per-sector matrices for this frame's CCT. Returns the
+/// corrected linear RGB (before sRGB gamma). The hue/saturation that select the
+/// sector are taken from the globally-corrected colour `ccm * rgb`.
+#[inline(always)]
+pub(crate) fn acm_color(rl: f64, gl: f64, bl: f64, ccm: &[f64; 9], acm: &AcmFrame) -> (f64, f64, f64) {
+    let g0 = ccm[0] * rl + ccm[1] * gl + ccm[2] * bl;
+    let g1 = ccm[3] * rl + ccm[4] * gl + ccm[5] * bl;
+    let g2 = ccm[6] * rl + ccm[7] * gl + ccm[8] * bl;
+
+    // Hue/saturation of the globally-corrected colour (negatives clamped: a
+    // slightly out-of-gamut corrected value should not flip the dominant hue).
+    let lr = g0.max(0.0);
+    let lg = g1.max(0.0);
+    let lb = g2.max(0.0);
+    let mx = lr.max(lg).max(lb);
+    let mn = lr.min(lg).min(lb);
+    let d = mx - mn;
+    if mx <= 0.0 || d <= 0.0 {
+        return (g0, g1, g2); // achromatic: global CCM only
+    }
+
+    let mut h = if lr >= lg && lr >= lb {
+        (lg - lb) / d
+    } else if lg >= lb {
+        2.0 + (lb - lr) / d
+    } else {
+        4.0 + (lr - lg) / d
+    };
+    h *= 60.0;
+    if h < 0.0 {
+        h += 360.0;
+    }
+    let sat = d / mx;
+    let w = (sat / ACM_SAT_KNEE).clamp(0.0, 1.0);
+
+    // Sector bracket (centres evenly spaced; circular). `pos` is the fractional
+    // sector position; the floor's modulo gives the lower neighbour, wrapping
+    // across the hue circle.
+    let pos = (h - ACM_HUE0 as f64) / ACM_HUE_STEP as f64;
+    let fi = pos.floor();
+    let frac = pos - fi;
+    let ia = (fi as i64).rem_euclid(ACM_NSEC as i64) as usize;
+    let ib = (ia + 1) % ACM_NSEC;
+    let (ma, mb) = (&acm.mats[ia], &acm.mats[ib]);
+
+    // Effective matrix: blend the two neighbouring sectors, then fade between the
+    // global CCM (low saturation) and the sector matrix (high saturation).
+    let mut m = [0f64; 9];
+    for k in 0..9 {
+        let ms = ma[k] * (1.0 - frac) + mb[k] * frac;
+        m[k] = ccm[k] * (1.0 - w) + ms * w;
+    }
+    (
+        m[0] * rl + m[1] * gl + m[2] * bl,
+        m[3] * rl + m[4] * gl + m[5] * bl,
+        m[6] * rl + m[7] * gl + m[8] * bl,
+    )
+}
+
+/// Chroma distance from scene `(rg, bg)` to LSC light source `k`.
+fn ls_dist(k: usize, rg: f64, bg: f64) -> f64 {
+    (LSC_CHROMA[k][0] as f64 - rg).hypot(LSC_CHROMA[k][1] as f64 - bg)
+}
+
+/// Choose the LSC light source nearest the scene chroma, with hysteresis: when
+/// `prev` is given, keep it unless another source is at least `1/LS_HYST` times
+/// closer (see [`LS_HYST`]). `prev = None` (stateless callers) picks the plain
+/// nearest source, matching the original `select_ls`.
+fn select_ls_hyst(rg: f64, bg: f64, prev: Option<usize>) -> usize {
     let mut best = (f64::INFINITY, 0usize);
-    for (k, c) in LSC_CHROMA.iter().enumerate() {
-        let d = (c[0] as f64 - rg).hypot(c[1] as f64 - bg);
+    for k in 0..LSC_CHROMA.len() {
+        let d = ls_dist(k, rg, bg);
         if d < best.0 {
             best = (d, k);
         }
     }
-    best.1
+    match prev {
+        Some(p) if ls_dist(p, rg, bg) <= best.0 / LS_HYST => p,
+        _ => best.1,
+    }
+}
+
+/// Exponentially smooth a freshly measured scene chroma against the previous
+/// (smoothed) value; `None` returns the measurement unchanged (first frame).
+pub(crate) fn smooth_chroma(prev: Option<(f32, f32)>, rg: f32, bg: f32) -> (f32, f32) {
+    match prev {
+        Some((p0, p1)) => (
+            p0 + AWB_SMOOTH_ALPHA * (rg - p0),
+            p1 + AWB_SMOOTH_ALPHA * (bg - p1),
+        ),
+        None => (rg, bg),
+    }
+}
+
+/// Build a full scene estimate (gains, CCT, LSC source, CCM) from an already
+/// chosen scene chroma. `prev_ls` enables LSC switch hysteresis for the live
+/// runtimes; stateless callers pass `None`.
+pub(crate) fn estimate_from_chroma(rg: f32, bg: f32, prev_ls: Option<usize>) -> Estimate {
+    let gains = [1.0 / rg as f64, 1.0, 1.0 / bg as f64];
+    let cct = estimate_cct(rg as f64, bg as f64);
+    let ls = select_ls_hyst(rg as f64, bg as f64, prev_ls);
+    let ccm = interp_ccm(cct);
+    Estimate { chroma: (rg, bg), gains, cct, ls, ccm }
 }
 
 /// Estimate WB gains, CCT, LSC light source and CCM from the (pre-LSC) planes.
+/// Stateless (no temporal smoothing, plain nearest LSC source) — this is the
+/// reference path the golden test pins; the live runtimes smooth on top of it.
 pub fn estimate(p: &Planes) -> Estimate {
     let (rg, bg) = robust_neutral(p);
-    let gains = [1.0 / rg as f64, 1.0, 1.0 / bg as f64];
-    let cct = estimate_cct(rg as f64, bg as f64);
-    let ls = select_ls(rg as f64, bg as f64);
-    let ccm = interp_ccm(cct);
-    Estimate { chroma: (rg, bg), gains, cct, ls, ccm }
+    estimate_from_chroma(rg, bg, None)
 }
 
 /// Bilinear resize of a `gh*gw` grid to `out_h*out_w` (numpy linspace semantics).
@@ -283,7 +480,7 @@ pub fn build_grids(ls: usize, hh: usize, ww: usize) -> Grids {
 
 /// Core half-res render into a caller-owned buffer using pre-resized grids.
 /// `out` must be `p.hh*p.ww*3` bytes. Row-parallel with the `video` feature.
-fn render_half_into(out: &mut [u8], p: &Planes, gains: [f64; 3], ccm: [f64; 9], grids: &Grids) {
+fn render_half_into(out: &mut [u8], p: &Planes, gains: [f64; 3], ccm: [f64; 9], grids: &Grids, acm: &AcmFrame) {
     let inv = 1.0 / MAXLIN as f64;
     let ww = p.ww;
     let (g_gr, g_r, g_b, g_gb) = (&grids.g_gr, &grids.g_r, &grids.g_b, &grids.g_gb);
@@ -297,13 +494,12 @@ fn render_half_into(out: &mut [u8], p: &Planes, gains: [f64; 3], ccm: [f64; 9], 
             let gbc = p.gb[i] as f64 * g_gb[i];
             let gc = 0.5 * (grc + gbc);
 
-            let rl = rc * gains[0] * inv;
-            let gl = gc * gains[1] * inv;
-            let bl = bc * gains[2] * inv;
+            let mut rl = rc * gains[0] * inv;
+            let mut gl = gc * gains[1] * inv;
+            let mut bl = bc * gains[2] * inv;
+            desaturate_highlight(&mut rl, &mut gl, &mut bl);
 
-            let cr = ccm[0] * rl + ccm[1] * gl + ccm[2] * bl;
-            let cg = ccm[3] * rl + ccm[4] * gl + ccm[5] * bl;
-            let cb = ccm[6] * rl + ccm[7] * gl + ccm[8] * bl;
+            let (cr, cg, cb) = acm_color(rl, gl, bl, &ccm, acm);
 
             orow[x * 3] = (srgb(cr) * 255.0 + 0.5) as u8;
             orow[x * 3 + 1] = (srgb(cg) * 255.0 + 0.5) as u8;
@@ -313,11 +509,14 @@ fn render_half_into(out: &mut [u8], p: &Planes, gains: [f64; 3], ccm: [f64; 9], 
 }
 
 /// Render RGB8 (row-major `hh*ww*3`) from planes using given gains/CCM/LSC src.
-/// Pipeline: LSC -> half-res debayer -> WB -> CCM -> sRGB gamma.
-pub fn render(p: &Planes, gains: [f64; 3], ccm: [f64; 9], ls: usize) -> Vec<u8> {
+/// Pipeline: LSC -> half-res debayer -> WB -> hue-sectored CCM -> sRGB gamma.
+/// `cct` selects the per-sector matrices (and must be the same CCT the `ccm` was
+/// interpolated for).
+pub fn render(p: &Planes, gains: [f64; 3], ccm: [f64; 9], cct: f64, ls: usize) -> Vec<u8> {
     let grids = build_grids(ls, p.hh, p.ww);
+    let acm = interp_acm(cct);
     let mut out = vec![0u8; p.hh * p.ww * 3];
-    render_half_into(&mut out, p, gains, ccm, &grids);
+    render_half_into(&mut out, p, gains, ccm, &grids, &acm);
     out
 }
 
@@ -470,16 +669,15 @@ pub fn mhc_debayer(cfa: &[f32], w: usize, h: usize) -> Vec<f32> {
 /// (LSC+WB-applied) CFA into RGB8, row-parallel, with no planar intermediate.
 /// Interior pixels take the unclamped fast path; the 2-pixel border uses the
 /// clamped [`mhc_rgb_at`]. sRGB uses the LUT (see [`srgb255`]).
-fn render_mhc_fused_into(out: &mut [u8], cfa: &[f32], w: usize, h: usize, ccm: [f64; 9]) {
+fn render_mhc_fused_into(out: &mut [u8], cfa: &[f32], w: usize, h: usize, ccm: [f64; 9], acm: &AcmFrame) {
     let inv = 1.0 / MAXLIN as f64;
     let lut = srgb255_lut();
     let color = |r: f32, g: f32, b: f32, orow: &mut [u8], x: usize| {
-        let rl = r as f64 * inv;
-        let gl = g as f64 * inv;
-        let bl = b as f64 * inv;
-        let cr = ccm[0] * rl + ccm[1] * gl + ccm[2] * bl;
-        let cg = ccm[3] * rl + ccm[4] * gl + ccm[5] * bl;
-        let cb = ccm[6] * rl + ccm[7] * gl + ccm[8] * bl;
+        let mut rl = r as f64 * inv;
+        let mut gl = g as f64 * inv;
+        let mut bl = b as f64 * inv;
+        desaturate_highlight(&mut rl, &mut gl, &mut bl);
+        let (cr, cg, cb) = acm_color(rl, gl, bl, &ccm, acm);
         orow[x * 3] = srgb255(lut, cr);
         orow[x * 3 + 1] = srgb255(lut, cg);
         orow[x * 3 + 2] = srgb255(lut, cb);
@@ -509,12 +707,157 @@ fn render_mhc_fused_into(out: &mut [u8], cfa: &[f32], w: usize, h: usize, ccm: [
     });
 }
 
+// ---------------------------------------------------------------------------
+// Lateral chromatic aberration correction (full-res MHC path only).
+//
+// The red and blue channels are shifted sub-pixel relative to green by the lens;
+// the .aiqb ships per-location shift grids (see tuning_data::LCA_*). We correct
+// by resampling the demosaiced R and B planes at the green-aligned position
+// `(x + shift)`, which requires the demosaiced neighbours — hence the full-res
+// MHC path renders into a planar RGB buffer first, then resamples + colours it.
+// The shifts are well under one pixel, so the effect is a small reduction of
+// coloured fringing toward the corners. Half-res keeps the fused path (no LCA).
+// ---------------------------------------------------------------------------
+
+/// The four embedded lateral-chromatic-aberration shift grids (native px),
+/// order blue_x, blue_y, red_x, red_y.
+pub struct Lca {
+    bx: Vec<f32>,
+    by: Vec<f32>,
+    rx: Vec<f32>,
+    ry: Vec<f32>,
+}
+
+impl Lca {
+    /// Load the grids from the embedded tuning blob.
+    pub fn load() -> Self {
+        Lca {
+            bx: tuning::lca_grid(0),
+            by: tuning::lca_grid(1),
+            rx: tuning::lca_grid(2),
+            ry: tuning::lca_grid(3),
+        }
+    }
+
+    /// The four grids as slices in (blue_x, blue_y, red_x, red_y) order, for
+    /// callers that upload them elsewhere (the GPU backend).
+    pub fn grids(&self) -> [&[f32]; 4] {
+        [&self.bx, &self.by, &self.rx, &self.ry]
+    }
+}
+
+/// Bilinear sample of an `LCA_GH*LCA_GW` shift grid at native pixel `(px, py)`.
+#[inline]
+fn lca_sample(grid: &[f32], px: f32, py: f32) -> f32 {
+    let gx = (px / LCA_CELL_X).clamp(0.0, (LCA_GW - 1) as f32);
+    let gy = (py / LCA_CELL_Y).clamp(0.0, (LCA_GH - 1) as f32);
+    let x0 = gx.floor() as usize;
+    let x1 = (x0 + 1).min(LCA_GW - 1);
+    let y0 = gy.floor() as usize;
+    let y1 = (y0 + 1).min(LCA_GH - 1);
+    let fx = gx - x0 as f32;
+    let fy = gy - y0 as f32;
+    let top = grid[y0 * LCA_GW + x0] * (1.0 - fx) + grid[y0 * LCA_GW + x1] * fx;
+    let bot = grid[y1 * LCA_GW + x0] * (1.0 - fx) + grid[y1 * LCA_GW + x1] * fx;
+    top * (1.0 - fy) + bot * fy
+}
+
+/// Bilinear sample of a `w*h` channel plane at float `(sx, sy)`, edge-clamped.
+#[inline]
+fn plane_sample(p: &[f32], w: usize, h: usize, sx: f32, sy: f32) -> f32 {
+    let x = sx.clamp(0.0, (w - 1) as f32);
+    let y = sy.clamp(0.0, (h - 1) as f32);
+    let x0 = x.floor() as usize;
+    let x1 = (x0 + 1).min(w - 1);
+    let y0 = y.floor() as usize;
+    let y1 = (y0 + 1).min(h - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let top = p[y0 * w + x0] * (1.0 - fx) + p[y0 * w + x1] * fx;
+    let bot = p[y1 * w + x0] * (1.0 - fx) + p[y1 * w + x1] * fx;
+    top * (1.0 - fy) + bot * fy
+}
+
+/// MHC debayer of `cfa` (LSC+WB-applied, GRBG) into a planar `[R | G | B]`
+/// buffer (`3*w*h`), row-parallel with the `video` feature. Interior pixels use
+/// the unclamped fast path; the 2-pixel border uses the clamped accessor.
+fn mhc_to_planar_into(planar: &mut [f32], cfa: &[f32], w: usize, h: usize) {
+    let plane = w * h;
+    let (rp, rest) = planar.split_at_mut(plane);
+    let (gp, bp) = rest.split_at_mut(plane);
+    let fill = |y: usize, rr: &mut [f32], gr: &mut [f32], br: &mut [f32]| {
+        if y >= 2 && y + 2 < h {
+            let yp = y & 1;
+            let row = y * w;
+            for x in 0..2 {
+                let (r, g, b) = mhc_rgb_at(cfa, w, h, y, x);
+                (rr[x], gr[x], br[x]) = (r, g, b);
+            }
+            for x in 2..w - 2 {
+                let (r, g, b) = mhc_rgb_interior(cfa, w, row + x, yp, x & 1);
+                (rr[x], gr[x], br[x]) = (r, g, b);
+            }
+            for x in w - 2..w {
+                let (r, g, b) = mhc_rgb_at(cfa, w, h, y, x);
+                (rr[x], gr[x], br[x]) = (r, g, b);
+            }
+        } else {
+            for x in 0..w {
+                let (r, g, b) = mhc_rgb_at(cfa, w, h, y, x);
+                (rr[x], gr[x], br[x]) = (r, g, b);
+            }
+        }
+    };
+    #[cfg(feature = "video")]
+    rp.par_chunks_mut(w)
+        .zip(gp.par_chunks_mut(w))
+        .zip(bp.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, ((rr, gr), br))| fill(y, rr, gr, br));
+    #[cfg(not(feature = "video"))]
+    rp.chunks_mut(w)
+        .zip(gp.chunks_mut(w))
+        .zip(bp.chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, ((rr, gr), br))| fill(y, rr, gr, br));
+}
+
+/// Stage 2 of the full-res LCA path: per output pixel, take green from the
+/// planar buffer, resample red/blue at their green-aligned (LCA-shifted)
+/// positions, then highlight-desaturate, CCM and sRGB gamma into RGB8.
+fn render_lca_color_into(out: &mut [u8], planar: &[f32], w: usize, h: usize, ccm: [f64; 9], acm: &AcmFrame, lca: &Lca) {
+    let plane = w * h;
+    let inv = 1.0 / MAXLIN as f64;
+    let lut = srgb255_lut();
+    let (rp, rest) = planar.split_at(plane);
+    let (gp, bp) = rest.split_at(plane);
+    for_each_row_mut(out, w * 3, |y, orow| {
+        let fy = y as f32;
+        for x in 0..w {
+            let fx = x as f32;
+            let g = gp[y * w + x];
+            let r = plane_sample(rp, w, h, fx + lca_sample(&lca.rx, fx, fy), fy + lca_sample(&lca.ry, fx, fy));
+            let b = plane_sample(bp, w, h, fx + lca_sample(&lca.bx, fx, fy), fy + lca_sample(&lca.by, fx, fy));
+            let mut rl = r as f64 * inv;
+            let mut gl = g as f64 * inv;
+            let mut bl = b as f64 * inv;
+            desaturate_highlight(&mut rl, &mut gl, &mut bl);
+            let (cr, cg, cb) = acm_color(rl, gl, bl, &ccm, acm);
+            orow[x * 3] = srgb255(lut, cr);
+            orow[x * 3 + 1] = srgb255(lut, cg);
+            orow[x * 3 + 2] = srgb255(lut, cb);
+        }
+    });
+}
+
 /// Full-resolution render: LSC + per-channel WB applied to the Bayer frame,
-/// then MHC debayer, then CCM and sRGB gamma. Returns (W, H, RGB8).
-pub fn render_mhc(raw: &RawFrame, gains: [f64; 3], ccm: [f64; 9], ls: usize) -> (usize, usize, Vec<u8>) {
+/// then MHC debayer, then lateral-CA correction, CCM and sRGB gamma. Returns
+/// (W, H, RGB8).
+pub fn render_mhc(raw: &RawFrame, gains: [f64; 3], ccm: [f64; 9], cct: f64, ls: usize) -> (usize, usize, Vec<u8>) {
     let (w, h) = (raw.w, raw.h);
     let (ww, hh) = (w / 2, h / 2);
     let grids = build_grids(ls, hh, ww);
+    let acm = interp_acm(cct);
 
     // Apply LSC and white balance on the Bayer frame, per channel (GRBG).
     let mut cfa = vec![0f32; w * h];
@@ -533,8 +876,11 @@ pub fn render_mhc(raw: &RawFrame, gains: [f64; 3], ccm: [f64; 9], ls: usize) -> 
         }
     });
 
+    let mut planar = vec![0f32; 3 * w * h];
+    mhc_to_planar_into(&mut planar, &cfa, w, h);
+    let lca = Lca::load();
     let mut rgb = vec![0u8; w * h * 3];
-    render_mhc_fused_into(&mut rgb, &cfa, w, h, ccm);
+    render_lca_color_into(&mut rgb, &planar, w, h, ccm, &acm, &lca);
     (w, h, rgb)
 }
 
@@ -542,7 +888,7 @@ pub fn render_mhc(raw: &RawFrame, gains: [f64; 3], ccm: [f64; 9], ls: usize) -> 
 pub fn process(raw: &RawFrame) -> (usize, usize, Vec<u8>, Estimate) {
     let planes = bayer_planes(raw);
     let est = estimate(&planes);
-    let rgb = render(&planes, est.gains, est.ccm, est.ls);
+    let rgb = render(&planes, est.gains, est.ccm, est.cct, est.ls);
     (planes.ww, planes.hh, rgb, est)
 }
 
@@ -553,7 +899,7 @@ pub fn process_with(raw: &RawFrame, mode: DebayerMode) -> (usize, usize, Vec<u8>
         DebayerMode::Mhc => {
             let planes = bayer_planes(raw);
             let est = estimate(&planes);
-            let (w, h, rgb) = render_mhc(raw, est.gains, est.ccm, est.ls);
+            let (w, h, rgb) = render_mhc(raw, est.gains, est.ccm, est.cct, est.ls);
             (w, h, rgb, est)
         }
     }
@@ -643,13 +989,19 @@ pub struct Processor {
     out: Vec<u8>,
     grids: Option<Grids>,
     est: Option<Estimate>,
+    acm: Option<AcmFrame>,
+    chroma: Option<(f32, f32)>,
+    planar: Vec<f32>,
+    lca: Option<Lca>,
 }
 
 #[cfg(feature = "video")]
 impl Processor {
     /// Create a processor for `mode`, re-estimating AWB/CCM every
     /// `awb_interval` frames (clamped to >= 1; the first frame always estimates).
-    pub fn new(mode: DebayerMode, awb_interval: u64) -> Self {
+    /// `lca` enables lateral-chromatic-aberration correction; it only applies to
+    /// the full-res MHC mode (half-res ignores it).
+    pub fn new(mode: DebayerMode, awb_interval: u64, lca: bool) -> Self {
         let (ww, hh) = (W / 2, H / 2);
         let planes = Planes {
             hh,
@@ -663,6 +1015,10 @@ impl Processor {
             DebayerMode::HalfRes => (Vec::new(), vec![0u8; hh * ww * 3]),
             DebayerMode::Mhc => (vec![0f32; W * H], vec![0u8; W * H * 3]),
         };
+        let (planar, lca) = match (mode, lca) {
+            (DebayerMode::Mhc, true) => (vec![0f32; 3 * W * H], Some(Lca::load())),
+            _ => (Vec::new(), None),
+        };
         Processor {
             mode,
             interval: awb_interval.max(1),
@@ -672,6 +1028,10 @@ impl Processor {
             out,
             grids: None,
             est: None,
+            acm: None,
+            chroma: None,
+            planar,
+            lca,
         }
     }
 
@@ -681,12 +1041,23 @@ impl Processor {
     }
 
     /// Re-estimate from the current (BLC) planes and rebuild the LSC grids if
-    /// the chosen light source changed.
+    /// the chosen light source changed. The scene chroma is exponentially
+    /// smoothed across estimates (see [`AWB_SMOOTH_ALPHA`]) and the LSC source
+    /// switch is hysteretic (see [`LS_HYST`]), so white balance follows lighting
+    /// changes gradually instead of stepping every interval. The first frame has
+    /// no history, so it reproduces the stateless [`estimate`] exactly.
     fn reestimate(&mut self) {
-        let est = estimate(&self.planes);
+        let (rg, bg) = robust_neutral(&self.planes);
+        let (srg, sbg) = smooth_chroma(self.chroma, rg, bg);
+        self.chroma = Some((srg, sbg));
+        let prev_ls = self.est.as_ref().map(|e| e.ls);
+        let est = estimate_from_chroma(srg, sbg, prev_ls);
         if self.grids.as_ref().map(|g| g.ls) != Some(est.ls) {
             self.grids = Some(build_grids(est.ls, self.planes.hh, self.planes.ww));
         }
+        // The per-sector matrices depend only on CCT; rebuilding them every
+        // estimate is cheap (24 matrices x 9 lerps) and keeps them in step.
+        self.acm = Some(interp_acm(est.cct));
         self.est = Some(est);
     }
 
@@ -710,8 +1081,8 @@ impl Processor {
                 }
                 let gains = self.est.as_ref().unwrap().gains;
                 let ccm = self.est.as_ref().unwrap().ccm;
-                let Self { out, planes, grids, .. } = &mut *self;
-                render_half_into(out, planes, gains, ccm, grids.as_ref().unwrap());
+                let Self { out, planes, grids, acm, .. } = &mut *self;
+                render_half_into(out, planes, gains, ccm, grids.as_ref().unwrap(), acm.as_ref().unwrap());
             }
             DebayerMode::Mhc => {
                 if estimating {
@@ -724,9 +1095,16 @@ impl Processor {
                     let Self { cfa, grids, .. } = &mut *self;
                     fill_cfa_lscwb_from_bytes(bytes, cfa, grids.as_ref().unwrap(), gains);
                 }
-                {
-                    let Self { out, cfa, .. } = &mut *self;
-                    render_mhc_fused_into(out, cfa, W, H, ccm);
+                if self.lca.is_some() {
+                    {
+                        let Self { planar, cfa, .. } = &mut *self;
+                        mhc_to_planar_into(planar, cfa, W, H);
+                    }
+                    let Self { out, planar, lca, acm, .. } = &mut *self;
+                    render_lca_color_into(out, planar, W, H, ccm, acm.as_ref().unwrap(), lca.as_ref().unwrap());
+                } else {
+                    let Self { out, cfa, acm, .. } = &mut *self;
+                    render_mhc_fused_into(out, cfa, W, H, ccm, acm.as_ref().unwrap());
                 }
             }
         }

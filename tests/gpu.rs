@@ -36,12 +36,12 @@ fn gpu_yuyv_matches_cpu_mhc() {
     let frame = raw::load_blc(&raw_path).expect("raw");
     let planes = pipeline::bayer_planes(&frame);
     let est = pipeline::estimate(&planes);
-    let (w, h, rgb) = pipeline::render_mhc(&frame, est.gains, est.ccm, est.ls);
+    let (w, h, rgb) = pipeline::render_mhc(&frame, est.gains, est.ccm, est.cct, est.ls);
     let mut cpu = vec![0u8; OUT_W * OUT_H * 2];
     rgb_to_yuyv_crop(&rgb, w, h, &mut cpu, OUT_W, OUT_H);
 
     // GPU path.
-    let mut proc = match GpuProcessor::new(8) {
+    let mut proc = match GpuProcessor::new(8, true) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("gpu: skipped (no usable Vulkan device: {e})");

@@ -89,12 +89,13 @@ fn render_matches_reference() {
     let golden = std::fs::read_to_string(data("golden.json")).expect("golden.json");
     let gains_v = json_number_array(&golden, "gains");
     let ccm_v = json_number_array(&golden, "ccm");
+    let cct = json_scalar(&golden, "cct");
     let ls = json_scalar(&golden, "lsc_ls") as usize;
     let gains = [gains_v[0], gains_v[1], gains_v[2]];
     let mut ccm = [0f64; 9];
     ccm.copy_from_slice(&ccm_v[..9]);
 
-    let rgb = pipeline::render(&planes, gains, ccm, ls);
+    let rgb = pipeline::render(&planes, gains, ccm, cct, ls);
     let expected = std::fs::read(data("golden_render.bin")).expect("golden_render.bin");
     assert_eq!(rgb.len(), expected.len(), "render size mismatch");
 
@@ -168,7 +169,7 @@ fn processor_matches_process_halfres() {
     let frame = raw::load_blc(data("sample-raw.bin")).expect("raw");
     let (_, _, expected, _) = pipeline::process(&frame);
 
-    let mut proc = pipeline::Processor::new(pipeline::DebayerMode::HalfRes, 8);
+    let mut proc = pipeline::Processor::new(pipeline::DebayerMode::HalfRes, 8, true);
     let (w, h, got) = proc.process(&bytes).expect("processor");
     assert_eq!((w, h), (frame.w / 2, frame.h / 2), "size mismatch");
     assert_eq!(got, &expected[..], "processor diverges from process()");

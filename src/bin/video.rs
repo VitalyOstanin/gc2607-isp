@@ -92,6 +92,7 @@ struct Args {
     target: f64,
     max_gain: u8,
     threads: usize,
+    lca: bool,
 }
 
 fn parse_args() -> Args {
@@ -105,6 +106,8 @@ fn parse_args() -> Args {
     let mut target = AeConfig::default().target;
     let mut max_gain = AeConfig::default().max_gain_index;
     let mut threads = 8usize;
+    // Lateral chromatic aberration correction (full-res MHC only); on by default.
+    let mut lca = true;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -132,14 +135,15 @@ fn parse_args() -> Args {
                 }
             },
             "--no-ae" => ae = false,
+            "--no-lca" => lca = false,
             "--target" => target = it.next().and_then(|s| s.parse().ok()).unwrap_or(target),
             "--max-gain" => max_gain = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_gain),
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads).max(1),
             "-h" | "--help" => {
                 eprintln!(
                     "usage: gc2607-video [--device /dev/videoN] [--backend auto|cpu|gpu] \
-                     [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>] \
-                     [--threads <n>]"
+                     [--debayer half|mhc] [--no-ae] [--no-lca] [--target <0..1>] \
+                     [--max-gain <idx>] [--threads <n>]"
                 );
                 std::process::exit(0);
             }
@@ -157,6 +161,7 @@ fn parse_args() -> Args {
         target,
         max_gain,
         threads,
+        lca,
     }
 }
 
@@ -175,13 +180,13 @@ fn output_size(mode: DebayerMode) -> (usize, usize) {
 fn build_engine(args: &Args) -> (Engine, usize, usize) {
     #[cfg(feature = "gpu")]
     if matches!(args.backend, Backend::Auto | Backend::Gpu) {
-        match GpuProcessor::new(AWB_INTERVAL) {
+        match GpuProcessor::new(AWB_INTERVAL, args.lca) {
             Ok(p) => {
                 if args.mode == DebayerMode::HalfRes {
                     eprintln!("note: GPU backend is always full-res MHC (--debayer half ignored)");
                 }
                 let (w, h) = p.out_dims();
-                println!("isp backend: gpu (full-res MHC)");
+                println!("isp backend: gpu (full-res MHC, lca={})", args.lca);
                 return (Engine::Gpu(p), w, h);
             }
             Err(e) => {
@@ -202,10 +207,13 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
 
     // CPU backend (forced, or the Auto fallback).
     let (dst_w, dst_h) = output_size(args.mode);
-    println!("isp backend: cpu ({:?}, {} threads)", args.mode, args.threads);
+    println!(
+        "isp backend: cpu ({:?}, {} threads, lca={})",
+        args.mode, args.threads, args.lca
+    );
     (
         Engine::Cpu {
-            proc: Processor::new(args.mode, AWB_INTERVAL),
+            proc: Processor::new(args.mode, AWB_INTERVAL, args.lca),
             yuyv: vec![0u8; dst_w * dst_h * 2],
             dst_w,
             dst_h,

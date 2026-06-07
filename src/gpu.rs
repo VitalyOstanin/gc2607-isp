@@ -9,9 +9,11 @@
 //!     rebuilt on the CPU and uploaded once.
 //!   - GPU pass 1 (`build_cfa`): unpack SGRBG10 -> black level -> LSC -> per
 //!     channel white balance, into a full-res CFA buffer.
-//!   - GPU pass 2 (`render_pack`): Malvar-He-Cutler debayer -> CCM -> sRGB gamma
-//!     -> full-range BT.601 YCbCr -> packed YUYV, with the centre crop applied,
-//!     straight into the output buffer (no CPU `rgb_to_yuyv_crop`).
+//!   - GPU pass 2 (`render_pack`): Malvar-He-Cutler debayer -> hue-sectored CCM
+//!     -> sRGB gamma -> full-range BT.601 YCbCr -> packed YUYV, with the centre
+//!     crop applied, straight into the output buffer (no CPU `rgb_to_yuyv_crop`).
+//!     The 24 per-sector matrices for the scene CCT are uploaded per re-estimate;
+//!     see `docs/acm-color-model.md`.
 //!
 //! Only the full-res MHC path is implemented on the GPU (the heavy case the GPU
 //! is meant to offload); half-res stays on the CPU. The arithmetic mirrors
@@ -21,8 +23,9 @@
 
 use std::io;
 
-use crate::pipeline::{self, Estimate};
+use crate::pipeline::{self, ACM_SAT_KNEE, Estimate, Lca, interp_acm};
 use crate::raw::{BLACK, H, MAXLIN, RawFrame, STRIDE_SAMPLES, W};
+use crate::tuning_data::{ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, LCA_CELL_X, LCA_CELL_Y, LCA_GH, LCA_GW};
 
 /// Output (centre-cropped) size for the GPU MHC path: 1920x1080 from 1928x1088.
 pub const OUT_W: usize = 1920;
@@ -44,6 +47,8 @@ struct Params {
     ccm0: [f32; 4],     // ccm[0..3]
     ccm1: [f32; 4],     // ccm[3..6]
     ccm2: [f32; 4],     // ccm[6..9]
+    lca: [f32; 4],      // lca grid_w, grid_h, cell_x, cell_y
+    acm_cfg: [f32; 4],  // hue0, hue_step, sat_knee, nsec
 }
 
 const SHADER: &str = r#"
@@ -56,6 +61,8 @@ struct Params {
     ccm0: vec4<f32>,
     ccm1: vec4<f32>,
     ccm2: vec4<f32>,
+    lca: vec4<f32>,
+    acm_cfg: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -66,6 +73,11 @@ struct Params {
 @group(0) @binding(5) var<storage, read> g_gb: array<f32>;
 @group(0) @binding(6) var<storage, read_write> cfa: array<f32>;
 @group(0) @binding(7) var<storage, read_write> yuyv: array<u32>;
+@group(0) @binding(8) var<storage, read_write> rgb: array<f32>;
+@group(0) @binding(9) var<storage, read> lca: array<f32>;
+// Per-sector colour matrices for this frame's CCT: 9 floats per sector
+// (row-major 3x3), nsec sectors, concatenated. Uploaded on each re-estimate.
+@group(0) @binding(10) var<storage, read> acm: array<f32>;
 
 // Pass 1: unpack + black level + LSC + white balance into the full-res CFA.
 @compute @workgroup_size(64)
@@ -101,6 +113,9 @@ fn build_cfa(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     cfa[idx] = v * lsc * gain;
 }
+
+// Highlight-desaturation knee; must match pipeline::HIGHLIGHT_KNEE.
+const HIGHLIGHT_KNEE: f32 = 0.95;
 
 fn srgb(x: f32) -> f32 {
     let v = clamp(x, 0.0, 1.0);
@@ -138,16 +153,73 @@ fn mhc(y: u32, x: u32) -> vec3<f32> {
     else { return vec3<f32>(at_g_vcol, c, at_g_hrow); }                            // Gb
 }
 
-// Linear CFA-scale RGB -> CCM -> sRGB gamma -> 0..255 (rounded).
-fn to_rgb8(lin: vec3<f32>) -> vec3<f32> {
-    let s = lin * P.consts.y; // * inv_maxlin
-    let cr = P.ccm0.x * s.x + P.ccm0.y * s.y + P.ccm0.z * s.z;
-    let cg = P.ccm1.x * s.x + P.ccm1.y * s.y + P.ccm1.z * s.z;
-    let cb = P.ccm2.x * s.x + P.ccm2.y * s.y + P.ccm2.z * s.z;
+// Hue-sectored colour correction (mirrors pipeline::acm_color). `s` is the
+// white-balanced linear pixel (0..1). The hue/saturation that select the sector
+// come from the globally-corrected colour `ccm * s`; the result fades between the
+// global CCM (low saturation) and the per-sector matrix (high saturation).
+fn acm_apply(s: vec3<f32>) -> vec3<f32> {
+    let g0 = P.ccm0.x * s.x + P.ccm0.y * s.y + P.ccm0.z * s.z;
+    let g1 = P.ccm1.x * s.x + P.ccm1.y * s.y + P.ccm1.z * s.z;
+    let g2 = P.ccm2.x * s.x + P.ccm2.y * s.y + P.ccm2.z * s.z;
+
+    let lr = max(g0, 0.0);
+    let lg = max(g1, 0.0);
+    let lb = max(g2, 0.0);
+    let mx = max(lr, max(lg, lb));
+    let mn = min(lr, min(lg, lb));
+    let d = mx - mn;
+    if (mx <= 0.0 || d <= 0.0) { return vec3<f32>(g0, g1, g2); }
+
+    var h: f32;
+    if (lr >= lg && lr >= lb) { h = (lg - lb) / d; }
+    else if (lg >= lb) { h = 2.0 + (lb - lr) / d; }
+    else { h = 4.0 + (lr - lg) / d; }
+    h = h * 60.0;
+    if (h < 0.0) { h = h + 360.0; }
+    let sat = d / mx;
+    let w = clamp(sat / P.acm_cfg.z, 0.0, 1.0);
+
+    let nsec = i32(P.acm_cfg.w);
+    let pos = (h - P.acm_cfg.x) / P.acm_cfg.y;
+    let fi = floor(pos);
+    let frac = pos - fi;
+    let ia = ((i32(fi) % nsec) + nsec) % nsec;
+    let ib = (ia + 1) % nsec;
+    let ba = u32(ia) * 9u;
+    let bb = u32(ib) * 9u;
+
+    let cc = array<f32, 9>(
+        P.ccm0.x, P.ccm0.y, P.ccm0.z,
+        P.ccm1.x, P.ccm1.y, P.ccm1.z,
+        P.ccm2.x, P.ccm2.y, P.ccm2.z,
+    );
+    var m: array<f32, 9>;
+    for (var k = 0u; k < 9u; k = k + 1u) {
+        let ms = acm[ba + k] * (1.0 - frac) + acm[bb + k] * frac;
+        m[k] = cc[k] * (1.0 - w) + ms * w;
+    }
     return vec3<f32>(
-        floor(srgb(cr) * 255.0 + 0.5),
-        floor(srgb(cg) * 255.0 + 0.5),
-        floor(srgb(cb) * 255.0 + 0.5),
+        m[0] * s.x + m[1] * s.y + m[2] * s.z,
+        m[3] * s.x + m[4] * s.y + m[5] * s.z,
+        m[6] * s.x + m[7] * s.y + m[8] * s.z,
+    );
+}
+
+// Linear CFA-scale RGB -> hue-sectored CCM -> sRGB gamma -> 0..255 (rounded).
+fn to_rgb8(lin: vec3<f32>) -> vec3<f32> {
+    var s = lin * P.consts.y; // * inv_maxlin
+    // Highlight desaturation: blend toward the max channel near full scale so
+    // blown highlights converge to neutral white (mirrors desaturate_highlight).
+    let m = max(s.x, max(s.y, s.z));
+    if (m > HIGHLIGHT_KNEE) {
+        let t = clamp((m - HIGHLIGHT_KNEE) / (1.0 - HIGHLIGHT_KNEE), 0.0, 1.0);
+        s = s + (vec3<f32>(m) - s) * t;
+    }
+    let c = acm_apply(s);
+    return vec3<f32>(
+        floor(srgb(c.x) * 255.0 + 0.5),
+        floor(srgb(c.y) * 255.0 + 0.5),
+        floor(srgb(c.z) * 255.0 + 0.5),
     );
 }
 
@@ -186,6 +258,102 @@ fn render_pack(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cr = (u32(yc0.z) + u32(yc1.z)) / 2u;
     yuyv[gidx] = y0 | (cb << 8u) | (y1 << 16u) | (cr << 24u);
 }
+
+// --- Lateral chromatic aberration path (three passes) ---
+
+// Pass 2a: MHC debayer into a planar linear-RGB buffer ([R | G | B], w*h each).
+// Only the interior is filled; the centre crop guarantees the sampled region is
+// well inside, so edge pixels are left zero.
+@compute @workgroup_size(64)
+fn mhc_planar(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = P.dims.x;
+    let h = P.dims.y;
+    let idx = gid.x;
+    if (idx >= w * h) { return; }
+    let plane = w * h;
+    let y = idx / w;
+    let x = idx % w;
+    if (y < 2u || y + 2u >= h || x < 2u || x + 2u >= w) {
+        rgb[idx] = 0.0; rgb[plane + idx] = 0.0; rgb[2u * plane + idx] = 0.0;
+        return;
+    }
+    let c = mhc(y, x);
+    rgb[idx] = c.x;
+    rgb[plane + idx] = c.y;
+    rgb[2u * plane + idx] = c.z;
+}
+
+// Bilinear sample of LCA shift grid channel `ch` (0=bx,1=by,2=rx,3=ry) at native
+// pixel (px, py). The four grids are concatenated in the `lca` buffer.
+fn lca_sample(ch: u32, px: f32, py: f32) -> f32 {
+    let gw = u32(P.lca.x);
+    let gh = u32(P.lca.y);
+    let gx = clamp(px / P.lca.z, 0.0, f32(gw - 1u));
+    let gy = clamp(py / P.lca.w, 0.0, f32(gh - 1u));
+    let x0 = u32(floor(gx));
+    let x1 = min(x0 + 1u, gw - 1u);
+    let y0 = u32(floor(gy));
+    let y1 = min(y0 + 1u, gh - 1u);
+    let fx = gx - f32(x0);
+    let fy = gy - f32(y0);
+    let base = ch * gw * gh;
+    let top = lca[base + y0 * gw + x0] * (1.0 - fx) + lca[base + y0 * gw + x1] * fx;
+    let bot = lca[base + y1 * gw + x0] * (1.0 - fx) + lca[base + y1 * gw + x1] * fx;
+    return top * (1.0 - fy) + bot * fy;
+}
+
+// Bilinear sample of one RGB plane (offset `chbase` into `rgb`) at float (sx, sy).
+fn plane_sample(chbase: u32, w: u32, h: u32, sx: f32, sy: f32) -> f32 {
+    let x = clamp(sx, 0.0, f32(w - 1u));
+    let y = clamp(sy, 0.0, f32(h - 1u));
+    let x0 = u32(floor(x));
+    let x1 = min(x0 + 1u, w - 1u);
+    let y0 = u32(floor(y));
+    let y1 = min(y0 + 1u, h - 1u);
+    let fx = x - f32(x0);
+    let fy = y - f32(y0);
+    let top = rgb[chbase + y0 * w + x0] * (1.0 - fx) + rgb[chbase + y0 * w + x1] * fx;
+    let bot = rgb[chbase + y1 * w + x0] * (1.0 - fx) + rgb[chbase + y1 * w + x1] * fx;
+    return top * (1.0 - fy) + bot * fy;
+}
+
+// Green from the planar buffer, red/blue resampled at their LCA-shifted (green-
+// aligned) positions, then coloured. Returns RGB8 (0..255).
+fn lca_color(sy: u32, sx: u32) -> vec3<f32> {
+    let w = P.dims.x;
+    let h = P.dims.y;
+    let plane = w * h;
+    let fx = f32(sx);
+    let fy = f32(sy);
+    let g = rgb[plane + sy * w + sx];
+    let r = plane_sample(0u, w, h, fx + lca_sample(2u, fx, fy), fy + lca_sample(3u, fx, fy));
+    let b = plane_sample(2u * plane, w, h, fx + lca_sample(0u, fx, fy), fy + lca_sample(1u, fx, fy));
+    return to_rgb8(vec3<f32>(r, g, b));
+}
+
+// Pass 2b: per output pixel pair, LCA-correct colour + YUYV pack (centre crop).
+@compute @workgroup_size(64)
+fn render_pack_lca(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dst_h = P.out_dims.y;
+    let off_x = P.out_dims.z;
+    let off_y = P.out_dims.w;
+    let groups_per_row = P.misc.y;
+    let gidx = gid.x;
+    if (gidx >= groups_per_row * dst_h) { return; }
+    let gy = gidx / groups_per_row;
+    let gx = gidx % groups_per_row;
+    let sy = off_y + gy;
+    let sx0 = off_x + gx * 2u;
+    let sx1 = sx0 + 1u;
+
+    let yc0 = ycbcr(lca_color(sy, sx0));
+    let yc1 = ycbcr(lca_color(sy, sx1));
+    let y0 = u32(yc0.x);
+    let y1 = u32(yc1.x);
+    let cb = (u32(yc0.y) + u32(yc1.y)) / 2u;
+    let cr = (u32(yc0.z) + u32(yc1.z)) / 2u;
+    yuyv[gidx] = y0 | (cb << 8u) | (y1 << 16u) | (cr << 24u);
+}
 "#;
 
 /// GPU-resident ISP for the live webcam path. Holds the device, both compute
@@ -197,16 +365,21 @@ pub struct GpuProcessor {
     queue: wgpu::Queue,
     cfa_pipeline: wgpu::ComputePipeline,
     pack_pipeline: wgpu::ComputePipeline,
+    planar_pipeline: wgpu::ComputePipeline,
+    pack_lca_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     raw_buf: wgpu::Buffer,
     grid_bufs: [wgpu::Buffer; 4],
+    acm_buf: wgpu::Buffer,
     yuyv_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
 
     interval: u64,
     frame: u64,
+    lca_on: bool,
     est: Option<Estimate>,
+    chroma: Option<(f32, f32)>,
     grids_ls: Option<usize>,
 
     yuyv_host: Vec<u8>,
@@ -217,11 +390,13 @@ pub struct GpuProcessor {
 impl GpuProcessor {
     /// Initialise the GPU backend (Vulkan / mesa ANV). Re-estimates AWB/CCM every
     /// `awb_interval` frames (clamped to >= 1; the first frame always estimates).
-    pub fn new(awb_interval: u64) -> Result<Self, String> {
-        pollster::block_on(Self::new_async(awb_interval))
+    /// `lca` enables lateral-chromatic-aberration correction (an extra MHC->planar
+    /// pass plus a resampling colour pass).
+    pub fn new(awb_interval: u64, lca: bool) -> Result<Self, String> {
+        pollster::block_on(Self::new_async(awb_interval, lca))
     }
 
-    async fn new_async(awb_interval: u64) -> Result<Self, String> {
+    async fn new_async(awb_interval: u64, lca: bool) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -287,6 +462,37 @@ impl GpuProcessor {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // Full-res planar linear RGB buffer ([R | G | B]) for the LCA path.
+        let rgb_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rgb"),
+            size: (W * H * 3 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // The four LCA shift grids concatenated (blue_x, blue_y, red_x, red_y),
+        // uploaded once.
+        let lca_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lca"),
+            size: (4 * LCA_GH * LCA_GW * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        {
+            let l = Lca::load();
+            let mut flat: Vec<f32> = Vec::with_capacity(4 * LCA_GH * LCA_GW);
+            for g in l.grids() {
+                flat.extend_from_slice(g);
+            }
+            queue.write_buffer(&lca_buf, 0, bytemuck::cast_slice(&flat));
+        }
+        // Per-sector colour matrices for the current CCT (9 floats per sector);
+        // rewritten on each re-estimate (see `upload_acm`).
+        let acm_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("acm"),
+            size: (ACM_NSEC * 9 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let yuyv_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("yuyv"),
             size: yuyv_bytes as u64,
@@ -345,6 +551,9 @@ impl GpuProcessor {
                 storage_ro(5),
                 storage_rw(6),
                 storage_rw(7),
+                storage_rw(8),
+                storage_ro(9),
+                storage_ro(10),
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -359,6 +568,9 @@ impl GpuProcessor {
                 wgpu::BindGroupEntry { binding: 5, resource: grid_bufs[3].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: cfa_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: yuyv_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: rgb_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: lca_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: acm_buf.as_entire_binding() },
             ],
         });
 
@@ -379,21 +591,28 @@ impl GpuProcessor {
         };
         let cfa_pipeline = make_pipeline("build_cfa");
         let pack_pipeline = make_pipeline("render_pack");
+        let planar_pipeline = make_pipeline("mhc_planar");
+        let pack_lca_pipeline = make_pipeline("render_pack_lca");
 
         Ok(GpuProcessor {
             device,
             queue,
             cfa_pipeline,
             pack_pipeline,
+            planar_pipeline,
+            pack_lca_pipeline,
             bind_group,
             params_buf,
             raw_buf,
             grid_bufs,
+            acm_buf,
             yuyv_buf,
             staging_buf,
             interval: awb_interval.max(1),
             frame: 0,
+            lca_on: lca,
             est: None,
+            chroma: None,
             grids_ls: None,
             yuyv_host: vec![0u8; yuyv_bytes],
             raw_needed,
@@ -416,7 +635,13 @@ impl GpuProcessor {
     fn reestimate(&mut self, bytes: &[u8]) -> io::Result<()> {
         let frame = RawFrame::from_bytes(bytes)?;
         let planes = pipeline::bayer_planes(&frame);
-        let est = pipeline::estimate(&planes);
+        // Same temporal smoothing / LSC hysteresis as the CPU `Processor`: the
+        // first frame (no history) reproduces the stateless estimate exactly.
+        let (rg, bg) = pipeline::robust_neutral(&planes);
+        let (srg, sbg) = pipeline::smooth_chroma(self.chroma, rg, bg);
+        self.chroma = Some((srg, sbg));
+        let prev_ls = self.est.as_ref().map(|e| e.ls);
+        let est = pipeline::estimate_from_chroma(srg, sbg, prev_ls);
         if self.grids_ls != Some(est.ls) {
             let grids = pipeline::build_grids(est.ls, HH, WW);
             let upload = |buf: &wgpu::Buffer, g: &[f64]| {
@@ -433,7 +658,8 @@ impl GpuProcessor {
         Ok(())
     }
 
-    /// Pack the current estimate into the uniform block and upload it.
+    /// Pack the current estimate into the uniform block and upload it, along with
+    /// this frame's per-sector ACM matrices (CCT-interpolated on the CPU).
     fn upload_params(&self) {
         let est = self.est.as_ref().unwrap();
         let g = est.gains;
@@ -447,8 +673,20 @@ impl GpuProcessor {
             ccm0: [c[0] as f32, c[1] as f32, c[2] as f32, 0.0],
             ccm1: [c[3] as f32, c[4] as f32, c[5] as f32, 0.0],
             ccm2: [c[6] as f32, c[7] as f32, c[8] as f32, 0.0],
+            lca: [LCA_GW as f32, LCA_GH as f32, LCA_CELL_X, LCA_CELL_Y],
+            acm_cfg: [ACM_HUE0, ACM_HUE_STEP, ACM_SAT_KNEE as f32, ACM_NSEC as f32],
         };
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+
+        // Per-sector matrices for this CCT, flattened sector-major row-major.
+        let acm = interp_acm(est.cct);
+        let mut flat = vec![0f32; ACM_NSEC * 9];
+        for (s, mat) in acm.mats.iter().enumerate() {
+            for k in 0..9 {
+                flat[s * 9 + k] = mat[k] as f32;
+            }
+        }
+        self.queue.write_buffer(&self.acm_buf, 0, bytemuck::cast_slice(&flat));
     }
 
     /// Process one raw SGRBG10 frame; returns the packed YUYV bytes (length
@@ -483,7 +721,28 @@ impl GpuProcessor {
             let groups = ((W * H) as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
-        {
+        if self.lca_on {
+            // Pass 2a: MHC into the planar RGB buffer (full frame interior).
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mhc_planar"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.planar_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                let groups = ((W * H) as u32).div_ceil(64);
+                pass.dispatch_workgroups(groups, 1, 1);
+            }
+            // Pass 2b: LCA-correct colour + YUYV pack.
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("render_pack_lca"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pack_lca_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            let groups = (((OUT_W / 2) * OUT_H) as u32).div_ceil(64);
+            pass.dispatch_workgroups(groups, 1, 1);
+        } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("render_pack"),
                 timestamp_writes: None,

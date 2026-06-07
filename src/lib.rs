@@ -1,9 +1,9 @@
 //! Software ISP for the GalaxyCore GC2607 colour camera.
 //!
 //! Pipeline: black-level -> lens-shading correction -> robust-neutral AWB ->
-//! debayer -> colour-correction matrix (interpolated by CCT) -> sRGB gamma.
-//! Tuning (CCM, white locus, LSC grids) is parsed from the camera's `.aiqb`
-//! tuning file; see `tools/` and `data/`.
+//! debayer -> hue-sectored colour correction (interpolated by CCT) -> sRGB
+//! gamma. Tuning (CCM, ACM sectors, white locus, LSC/LCA grids) is parsed from
+//! the camera's `.aiqb` tuning file; see `tools/` and `data/`.
 
 pub mod tuning_data;
 pub mod tuning;

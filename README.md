@@ -32,7 +32,7 @@ raw SGRBG10 (1928x1088)
   -> LSC          per-Bayer-channel vignetting correction (light source by scene)
   -> AWB          robust-neutral: median chroma of bright, non-clipped pixels
   -> debayer      half-res (stage 1); full-res MHC (stage 2)
-  -> CCM          colour-correction matrix, interpolated by CCT
+  -> CCM          hue-sectored colour correction (24 sectors), interpolated by CCT
   -> sRGB gamma
   -> RGB8
 ```
@@ -40,14 +40,23 @@ raw SGRBG10 (1928x1088)
 White balance, CCT and the lens-shading light source are estimated on the
 post-BLC frame, before LSC is applied.
 
+The colour step is hue-sectored: beyond the single global matrix, 24 per-hue
+matrices refine the correction by the colour's hue, fading to the global matrix
+near neutral. See [docs/acm-color-model.md](docs/acm-color-model.md).
+
 ## Tuning source
 
 Tuning is parsed from the camera's `.aiqb` tuning file:
 
 - **CCM** — 5 colour-correction matrices by CCT (2963/3803/4049/4779/6426 K),
   plus a white locus for CCT estimation. File [data/gc2607_ccms.json](data/gc2607_ccms.json).
+- **ACM** — 24 per-hue-sector colour matrices for each of the 5 CCTs (hue-sectored
+  refinement of the CCM). File [data/gc2607_acm.npz](data/gc2607_acm.npz); see
+  [docs/acm-color-model.md](docs/acm-color-model.md).
 - **LSC** — 5 light sources x 4 Bayer channels x 63x47 grid, gain 1.0..5.543
   (strong vignetting). File [data/gc2607_lsc.npz](data/gc2607_lsc.npz).
+- **LCA** — lateral chromatic aberration shift grids (red/blue vs green).
+  File [data/gc2607_lca.npz](data/gc2607_lca.npz).
 
 The tone curve is not extractable (parsed by Intel's closed parser), so a
 standard sRGB gamma is used.
@@ -60,13 +69,13 @@ Rust data is generated from the sources by [tools/gen_tuning.py](tools/gen_tunin
 | Path | Purpose |
 |------|---------|
 | [src/raw.rs](src/raw.rs) | raw SGRBG10 loading + black-level subtraction |
-| [src/pipeline.rs](src/pipeline.rs) | core: debayer (half / own MHC), AWB, CCT, LSC, CCM, gamma; `Processor` (live, buffer-reuse + caching) |
-| [src/tuning.rs](src/tuning.rs) | access to the embedded LSC grids |
-| [src/tuning_data.rs](src/tuning_data.rs) | generated tables (CCM, locus, dims) |
+| [src/pipeline.rs](src/pipeline.rs) | core: debayer (half / own MHC), AWB, CCT, LSC, hue-sectored CCM, gamma; `Processor` (live, buffer-reuse + caching) |
+| [src/tuning.rs](src/tuning.rs) | access to the embedded LSC / LCA grids |
+| [src/tuning_data.rs](src/tuning_data.rs) | generated tables (CCM, ACM sectors, locus, dims) |
 | [src/ae.rs](src/ae.rs) | auto-exposure logic (exposure-priority), std-only, unit-tested |
 | [src/sensor.rs](src/sensor.rs) | V4L2 subdev control (exposure/gain/vblank) via raw ioctls (`video` feature) |
 | [src/output.rs](src/output.rs) | v4l2loopback output, RGB->YUYV pack (`video` feature) |
-| [src/gpu.rs](src/gpu.rs) | GPU backend: `GpuProcessor` + WGSL compute shaders (unpack/LSC/WB, MHC, CCM, gamma, YUYV) (`gpu` feature) |
+| [src/gpu.rs](src/gpu.rs) | GPU backend: `GpuProcessor` + WGSL compute shaders (unpack/LSC/WB, MHC, hue-sectored CCM, gamma, YUYV) (`gpu` feature) |
 | [src/main.rs](src/main.rs) | offline CLI: raw -> PNG/PPM |
 | [src/bin/capture.rs](src/bin/capture.rs) | `gc2607-capture`: grab raw frames via libcamera (`capture` feature) |
 | [src/bin/video.rs](src/bin/video.rs) | `gc2607-video`: live webcam daemon (`capture` feature; `--backend gpu` adds `gpu`) |
