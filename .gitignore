@@ -1,0 +1,15 @@
+/target
+*.ppm
+*.png
+
+# Sensor captures and anything derived from them are private to the user's
+# scene and must never be committed. Tuning data in data/ is sensor tuning
+# data, not a scene capture, and is tracked.
+/tests/data/*
+!/tests/data/.gitkeep
+
+__pycache__/
+
+# capture binary built in container, copied to host for running
+/gc2607-capture
+/gc2607-video

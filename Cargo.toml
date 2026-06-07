@@ -1,0 +1,56 @@
+[package]
+name = "gc2607-isp"
+version = "0.1.0"
+edition = "2021"
+description = "Software ISP for the GalaxyCore GC2607 colour camera (MateBook X Pro 2024)."
+license = "MIT"
+
+[dependencies]
+# PNG output for the offline CLI (PNG only, to keep the dependency tree small).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Raw capture via libcamera. Optional: needs libcamera-dev + clang at build
+# time, so it is built in a podman container (see Containerfile), not on the
+# host. The host `cargo build` stays dependency-light without this feature.
+libcamera = { version = "0.7", optional = true }
+# Own minimal V4L2 layer (sensor subdev control for AE, v4l2loopback output)
+# via raw ioctls. Optional: only the live video runtime needs it; the offline
+# ISP stays std-only. The `v4l` crate is avoided (stale, no output API).
+nix = { version = "0.31", optional = true, default-features = false, features = ["ioctl"] }
+# Data-parallel ISP for the live runtime. Optional: the offline ISP stays
+# single-threaded and std-only. Thread count is set at runtime (--threads).
+rayon = { version = "1.12", optional = true }
+
+[features]
+# Live video runtime: V4L2 sensor control (AE), v4l2loopback output, and
+# data-parallel ISP (rayon).
+video = ["dep:nix", "dep:rayon"]
+# Raw capture via libcamera (gc2607-capture). Pulls in `video` for AE. Off by default.
+capture = ["dep:libcamera", "video"]
+
+[dev-dependencies]
+# Reference Malvar-He-Cutler implementation. Used only by the validation test
+# that checks our own row-parallel MHC (pipeline::mhc_debayer) matches a known
+# implementation; not linked into any binary.
+demosaic = "0.3"
+
+[lib]
+name = "gc2607_isp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gc2607-isp"
+path = "src/main.rs"
+
+[[bin]]
+name = "gc2607-capture"
+path = "src/bin/capture.rs"
+required-features = ["capture"]
+
+[[bin]]
+name = "gc2607-video"
+path = "src/bin/video.rs"
+required-features = ["capture"]
+
+[profile.release]
+opt-level = 3
+lto = true
