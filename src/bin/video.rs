@@ -320,6 +320,15 @@ fn main() {
     let mut last_report = Instant::now();
     let mut report_frames = 0u64;
 
+    // AE settling: the sensor applies a new exposure/gain with a delay of a few
+    // frames (the exact figure is not in libcamera's sensor database for this
+    // part). If we re-meter every frame we issue several corrections before the
+    // first takes effect, so the loop double-corrects and oscillates bright/dark
+    // at a brightness boundary. After committing a change, hold metering for
+    // AE_SETTLE frames so the change is reflected before the next decision.
+    const AE_SETTLE: u32 = 3;
+    let mut ae_hold = 0u32;
+
     loop {
         // Block for one completed request, then drain any extra ready ones,
         // requeuing all but the freshest so we always process the newest frame.
@@ -356,15 +365,18 @@ fn main() {
             Err(_) => false,
         };
         if processed {
-            // AE from the same frame's brightness.
+            // AE from the same frame's brightness, with apply-delay settling.
             if args.ae {
-                if let (Some(m), Some(s)) =
+                if ae_hold > 0 {
+                    ae_hold -= 1;
+                } else if let (Some(m), Some(s)) =
                     (gc2607_isp::raw::mean_norm_from_bytes(buf), &sensor)
                 {
                     let next = ae::step(&ae_cfg, state, m);
                     if next != state {
                         let _ = s.apply(next);
                         state = next;
+                        ae_hold = AE_SETTLE;
                     }
                 }
             }
