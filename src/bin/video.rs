@@ -2,6 +2,10 @@
 //! auto-exposure on the sensor, and publish processed YUYV frames to a
 //! v4l2loopback device that any application can open.
 //!
+//! Auto-exposure meters the mean luma of the produced frame (post white
+//! balance, lens-shading, CCM and gamma) toward a perceptual mid-grey, so the
+//! exposure tracks the brightness the viewer sees rather than a raw level.
+//!
 //! Defaults to full-res MHC on 8 threads (sustains the sensor's 30 fps); use
 //! `--debayer half` and/or fewer `--threads` to trade quality for lower CPU use.
 //! Stale frames are dropped so latency stays low when the ISP falls behind.
@@ -90,6 +94,13 @@ const HEIGHT: u32 = 1088;
 /// step) runs only occasionally; AE brightness is still metered every frame.
 const AWB_INTERVAL: u64 = 8;
 
+/// Default AE target. AE meters the mean luma of the *produced* frame (after
+/// white balance, lens-shading, CCM and sRGB gamma), so the target is a
+/// perceptual mid-grey on the 0..1 output scale — not a linear raw level. This
+/// makes exposure converge on the brightness the viewer actually sees and
+/// self-corrects for the pipeline's brightness gain. Override with `--target`.
+const AE_TARGET_LUMA: f64 = 0.42;
+
 struct Args {
     device: String,
     backend: Backend,
@@ -110,7 +121,7 @@ fn parse_args() -> Args {
     let mut backend = Backend::Auto;
     let mut mode = DebayerMode::Mhc;
     let mut ae = true;
-    let mut target = AeConfig::default().target;
+    let mut target = AE_TARGET_LUMA;
     let mut max_gain = AeConfig::default().max_gain_index;
     let mut threads = 8usize;
     // Lateral chromatic aberration correction (full-res MHC only); on by default.
@@ -182,6 +193,29 @@ fn output_size(mode: DebayerMode) -> (usize, usize) {
     match mode {
         DebayerMode::Mhc => (1920, 1080),  // from 1928x1088
         DebayerMode::HalfRes => (960, 540), // from 964x544
+    }
+}
+
+/// Mean luma of a packed YUYV frame, as a fraction of full scale (0..1).
+///
+/// The Y bytes sit at even offsets; this subsamples every fourth pixel, which is
+/// ample for an exposure metric and keeps the per-frame cost negligible. This is
+/// the AE control variable: metering the produced frame's luma makes exposure
+/// converge on the brightness the viewer actually sees, accounting for white
+/// balance, lens-shading, CCM and gamma in a single measurement.
+fn mean_luma_norm(yuyv: &[u8]) -> f64 {
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    let mut i = 0;
+    while i < yuyv.len() {
+        sum += yuyv[i] as u64; // Y of every fourth pixel (2 bytes/px, step 8)
+        n += 1;
+        i += 8;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum as f64 / n as f64 / 255.0
     }
 }
 
@@ -558,6 +592,8 @@ fn main() {
     let mut dropped = 0u64;
     let mut last_report = Instant::now();
     let mut report_frames = 0u64;
+    // Last metered output luma (0..1), for the periodic telemetry line.
+    let mut last_luma = 0f64;
 
     // AE settling: the sensor applies a new exposure/gain with a delay. If we
     // re-meter every frame we issue several corrections before the first takes
@@ -596,24 +632,31 @@ fn main() {
 
         // ISP (reuses buffers, caches AWB/CCM across frames). The engine returns
         // a packed YUYV frame (CPU renders RGB then packs; GPU packs in-shader).
+        // The output luma is metered here (while the YUYV is in hand) as the AE
+        // control variable: see `mean_luma_norm`.
+        let mut luma = None;
         let processed = match engine.process(buf) {
-            Ok(yuyv) => match out.write_frame(yuyv) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("loopback write failed: {e}");
-                    break;
+            Ok(yuyv) => {
+                luma = Some(mean_luma_norm(yuyv));
+                match out.write_frame(yuyv) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("loopback write failed: {e}");
+                        break;
+                    }
                 }
-            },
+            }
             Err(_) => false,
         };
         if processed {
-            // AE from the same frame's brightness, with apply-delay settling.
+            // AE from this frame's output luma, with apply-delay settling.
+            if let Some(m) = luma {
+                last_luma = m;
+            }
             if args.ae {
                 if ae_hold > 0 {
                     ae_hold -= 1;
-                } else if let (Some(m), Some(s)) =
-                    (gc2607_isp::raw::mean_norm_from_bytes(buf), &sensor)
-                {
+                } else if let (Some(m), Some(s)) = (luma, &sensor) {
                     let next = ae::step(&ae_cfg, state, m);
                     if next != state {
                         let _ = s.apply(next);
@@ -634,7 +677,7 @@ fn main() {
             let fps = report_frames as f64 / last_report.elapsed().as_secs_f64();
             println!(
                 "{frames} frames, {fps:.1} fps processed, {dropped} dropped, \
-                 exposure={} gain_idx={} ({:.1} fps sensor)",
+                 exposure={} gain_idx={} ({:.1} fps sensor), Y={last_luma:.3}",
                 state.exposure,
                 state.gain_index,
                 ae::frame_rate(state.vblank),
