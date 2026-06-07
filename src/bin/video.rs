@@ -11,22 +11,28 @@
 //! offloads the CPU and always produces full-res 1920x1080 (the `--debayer`
 //! option is ignored on the GPU path).
 //!
+//! With `--measure-delay` the binary runs a one-off calibration instead of the
+//! live loop: on a static scene it steps exposure and gain and reports how many
+//! frames the sensor takes to apply each change (used to tune the AE settle
+//! count and to fill libcamera's sensor-delays database). No loopback is opened.
+//!
 //! Usage:
 //!   gc2607-video [--device /dev/videoN] [--backend cpu|gpu] [--debayer half|mhc]
 //!                [--no-ae] [--target <0..1>] [--max-gain <idx>] [--threads <n>]
+//!                [--measure-delay]
 
 use std::io;
 use std::time::{Duration, Instant};
 
 use libcamera::{
-    camera::CameraConfigurationStatus,
+    camera::{ActiveCamera, CameraConfigurationStatus},
     camera_manager::CameraManager,
     framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
     geometry::Size,
-    request::ReuseFlag,
-    stream::StreamRole,
+    request::{Request, ReuseFlag},
+    stream::{Stream, StreamRole},
 };
 
 use gc2607_isp::ae::{self, AeConfig, AeState};
@@ -93,6 +99,7 @@ struct Args {
     max_gain: u8,
     threads: usize,
     lca: bool,
+    measure: bool,
 }
 
 fn parse_args() -> Args {
@@ -108,6 +115,8 @@ fn parse_args() -> Args {
     let mut threads = 8usize;
     // Lateral chromatic aberration correction (full-res MHC only); on by default.
     let mut lca = true;
+    // Sensor apply-delay measurement mode (no loopback, no ISP output).
+    let mut measure = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -136,6 +145,7 @@ fn parse_args() -> Args {
             },
             "--no-ae" => ae = false,
             "--no-lca" => lca = false,
+            "--measure-delay" => measure = true,
             "--target" => target = it.next().and_then(|s| s.parse().ok()).unwrap_or(target),
             "--max-gain" => max_gain = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_gain),
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads).max(1),
@@ -143,7 +153,7 @@ fn parse_args() -> Args {
                 eprintln!(
                     "usage: gc2607-video [--device /dev/videoN] [--backend auto|cpu|gpu] \
                      [--debayer half|mhc] [--no-ae] [--no-lca] [--target <0..1>] \
-                     [--max-gain <idx>] [--threads <n>]"
+                     [--max-gain <idx>] [--threads <n>] [--measure-delay]"
                 );
                 std::process::exit(0);
             }
@@ -162,6 +172,7 @@ fn parse_args() -> Args {
         max_gain,
         threads,
         lca,
+        measure,
     }
 }
 
@@ -223,6 +234,221 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
     )
 }
 
+/// Read the next completed request in strict capture order (no frame dropping)
+/// and return its raw-mean brightness metric, requeuing the buffer. Returns
+/// `None` only on capture timeout. `--measure-delay` must observe every sensor
+/// frame in sequence, so unlike the live loop it never drains to the freshest.
+fn next_in_order_mean(
+    cam: &mut ActiveCamera,
+    stream: &Stream,
+    rx: &std::sync::mpsc::Receiver<Request>,
+) -> Option<f64> {
+    let mut req = rx.recv_timeout(Duration::from_secs(5)).ok()?;
+    let mean = {
+        let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(stream).unwrap();
+        let plane = fb.data();
+        let plane = plane.first().unwrap();
+        let bytes_used = fb.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
+        gc2607_isp::raw::mean_norm_from_bytes(&plane[..bytes_used])
+    };
+    req.reuse(ReuseFlag::REUSE_BUFFERS);
+    cam.queue_request(req).map_err(|(_, e)| e).ok()?;
+    Some(mean.unwrap_or(f64::NAN))
+}
+
+/// Drop every request currently waiting in the channel (requeuing its buffer)
+/// to shrink the in-flight pipeline before arming a step change.
+fn flush_pending(cam: &mut ActiveCamera, rx: &std::sync::mpsc::Receiver<Request>) {
+    while let Ok(mut req) = rx.try_recv() {
+        req.reuse(ReuseFlag::REUSE_BUFFERS);
+        let _ = cam.queue_request(req).map_err(|(_, e)| e);
+    }
+}
+
+/// Read `n` frames in order and return the last frame's mean (None on timeout).
+fn settle_mean(
+    cam: &mut ActiveCamera,
+    stream: &Stream,
+    rx: &std::sync::mpsc::Receiver<Request>,
+    n: u32,
+) -> Option<f64> {
+    let mut last = f64::NAN;
+    for _ in 0..n {
+        last = next_in_order_mean(cam, stream, rx)?;
+    }
+    Some(last)
+}
+
+/// Record the means of the next `n` frames in order (stops early on timeout).
+fn record_means(
+    cam: &mut ActiveCamera,
+    stream: &Stream,
+    rx: &std::sync::mpsc::Receiver<Request>,
+    n: u32,
+) -> Vec<f64> {
+    let mut v = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        match next_in_order_mean(cam, stream, rx) {
+            Some(m) => v.push(m),
+            None => break,
+        }
+    }
+    v
+}
+
+/// Settled level after a step: the mean of the last few recorded frames.
+fn plateau_of(means: &[f64]) -> f64 {
+    let tail: Vec<f64> = means.iter().rev().take(4).copied().filter(|m| m.is_finite()).collect();
+    if tail.is_empty() {
+        f64::NAN
+    } else {
+        tail.iter().sum::<f64>() / tail.len() as f64
+    }
+}
+
+/// First frame (1-based) whose mean crosses halfway between `base` and
+/// `plateau` — the observed apply delay for a rising step. None if never seen.
+fn detect_delay(base: f64, plateau: f64, means: &[f64]) -> Option<usize> {
+    if !base.is_finite() || !plateau.is_finite() || plateau <= base {
+        return None;
+    }
+    let thr = base + 0.5 * (plateau - base);
+    means
+        .iter()
+        .position(|&m| m.is_finite() && m >= thr)
+        .map(|i| i + 1)
+}
+
+/// Print a step's per-frame means, marking the detected delay frame.
+fn report_step(header: &str, base: f64, plateau: f64, means: &[f64], delay: Option<usize>) {
+    println!("{header}: base mean {base:.3}, settled {plateau:.3}");
+    for (i, m) in means.iter().enumerate() {
+        let marker = if delay == Some(i + 1) { "  <- delay" } else { "" };
+        println!("  +{:>2}: mean {m:.3}{marker}", i + 1);
+    }
+    println!();
+}
+
+/// Print one named delay result.
+fn print_delay(name: &str, delay: Option<usize>) {
+    match delay {
+        Some(d) => println!("{name:>9} delay: {d} frames"),
+        None => println!("{name:>9} delay: not detected"),
+    }
+}
+
+/// Measure the sensor's exposure and gain apply latency on a static scene.
+///
+/// AE is off. The routine calibrates a unity-gain exposure for a mid-range
+/// image, then applies a step change to exposure (and separately to gain) and
+/// records the per-frame mean, in capture order with no frame dropping. The
+/// delay is the number of frames between the register write and the first frame
+/// that reflects it. The figure is *observed* end-to-end: it includes the
+/// capture pipeline depth, so it is the right basis for the live loop's
+/// `AE_SETTLE` (which reads frames the same way). The sensor-internal latch
+/// delay stored in libcamera's database is usually smaller.
+fn run_measure_delay(
+    cam: &mut ActiveCamera,
+    stream: &Stream,
+    rx: &std::sync::mpsc::Receiver<Request>,
+    sensor: &Sensor,
+    mut state: AeState,
+) {
+    const CAL_TARGET: f64 = 0.30;
+    const CAL_ITERS: u32 = 12;
+    const SETTLE: u32 = 24; // ~0.8 s at 30 fps: well past any apply delay
+    const WINDOW: u32 = 16; // frames observed after each step
+
+    println!("measure-delay: keep the camera on a static, evenly-lit scene\n");
+
+    let vb = ae::VBLANK_MIN;
+    state.vblank = vb;
+    state.gain_index = 0;
+    state.exposure = state.exposure.clamp(ae::EXPOSURE_MIN, ae::exposure_max(vb));
+    let _ = sensor.apply(state);
+
+    // Calibrate unity-gain exposure to ~CAL_TARGET so neither step clips.
+    let mut cal_mean = f64::NAN;
+    for _ in 0..CAL_ITERS {
+        cal_mean = match settle_mean(cam, stream, rx, SETTLE) {
+            Some(m) => m,
+            None => {
+                eprintln!("capture timed out during calibration");
+                return;
+            }
+        };
+        if (0.27..=0.34).contains(&cal_mean) {
+            break;
+        }
+        let factor = (CAL_TARGET / cal_mean.max(1e-4)).clamp(0.25, 4.0);
+        state.exposure = ((state.exposure as f64 * factor).round() as i32)
+            .clamp(ae::EXPOSURE_MIN, ae::exposure_max(vb));
+        let _ = sensor.apply(state);
+    }
+    let e_star = state.exposure;
+    println!("calibrated: exposure={e_star} lines, gain_idx=0, mean~{cal_mean:.3}\n");
+
+    // --- Exposure step: e_lo -> e_hi (~3x) at unity gain. ---
+    let e_lo = (e_star / 3).max(ae::EXPOSURE_MIN);
+    let e_hi = e_star;
+    state.exposure = e_lo;
+    state.gain_index = 0;
+    let _ = sensor.apply(state);
+    let exp_base = match settle_mean(cam, stream, rx, SETTLE) {
+        Some(m) => m,
+        None => return,
+    };
+    flush_pending(cam, rx);
+    state.exposure = e_hi;
+    let _ = sensor.apply(state);
+    let exp_means = record_means(cam, stream, rx, WINDOW);
+    let exp_plateau = plateau_of(&exp_means);
+    let exp_delay = detect_delay(exp_base, exp_plateau, &exp_means);
+    report_step(
+        &format!("exposure step {e_lo}->{e_hi} lines"),
+        exp_base,
+        exp_plateau,
+        &exp_means,
+        exp_delay,
+    );
+
+    // --- Gain step: index 0 -> 4 (~2x) at exposure e_star/2. ---
+    let e_g = (e_star / 2).max(ae::EXPOSURE_MIN);
+    state.exposure = e_g;
+    state.gain_index = 0;
+    let _ = sensor.apply(state);
+    let gain_base = match settle_mean(cam, stream, rx, SETTLE) {
+        Some(m) => m,
+        None => return,
+    };
+    flush_pending(cam, rx);
+    state.gain_index = 4;
+    let _ = sensor.apply(state);
+    let gain_means = record_means(cam, stream, rx, WINDOW);
+    let gain_plateau = plateau_of(&gain_means);
+    let gain_delay = detect_delay(gain_base, gain_plateau, &gain_means);
+    report_step(
+        "gain step idx 0->4 (~2x)",
+        gain_base,
+        gain_plateau,
+        &gain_means,
+        gain_delay,
+    );
+
+    // --- Summary. ---
+    println!("=== apply-delay summary (observed, includes capture pipeline depth) ===");
+    print_delay("exposure", exp_delay);
+    print_delay("gain", gain_delay);
+    match (exp_delay, gain_delay) {
+        (Some(a), Some(b)) => println!("suggested AE_SETTLE = {} frames (max of the two)", a.max(b)),
+        _ => println!("could not auto-detect one or both delays; read the per-frame tables above"),
+    }
+    println!(
+        "note: libcamera's sensor-delays DB wants the sensor-internal latch delay\n      \
+         (commonly 2 frames for exposure and gain); the figure above is end-to-end."
+    );
+}
+
 fn main() {
     let args = parse_args();
 
@@ -233,10 +459,6 @@ fn main() {
         .num_threads(args.threads)
         .build_global()
         .expect("build rayon pool");
-
-    // Resolve the backend now (Auto may fall back to CPU), so the output size is
-    // known before the loopback is opened.
-    let (mut engine, dst_w, dst_h) = build_engine(&args);
 
     let sensor = match Sensor::open_gc2607() {
         Ok(s) => {
@@ -249,15 +471,7 @@ fn main() {
         }
     };
 
-    let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32)
-        .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
-    println!("output: {} {dst_w}x{dst_h} YUYV", args.device);
-
-    let ae_cfg = AeConfig {
-        target: args.target,
-        max_gain_index: args.max_gain,
-        ..AeConfig::default()
-    };
+    // Seed the AE state from whatever the sensor currently holds.
     let mut state = AeState::default();
     if let Some(s) = &sensor {
         state.exposure = s.exposure().unwrap_or(state.exposure);
@@ -265,6 +479,7 @@ fn main() {
         state.vblank = s.vblank().unwrap_or(state.vblank);
     }
 
+    // --- Camera setup (shared by the live path and --measure-delay). ---
     let mgr = CameraManager::new().expect("CameraManager");
     let cameras = mgr.cameras();
     let cam = cameras.get(0).expect("no cameras found");
@@ -315,17 +530,44 @@ fn main() {
         cam.queue_request(req).map_err(|(_, e)| e).unwrap();
     }
 
+    // --- Sensor apply-delay measurement mode (no loopback, no ISP output). ---
+    if args.measure {
+        match &sensor {
+            Some(s) => run_measure_delay(&mut cam, &stream, &rx, s, state),
+            None => eprintln!("--measure-delay needs sensor control, but none is available"),
+        }
+        return;
+    }
+
+    // --- Live path: ISP engine + loopback output. ---
+    // Resolve the backend now (Auto may fall back to CPU), so the output size is
+    // known before the loopback is opened.
+    let (mut engine, dst_w, dst_h) = build_engine(&args);
+
+    let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32)
+        .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
+    println!("output: {} {dst_w}x{dst_h} YUYV", args.device);
+
+    let ae_cfg = AeConfig {
+        target: args.target,
+        max_gain_index: args.max_gain,
+        ..AeConfig::default()
+    };
+
     let mut frames = 0u64;
     let mut dropped = 0u64;
     let mut last_report = Instant::now();
     let mut report_frames = 0u64;
 
-    // AE settling: the sensor applies a new exposure/gain with a delay of a few
-    // frames (the exact figure is not in libcamera's sensor database for this
-    // part). If we re-meter every frame we issue several corrections before the
-    // first takes effect, so the loop double-corrects and oscillates bright/dark
-    // at a brightness boundary. After committing a change, hold metering for
+    // AE settling: the sensor applies a new exposure/gain with a delay. If we
+    // re-meter every frame we issue several corrections before the first takes
+    // effect, so the loop double-corrects and oscillates bright/dark at a
+    // brightness boundary. After committing a change, hold metering for
     // AE_SETTLE frames so the change is reflected before the next decision.
+    //
+    // `--measure-delay` measured the observed end-to-end apply delay (capture
+    // pipeline included) at 2 frames for both exposure and gain on this part;
+    // AE_SETTLE keeps one frame of margin on top.
     const AE_SETTLE: u32 = 3;
     let mut ae_hold = 0u32;
 
