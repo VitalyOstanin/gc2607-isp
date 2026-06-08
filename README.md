@@ -267,7 +267,7 @@ ffplay -f v4l2 /dev/video0
 | `--debayer half\|mhc` | `mhc` | `mhc` = full-res 1920x1080; `half` = 960x540, lighter (CPU backend only) |
 | `--threads N` | `8` | ISP worker threads (CPU budget; see note). On the GPU backend only the occasional CPU-side AWB uses them. |
 | `--no-ae` | (AE on) | disable auto-exposure (use current sensor settings) |
-| `--target <0..1>` | `0.35` | AE target mean brightness |
+| `--target <0..1>` | `0.15` | AE target mean brightness, in linear light (the output luma is metered with the sRGB gamma inverted). `0.15` linear ≈ gamma-encoded mid-grey `0.43`. |
 | `--max-gain <idx>` | `16` | AE max analogue-gain LUT index |
 | `--on-demand auto\|on\|off` | `auto` | open the camera and run the ISP only while an application is capturing (see [Roadmap](#roadmap)). `auto` self-gates when v4l2loopback exposes the client-usage event and otherwise streams always-on; `on` requires the event (warns and falls back if absent); `off` forces always-on. While idle the camera sensor stays runtime-suspended; the producer only writes cheap black keepalive frames so consumers can still negotiate the format. |
 

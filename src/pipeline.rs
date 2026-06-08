@@ -475,6 +475,21 @@ fn srgb(x: f64) -> f64 {
     }
 }
 
+/// Inverse sRGB EOTF (gamma-encoded `0..1` -> linear `0..1`): the exact inverse
+/// of [`srgb`], reusing the same breakpoint and coefficients. The live AE loop
+/// uses this to meter the produced frame's mean luminance in linear light, so
+/// the exposure model (which assumes brightness is proportional to the
+/// exposure-gain product) operates on a linear quantity rather than the
+/// gamma-encoded luma.
+pub fn srgb_to_linear(y: f64) -> f64 {
+    let y = y.clamp(0.0, 1.0);
+    if y <= SRGB_LIN_SLOPE * SRGB_LIN_THRESH {
+        y / SRGB_LIN_SLOPE
+    } else {
+        ((y + SRGB_OFFSET) / SRGB_SCALE).powf(1.0 / SRGB_GAMMA)
+    }
+}
+
 /// Pre-resized per-Bayer-channel LSC gain grids (`hh*ww` each) for one light
 /// source. Building these is a fixed per-frame cost that depends only on the
 /// chosen light source, so [`Processor`] caches a `Grids` and rebuilds it only

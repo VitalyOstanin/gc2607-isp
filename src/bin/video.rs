@@ -2,9 +2,12 @@
 //! auto-exposure on the sensor, and publish processed YUYV frames to a
 //! v4l2loopback device that any application can open.
 //!
-//! Auto-exposure meters the mean luma of the produced frame (post white
-//! balance, lens-shading, CCM and gamma) toward a perceptual mid-grey, so the
-//! exposure tracks the brightness the viewer sees rather than a raw level.
+//! Auto-exposure meters the produced frame's mean luminance in linear light
+//! (the output luma with the sRGB gamma inverted) toward a linear mid-grey
+//! target, so the exposure model — which treats brightness as proportional to
+//! the exposure-gain product — operates on a linear quantity. This tracks the
+//! brightness the viewer sees while keeping the control loop's per-frame
+//! correction the right magnitude (see [`mean_linear_luma`]).
 //!
 //! Defaults to full-res MHC on 8 threads (sustains the sensor's 30 fps); use
 //! `--debayer half` and/or fewer `--threads` to trade quality for lower CPU use.
@@ -118,12 +121,14 @@ const HEIGHT: u32 = gc2607_isp::raw::H as u32;
 /// step) runs only occasionally; AE brightness is still metered every frame.
 const AWB_INTERVAL: u64 = 8;
 
-/// Default AE target. AE meters the mean luma of the *produced* frame (after
-/// white balance, lens-shading, CCM and sRGB gamma), so the target is a
-/// perceptual mid-grey on the 0..1 output scale — not a linear raw level. This
-/// makes exposure converge on the brightness the viewer actually sees and
-/// self-corrects for the pipeline's brightness gain. Override with `--target`.
-const AE_TARGET_LUMA: f64 = 0.42;
+/// Default AE target, in *linear* light (0..1). AE meters the produced frame's
+/// mean luminance with the sRGB gamma inverted (see [`mean_linear_luma`]), so the
+/// target is a linear level, not a gamma-encoded one. 0.15 corresponds to a
+/// gamma-encoded mid-grey of `srgb(0.15) ≈ 0.43` on the output scale (near the
+/// photographic 18%-grey reference, `srgb(0.18) ≈ 0.46`); it preserves the
+/// previously tuned output brightness while letting the linear exposure model
+/// drive the loop. Override with `--target` (also interpreted as linear).
+const AE_TARGET_LINEAR: f64 = 0.15;
 
 /// Interval between standby frames written while on-demand idle (~10 fps). Just
 /// frequent enough to keep the loopback a negotiable capture device for a
@@ -154,7 +159,7 @@ fn parse_args() -> Args {
     let mut backend = Backend::Auto;
     let mut mode = DebayerMode::Mhc;
     let mut ae = true;
-    let mut target = AE_TARGET_LUMA;
+    let mut target = AE_TARGET_LINEAR;
     let mut max_gain = AeConfig::default().max_gain_index;
     let mut threads = 8usize;
     // Lateral chromatic aberration correction (full-res MHC only); on by default.
@@ -330,26 +335,54 @@ fn output_size(mode: DebayerMode) -> (usize, usize) {
     }
 }
 
-/// Mean luma of a packed YUYV frame, as a fraction of full scale (0..1).
+/// Inverse-sRGB lookup table: gamma-encoded luma byte (0..=255) -> linear light
+/// (0..1). Built once. The AE metric maps each sampled Y byte through this table
+/// (a load, no `powf`) so metering stays as cheap as a plain mean while yielding
+/// a linear quantity.
+fn srgb_to_linear_lut() -> &'static [f64; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[f64; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f64; 256];
+        for (b, e) in t.iter_mut().enumerate() {
+            *e = gc2607_isp::pipeline::srgb_to_linear(b as f64 / 255.0);
+        }
+        t
+    })
+}
+
+/// Mean *linear* luminance of a packed YUYV frame, as a fraction of full scale
+/// (0..1). Each sampled Y byte is mapped back through the inverse sRGB EOTF
+/// before averaging, so the result is mean scene luminance in linear light, not
+/// the gamma-encoded mean.
+///
+/// This is the AE control variable. The exposure model in [`ae::step`] assumes
+/// brightness is proportional to the exposure-gain product, which holds for a
+/// linear metric but not for gamma-encoded luma; metering in linear light makes
+/// each damped correction the right magnitude and keeps convergence independent
+/// of the scene. Averaging the gamma-encoded byte then inverting (as opposed to
+/// inverting per pixel) would bias the metric toward shadows, so the inversion
+/// is applied per sample via the LUT.
 ///
 /// The Y bytes sit at even offsets; this subsamples every fourth pixel, which is
-/// ample for an exposure metric and keeps the per-frame cost negligible. This is
-/// the AE control variable: metering the produced frame's luma makes exposure
-/// converge on the brightness the viewer actually sees, accounting for white
-/// balance, lens-shading, CCM and gamma in a single measurement.
-fn mean_luma_norm(yuyv: &[u8]) -> f64 {
-    let mut sum = 0u64;
+/// ample for an exposure metric and keeps the per-frame cost negligible. Note
+/// the inverse is applied to the BT.601 luma byte rather than to R, G, B
+/// separately (the YUYV frame carries only luma); for a scalar AE metric this is
+/// a standard, monotonic approximation of scene luminance.
+fn mean_linear_luma(yuyv: &[u8]) -> f64 {
+    let lut = srgb_to_linear_lut();
+    let mut sum = 0f64;
     let mut n = 0u64;
     let mut i = 0;
     while i < yuyv.len() {
-        sum += yuyv[i] as u64; // Y of every fourth pixel (2 bytes/px, step 8)
+        sum += lut[yuyv[i] as usize]; // Y of every fourth pixel (2 bytes/px, step 8)
         n += 1;
         i += 8;
     }
     if n == 0 {
         0.0
     } else {
-        sum as f64 / n as f64 / 255.0
+        sum / n as f64
     }
 }
 
@@ -744,8 +777,9 @@ fn queue_initial(session: &mut cam_setup::Session<'_>) {
 
 /// Outcome of processing and writing one frame (see `process_and_write`).
 enum FrameOutcome {
-    /// Written to the loopback. Carries the output luma (AE control variable)
-    /// and the applied denoise strengths (chroma radius, temporal alpha).
+    /// Written to the loopback. Carries the output mean linear luminance (the AE
+    /// control variable; see [`mean_linear_luma`]) and the applied denoise
+    /// strengths (chroma radius, temporal alpha).
     Written { luma: f64, chroma_radius: usize, temporal_alpha: f64 },
     /// The ISP/GPU returned an error or the frame work panicked; the frame is
     /// skipped. Carries a human-readable reason for the throttled log.
@@ -777,7 +811,7 @@ fn process_and_write(
             Ok(y) => y,
             Err(e) => return FrameOutcome::Skipped(e.to_string()),
         };
-        let luma = mean_luma_norm(yuyv);
+        let luma = mean_linear_luma(yuyv);
         let (chroma_radius, temporal_alpha, used) =
             apply_denoise(yuyv, dst_w, dst_h, gain_index, args, denoise_buf, prev_y);
         let frame: &[u8] = if used { denoise_buf.as_slice() } else { yuyv };
@@ -838,7 +872,7 @@ fn run_live(
     let mut ae_errors = 0u64;
     let mut last_report = Instant::now();
     let mut report_frames = 0u64;
-    // Last metered output luma (0..1), for the periodic telemetry line.
+    // Last metered output mean linear luminance (0..1), for the telemetry line.
     let mut last_luma = 0f64;
     // Scratch for the denoise post-pass (only filled when a denoise stage runs),
     // the temporal-denoise luma history, and the last applied strengths (for
@@ -988,7 +1022,7 @@ fn run_live(
             let fps = report_frames as f64 / last_report.elapsed().as_secs_f64();
             println!(
                 "{frames} frames, {fps:.1} fps processed, {dropped} dropped, {errors} errors, \
-                 exposure={} gain_idx={} ({:.1} fps sensor), Y={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}",
+                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}",
                 state.exposure,
                 state.gain_index,
                 ae::frame_rate(state.vblank),

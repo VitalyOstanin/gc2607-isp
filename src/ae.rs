@@ -307,11 +307,12 @@ mod tests {
 
     #[test]
     fn converges_with_nonlinear_metric() {
-        // The live loop meters post-gamma luma, so the brightness response is
-        // metric = (k * product)^(1/2.4), not the linear model step() assumes.
-        // step() still converges because the response is monotonic; this guards
-        // the actual non-linear regime used in production reaches the target
-        // (the linear test below only covers the model step() was written for).
+        // The live loop now meters linear luminance (the output luma with the
+        // sRGB gamma inverted), so the metric matches step()'s linear model. This
+        // test keeps a non-linear response — metric = (k * product)^(1/2.4), the
+        // pre-linearization regime — as a robustness guard: step() must still
+        // converge on any monotonic metric, so a future metric change cannot
+        // silently break the loop.
         let cfg = AeConfig::default();
         let mut st = AeState::default();
         let k = 3.0e-4f64; // scene gain; converged product well within 30 fps range
