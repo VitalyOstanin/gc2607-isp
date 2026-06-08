@@ -25,9 +25,17 @@ use libcamera::{
     framebuffer_allocator::FrameBufferAllocator,
     framebuffer_map::MemoryMappedFrameBuffer,
     geometry::Size,
+    properties,
     request::Request,
     stream::{Stream, StreamRole},
 };
+
+/// libcamera `Model` property of the GC2607 (the internal front camera). The
+/// camera is selected by this model rather than by enumeration index, because
+/// the index is not stable: when another camera is present (e.g. a USB webcam)
+/// it may enumerate first, and `cameras.get(0)` would then pick the wrong
+/// device and fail to configure a raw stream on it.
+const GC2607_MODEL: &str = "gc2607";
 
 /// A configured, allocated raw-capture session that has **not** been started.
 ///
@@ -52,14 +60,33 @@ pub struct Session<'d> {
     _config: CameraConfiguration,
 }
 
-/// Open camera 0 from `mgr`, configure a single raw stream at `width`x`height`,
-/// allocate and map its buffers, build one request per buffer, and wire the
-/// completion channel. Returns a [`Session`] that is configured but not started.
+/// Select the GC2607 camera from `mgr` (by `Model`, see [`GC2607_MODEL`]),
+/// configure a single raw stream at `width`x`height`, allocate and map its
+/// buffers, build one request per buffer, and wire the completion channel.
+/// Returns a [`Session`] that is configured but not started.
 pub fn open_raw(mgr: &CameraManager, width: u32, height: u32) -> io::Result<Session<'_>> {
     let cameras = mgr.cameras();
-    let cam = cameras
-        .get(0)
-        .ok_or_else(|| io::Error::other("no cameras found"))?;
+    let mut chosen = None;
+    let mut seen = Vec::new();
+    for i in 0..cameras.len() {
+        let Some(cam) = cameras.get(i) else { continue };
+        let model = cam
+            .properties()
+            .get::<properties::Model>()
+            .ok()
+            .map(|m| m.to_string());
+        seen.push(format!("{} ({})", model.as_deref().unwrap_or("?"), cam.id()));
+        if model.as_deref() == Some(GC2607_MODEL) {
+            chosen = Some(cam);
+            break;
+        }
+    }
+    let cam = chosen.ok_or_else(|| {
+        io::Error::other(format!(
+            "GC2607 camera (Model {GC2607_MODEL:?}) not found; available cameras: [{}]",
+            seen.join(", ")
+        ))
+    })?;
     let mut cam = cam.acquire()?;
 
     let mut cfgs = cam
