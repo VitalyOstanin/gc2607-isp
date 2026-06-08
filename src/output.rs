@@ -342,37 +342,82 @@ pub fn denoise_chroma_yuyv(buf: &mut [u8], w: usize, h: usize, radius: usize, st
 }
 
 /// Separable box blur of a single-channel `w x h` plane (values 0..=255 in
-/// `u16`), clamping at the borders. Row passes run in parallel.
+/// `u16`). At the borders the window shrinks (each border pixel averages only the
+/// available neighbours), and the mean uses integer truncation.
+///
+/// Both passes use a sliding-window running sum, so the cost is O(w*h)
+/// independent of the radius `r` (a naive window sum is O(w*h*r)). The horizontal
+/// pass runs in parallel per row; the vertical pass carries one running sum per
+/// column down the rows in a single pass — sequential but still O(w*h), and it
+/// keeps CPU use low rather than fanning a tiny workload across all cores.
 fn box_blur_plane(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
-    // Horizontal pass.
+    if w == 0 || h == 0 {
+        return vec![0u16; w * h];
+    }
+    // Horizontal pass: each row is an independent sliding window.
     let mut tmp = vec![0u16; w * h];
-    tmp.par_chunks_mut(w).enumerate().for_each(|(y, trow)| {
-        let srow = &src[y * w..y * w + w];
-        for (x, t) in trow.iter_mut().enumerate() {
-            let x0 = x.saturating_sub(r);
-            let x1 = (x + r).min(w - 1);
-            let mut sum = 0u32;
-            for v in &srow[x0..=x1] {
-                sum += *v as u32;
-            }
-            *t = (sum / (x1 - x0 + 1) as u32) as u16;
-        }
-    });
-    // Vertical pass.
+    tmp.par_chunks_mut(w)
+        .zip(src.par_chunks(w))
+        .for_each(|(trow, srow)| blur_line_runsum(srow, trow, w, r));
+
+    // Vertical pass: maintain `colsum[x]`, the sum of `tmp[yy*w + x]` over the
+    // current vertical window, advancing the window one row at a time.
     let mut out = vec![0u16; w * h];
-    out.par_chunks_mut(w).enumerate().for_each(|(y, orow)| {
-        let y0 = y.saturating_sub(r);
-        let y1 = (y + r).min(h - 1);
-        let n = (y1 - y0 + 1) as u32;
-        for (x, o) in orow.iter_mut().enumerate() {
-            let mut sum = 0u32;
-            for yy in y0..=y1 {
-                sum += tmp[yy * w + x] as u32;
-            }
-            *o = (sum / n) as u16;
+    let mut colsum = vec![0u32; w];
+    let mut hi = r.min(h - 1);
+    for yy in 0..=hi {
+        let base = yy * w;
+        for (x, c) in colsum.iter_mut().enumerate() {
+            *c += tmp[base + x] as u32;
         }
-    });
+    }
+    let mut lo = 0usize;
+    for y in 0..h {
+        let want_hi = (y + r).min(h - 1);
+        while hi < want_hi {
+            hi += 1;
+            let base = hi * w;
+            for (x, c) in colsum.iter_mut().enumerate() {
+                *c += tmp[base + x] as u32;
+            }
+        }
+        let want_lo = y.saturating_sub(r);
+        while lo < want_lo {
+            let base = lo * w;
+            for (x, c) in colsum.iter_mut().enumerate() {
+                *c -= tmp[base + x] as u32;
+            }
+            lo += 1;
+        }
+        let n = (want_hi - want_lo + 1) as u32;
+        let orow = &mut out[y * w..y * w + w];
+        for (o, &c) in orow.iter_mut().zip(colsum.iter()) {
+            *o = (c / n) as u16;
+        }
+    }
     out
+}
+
+/// One row (or any contiguous line) box-blurred with a sliding-window running
+/// sum: `out[x]` is the integer mean of `src` over `[x-r, x+r]` clamped to
+/// `[0, w-1]`. Border windows shrink, matching the divisor to the actual count.
+fn blur_line_runsum(src: &[u16], out: &mut [u16], w: usize, r: usize) {
+    let mut hi = r.min(w - 1);
+    let mut sum: u32 = src[0..=hi].iter().map(|&v| v as u32).sum();
+    let mut lo = 0usize;
+    for (x, o) in out.iter_mut().enumerate() {
+        let want_hi = (x + r).min(w - 1);
+        while hi < want_hi {
+            hi += 1;
+            sum += src[hi] as u32;
+        }
+        let want_lo = x.saturating_sub(r);
+        while lo < want_lo {
+            sum -= src[lo] as u32;
+            lo += 1;
+        }
+        *o = (sum / (want_hi - want_lo + 1) as u32) as u16;
+    }
 }
 
 /// Temporally denoise the luma of a packed YUYV frame in place, blending each
@@ -509,6 +554,58 @@ mod tests {
         assert_eq!(buf, orig);
         denoise_chroma_yuyv(&mut buf, w, h, 2, 0.0);
         assert_eq!(buf, orig);
+    }
+
+    /// Naive O(w*h*r) reference: the box blur written as an explicit window sum,
+    /// kept only to pin the optimised running-sum [`box_blur_plane`] to identical
+    /// output (same border-shrinking and integer-truncated mean).
+    fn box_blur_naive(src: &[u16], w: usize, h: usize, r: usize) -> Vec<u16> {
+        let mut tmp = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let x0 = x.saturating_sub(r);
+                let x1 = (x + r).min(w - 1);
+                let sum: u32 = (x0..=x1).map(|xx| src[y * w + xx] as u32).sum();
+                tmp[y * w + x] = (sum / (x1 - x0 + 1) as u32) as u16;
+            }
+        }
+        let mut out = vec![0u16; w * h];
+        for y in 0..h {
+            let y0 = y.saturating_sub(r);
+            let y1 = (y + r).min(h - 1);
+            let n = (y1 - y0 + 1) as u32;
+            for x in 0..w {
+                let sum: u32 = (y0..=y1).map(|yy| tmp[yy * w + x] as u32).sum();
+                out[y * w + x] = (sum / n) as u16;
+            }
+        }
+        out
+    }
+
+    /// The optimised running-sum box blur must be byte-identical to the naive
+    /// reference across radii, sizes, and the degenerate single-row/column cases.
+    #[test]
+    fn box_blur_runsum_matches_naive() {
+        // Deterministic pseudo-random plane (no rand dependency): a simple LCG.
+        let make = |w: usize, h: usize| -> Vec<u16> {
+            let mut s = 0x1234_5678u32;
+            (0..w * h)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((s >> 16) % 256) as u16
+                })
+                .collect()
+        };
+        for &(w, h) in &[(1, 1), (1, 7), (7, 1), (8, 4), (17, 13), (32, 32)] {
+            let src = make(w, h);
+            for r in 0..=6 {
+                assert_eq!(
+                    box_blur_plane(&src, w, h, r),
+                    box_blur_naive(&src, w, h, r),
+                    "box blur mismatch at {w}x{h} r={r}"
+                );
+            }
+        }
     }
 
     /// Build a single-row YUYV frame with the given per-pixel luma; chroma is set
