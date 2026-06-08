@@ -1,5 +1,7 @@
 # gc2607-isp
 
+*Read this in Russian: [README.ru.md](README.ru.md).*
+
 > **Status: testing / experimental.** Targets one specific device (MateBook X
 > Pro 2024 GC2607); it works end-to-end on the development machine, but
 > interfaces, defaults and tuning may still change.
@@ -27,6 +29,9 @@ here, and is left alone.
 - [Processing pipeline](#processing-pipeline)
 - [Tuning source](#tuning-source)
 - [Layout](#layout)
+- [Installation (Ubuntu 26.04)](#installation-ubuntu-2604)
+  - [Prebuilt packages](#prebuilt-packages)
+  - [From source](#from-source)
 - [Build and run (offline CLI)](#build-and-run-offline-cli)
 - [Live webcam (gc2607-video)](#live-webcam-gc2607-video)
   - [Troubleshooting: washed-out / banded image after changing resolution](#troubleshooting-washed-out--banded-image-after-changing-resolution)
@@ -214,6 +219,95 @@ Rust data is generated from the sources by [tools/gen_tuning.py](tools/gen_tunin
 | [tests/gpu.rs](tests/gpu.rs) | checks the GPU backend matches the CPU MHC path within 1 LSB (`gpu`+`video`) |
 | [packaging/](packaging/) | systemd unit + loopback config to run the daemon as an on-demand service |
 
+## Installation (Ubuntu 26.04)
+
+The colour webcam needs all three parts of the stack
+([Architecture](#architecture-the-camera-stack)): the `gc2607` sensor driver,
+the patched `ipu-bridge`, and this ISP. Each is published as a Debian package
+on its GitHub releases page. The fastest route on Ubuntu 26.04 is to install the
+three prebuilt packages; building everything from source is also supported
+([From source](#from-source)).
+
+This targets the MateBook X Pro 2024 specifically and is verified on Ubuntu
+26.04 with a 7.x kernel.
+
+### Prebuilt packages
+
+Prerequisites:
+
+- Ubuntu 26.04 with a 7.x kernel and the matching kernel headers
+  (`linux-headers-$(uname -r)`), which DKMS needs to build the modules.
+- The physical camera switch on the side of the laptop must be **on**, or the
+  sensor delivers no usable frame.
+- With Secure Boot enabled, DKMS signs the modules with a local MOK key and
+  prompts to enrol it on first build; complete the enrolment (a reboot asks to
+  confirm the key) so the signed modules load.
+
+1. Download the three packages from their latest releases (uses the GitHub CLI;
+   alternatively download them from each project's releases page in a browser):
+
+   ```sh
+   mkdir gc2607-debs && cd gc2607-debs
+   gh release download v1.0   -R VitalyOstanin/gc2607-driver
+   gh release download v1.0   -R VitalyOstanin/gc2607-ipu-bridge
+   gh release download v0.1.0 -R VitalyOstanin/gc2607-isp
+   ```
+
+2. Install all three at once so `apt` resolves the dependencies and the
+   recommended packages (`v4l2loopback-dkms`, `mesa-vulkan-drivers`) together:
+
+   ```sh
+   sudo apt install ./gc2607-driver-dkms_1.0_all.deb \
+                    ./gc2607-ipu-bridge-dkms_1.0_all.deb \
+                    ./gc2607-isp_0.1.0_amd64.deb
+   ```
+
+   The two DKMS packages build and sign their kernel modules for the running 7.x
+   kernel (other kernel series are skipped via `BUILD_EXCLUSIVE_KERNEL`). The
+   `gc2607-isp` package installs `gc2607-video` to `/usr/bin`, the loopback
+   configuration, and the `gc2607-camera` service (enabled for the next boot but
+   not started during install).
+
+3. Reboot so the new `ipu-bridge` replaces the in-tree one and the IPU6 builds
+   the CSI-2 link to the sensor. After the reboot the loopback module is loaded
+   from `/etc/modules-load.d/`, the `gc2607-camera` service is running, and the
+   camera stays idle until an application opens it.
+
+   ```sh
+   sudo reboot
+   ```
+
+4. Verify:
+
+   ```sh
+   systemctl status gc2607-camera        # active (running), sensor idle
+   v4l2-ctl --list-devices               # lists "MateBook Camera (GC2607)"
+   ffplay -f v4l2 /dev/video0            # opening the node wakes the camera
+   ```
+
+   Any webcam application (browser, OBS, `ffplay`) can now open
+   "MateBook Camera (GC2607)" as a regular webcam. The sensor powers up only
+   while an application is capturing and suspends again when it stops.
+
+To remove the webcam service and loopback configuration, see
+[`packaging/README.md`](packaging/README.md#uninstall); the two DKMS packages are
+removed with `sudo apt remove gc2607-driver-dkms gc2607-ipu-bridge-dkms`.
+
+### From source
+
+To build the stack from source instead of installing the prebuilt packages:
+
+- **Offline CLI** (`gc2607-isp`, raw frame → image, no hardware needed) —
+  [Build and run (offline CLI)](#build-and-run-offline-cli).
+- **Live webcam binary** (`gc2607-video`) — [Live webcam](#live-webcam-gc2607-video)
+  for the container build, or [Building on other distributions](#building-on-other-distributions)
+  for a native build.
+- **Debian package** for this ISP — [Debian package (.deb)](#debian-package-deb).
+- **Sensor driver and ipu-bridge** are built from their own repositories
+  ([gc2607-driver](https://github.com/VitalyOstanin/gc2607-driver),
+  [gc2607-ipu-bridge](https://github.com/VitalyOstanin/gc2607-ipu-bridge));
+  each ships a DKMS package built with `dpkg-buildpackage -us -uc -b`.
+
 ## Build and run (offline CLI)
 
 The offline CLI converts a saved raw frame to an image. It is dependency-light
@@ -376,7 +470,7 @@ Install and management steps, plus a hardened (non-root) variant, are in
 [`packaging/README.md`](packaging/README.md). In short:
 
 ```sh
-sudo install -m 0755 gc2607-video /usr/local/bin/gc2607-video
+sudo install -m 0755 gc2607-video /usr/bin/gc2607-video
 sudo install -m 0644 packaging/modules-load.d/gc2607-loopback.conf /etc/modules-load.d/
 sudo install -m 0644 packaging/modprobe.d/gc2607-loopback.conf     /etc/modprobe.d/
 sudo install -m 0644 packaging/systemd/gc2607-camera.service       /etc/systemd/system/
