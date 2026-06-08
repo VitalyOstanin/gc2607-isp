@@ -33,6 +33,7 @@ here, and is left alone.
 - [Building on other distributions](#building-on-other-distributions)
 - [Correctness check (golden)](#correctness-check-golden)
 - [Roadmap](#roadmap)
+- [Related projects](#related-projects)
 - [Acknowledgements](#acknowledgements)
 
 ## Purpose
@@ -442,6 +443,14 @@ the tests skip instead of failing. To run them, place a raw frame at
 | 7. GPU offload | done | `--backend gpu`: per-pixel stages (unpack/BLC/LSC/WB, MHC, CCM, gamma, YUYV pack) as Vulkan compute shaders; AWB on the CPU. ~4x lower CPU at the same frame rate |
 | 8. On-demand capture | done | `--on-demand auto` opens the camera + runs the ISP only while an application is capturing, driven by the v4l2loopback `V4L2_EVENT_PRI_CLIENT_USAGE` event (the v4l2-relayd mechanism, implemented in-process); the sensor stays runtime-suspended while idle. Falls back to always-on where the event is unavailable |
 
+## Related projects
+
+This ISP is the last stage of a three-part stack (see
+[Architecture](#architecture-the-camera-stack)):
+
+- [gc2607-driver](https://github.com/VitalyOstanin/gc2607-driver) — the GC2607 V4L2 sensor driver (I2C bring-up, exposure/gain/vblank, runtime PM).
+- [gc2607-ipu-bridge](https://github.com/VitalyOstanin/gc2607-ipu-bridge) — the IPU-bridge patch that registers the `GCTI2607` HID with the IPU6 so the CSI-2 link is built.
+
 ## Acknowledgements
 
 Two earlier community efforts to run the MateBook GC2607 on Linux were the
@@ -450,7 +459,7 @@ starting point that got this work going — thanks to their authors:
 - [abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver) — a
   GC2607 V4L2 sub-device driver with INT3472 power and an `ipu_bridge` patch,
   feeding a `v4l2loopback` node via GStreamer (developed on Arch). The basis for
-  this project's own [gc2607-driver](../gc2607-driver).
+  this project's own [gc2607-driver](https://github.com/VitalyOstanin/gc2607-driver).
 - [antonbiluta/gc2607-driver](https://github.com/antonbiluta/gc2607-driver) — a
   GC2607 driver and `ipu_bridge` patch (Fedora), another early reference for
   bringing the sensor up.
