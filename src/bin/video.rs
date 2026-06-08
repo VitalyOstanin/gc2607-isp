@@ -654,6 +654,53 @@ fn main() {
     run_live(&mut session.cam, &session.stream, &session.rx, sensor, state, &args);
 }
 
+/// Outcome of processing and writing one frame (see `process_and_write`).
+enum FrameOutcome {
+    /// Written to the loopback. Carries the output luma (AE control variable)
+    /// and the applied denoise strengths (chroma radius, temporal alpha).
+    Written { luma: f64, chroma_radius: usize, temporal_alpha: f64 },
+    /// The ISP/GPU returned an error or the frame work panicked; the frame is
+    /// skipped. Carries a human-readable reason for the throttled log.
+    Skipped(String),
+    /// Writing to the loopback failed; the caller should stop the stream.
+    WriteFailed(io::Error),
+}
+
+/// Run the ISP on one raw frame, apply gain-adaptive denoise, and write the
+/// result to the loopback. The whole frame's work runs inside `catch_unwind` so
+/// an unexpected panic (e.g. an out-of-range index in a pixel stage) skips that
+/// one frame instead of killing the long-running daemon; the panic message is
+/// still printed by the default hook. ISP errors and write failures are returned
+/// as variants, not panics.
+#[allow(clippy::too_many_arguments)]
+fn process_and_write(
+    engine: &mut Engine,
+    out: &mut LoopbackOutput,
+    buf: &[u8],
+    dst_w: usize,
+    dst_h: usize,
+    gain_index: u8,
+    args: &Args,
+    denoise_buf: &mut Vec<u8>,
+    prev_y: &mut Vec<u8>,
+) -> FrameOutcome {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let yuyv = match engine.process(buf) {
+            Ok(y) => y,
+            Err(e) => return FrameOutcome::Skipped(e.to_string()),
+        };
+        let luma = mean_luma_norm(yuyv);
+        let (chroma_radius, temporal_alpha, used) =
+            apply_denoise(yuyv, dst_w, dst_h, gain_index, args, denoise_buf, prev_y);
+        let frame: &[u8] = if used { denoise_buf.as_slice() } else { yuyv };
+        match out.write_frame(frame) {
+            Ok(()) => FrameOutcome::Written { luma, chroma_radius, temporal_alpha },
+            Err(e) => FrameOutcome::WriteFailed(e),
+        }
+    }));
+    result.unwrap_or_else(|_| FrameOutcome::Skipped("panic in frame processing".to_string()))
+}
+
 /// Live path: resolve the ISP backend, open the loopback output, and run the
 /// capture/process/AE loop until the camera times out or a write fails. Drops
 /// stale frames so latency stays low when the ISP falls behind, meters output
@@ -744,46 +791,39 @@ fn run_live(
             }
         };
 
-        // ISP (reuses buffers, caches AWB/CCM across frames). The engine returns
-        // a packed YUYV frame (CPU renders RGB then packs; GPU packs in-shader).
-        // The output luma is metered here (while the YUYV is in hand) as the AE
-        // control variable: see `mean_luma_norm`.
+        // ISP + denoise + loopback write for this frame, isolated against panics
+        // (see `process_and_write`). The output luma is metered inside as the AE
+        // control variable; denoise is a no-op at low gain (the common case).
         let mut luma = None;
-        let processed = match engine.process(buf) {
-            Ok(yuyv) => {
-                luma = Some(mean_luma_norm(yuyv));
-                // Gain-adaptive denoise on the produced frame, applied here
-                // (post-process) so it covers both the CPU and GPU backends
-                // uniformly. No-op at low gain (the common case), where the frame
-                // is written straight through; see `apply_denoise`.
-                let (dr, ta, used) = apply_denoise(
-                    yuyv,
-                    dst_w,
-                    dst_h,
-                    state.gain_index,
-                    args,
-                    &mut denoise_buf,
-                    &mut prev_y,
-                );
-                last_dn = dr;
-                last_ta = ta;
-                let frame: &[u8] = if used { &denoise_buf } else { yuyv };
-                match out.write_frame(frame) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        eprintln!("loopback write failed: {e}");
-                        break;
-                    }
-                }
+        let processed = match process_and_write(
+            &mut engine,
+            &mut out,
+            buf,
+            dst_w,
+            dst_h,
+            state.gain_index,
+            args,
+            &mut denoise_buf,
+            &mut prev_y,
+        ) {
+            FrameOutcome::Written { luma: m, chroma_radius, temporal_alpha } => {
+                luma = Some(m);
+                last_dn = chroma_radius;
+                last_ta = temporal_alpha;
+                true
             }
-            Err(e) => {
-                // Skip the frame but make the failure observable (throttled) so a
-                // systematic ISP/GPU fault does not look like a silently idle daemon.
+            FrameOutcome::Skipped(reason) => {
+                // Make the failure observable (throttled) so a systematic ISP/GPU
+                // fault does not look like a silently idle daemon.
                 errors += 1;
                 if errors <= 5 || errors % 100 == 0 {
-                    eprintln!("frame {frames}: ISP error ({errors} total): {e}");
+                    eprintln!("frame {frames}: skipped ({errors} total): {reason}");
                 }
                 false
+            }
+            FrameOutcome::WriteFailed(e) => {
+                eprintln!("loopback write failed: {e}");
+                break;
             }
         };
         if processed {
