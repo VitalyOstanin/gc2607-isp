@@ -390,6 +390,29 @@ pub struct GpuProcessor {
     yuyv_bytes: usize,
 }
 
+/// All persistent GPU buffers, produced by `GpuProcessor::create_buffers`. `cfa`,
+/// `rgb`, and `lca` are referenced only through the bind group (which keeps them
+/// alive) and are not retained on the [`GpuProcessor`] itself.
+struct GpuBuffers {
+    params: wgpu::Buffer,
+    raw: wgpu::Buffer,
+    grids: [wgpu::Buffer; 4],
+    cfa: wgpu::Buffer,
+    rgb: wgpu::Buffer,
+    lca: wgpu::Buffer,
+    acm: wgpu::Buffer,
+    yuyv: wgpu::Buffer,
+    staging: wgpu::Buffer,
+}
+
+/// The four compute pipelines, one per shader entry point.
+struct Pipelines {
+    cfa: wgpu::ComputePipeline,
+    pack: wgpu::ComputePipeline,
+    planar: wgpu::ComputePipeline,
+    pack_lca: wgpu::ComputePipeline,
+}
+
 impl GpuProcessor {
     /// Initialise the GPU backend (Vulkan / mesa ANV). Re-estimates AWB/CCM every
     /// `awb_interval` frames (clamped to >= 1; the first frame always estimates).
@@ -400,6 +423,40 @@ impl GpuProcessor {
     }
 
     async fn new_async(awb_interval: u64, lca: bool) -> Result<Self, String> {
+        let (device, queue) = Self::init_device().await?;
+        let bufs = Self::create_buffers(&device, &queue);
+        let (bind_group, pipelines) = Self::build_pipelines(&device, &bufs);
+
+        Ok(GpuProcessor {
+            device,
+            queue,
+            cfa_pipeline: pipelines.cfa,
+            pack_pipeline: pipelines.pack,
+            planar_pipeline: pipelines.planar,
+            pack_lca_pipeline: pipelines.pack_lca,
+            bind_group,
+            params_buf: bufs.params,
+            raw_buf: bufs.raw,
+            grid_bufs: bufs.grids,
+            acm_buf: bufs.acm,
+            yuyv_buf: bufs.yuyv,
+            staging_buf: bufs.staging,
+            interval: awb_interval.max(1),
+            frame: 0,
+            lca_on: lca,
+            est: None,
+            chroma: None,
+            grids_ls: None,
+            yuyv_host: vec![0u8; OUT_W * OUT_H * 2],
+            raw_needed: H * STRIDE_SAMPLES * 2,
+            yuyv_bytes: OUT_W * OUT_H * 2,
+        })
+    }
+
+    /// Acquire a Vulkan device and queue. Uses the adapter's own limits because
+    /// the pipeline binds 7 storage buffers in one compute stage and wgpu's
+    /// downlevel defaults cap storage buffers at 4 (too few on ANV).
+    async fn init_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -415,31 +472,34 @@ impl GpuProcessor {
         let info = adapter.get_info();
         eprintln!("gpu: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
 
-        let (device, queue) = adapter
+        adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gc2607-isp"),
                 required_features: wgpu::Features::empty(),
-                // The pipeline binds 7 storage buffers in one compute stage; the
-                // adapter's own limits cover that on ANV (downlevel defaults cap
-                // storage buffers at 4, which is too few).
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await
-            .map_err(|e| format!("request_device: {e}"))?;
+            .map_err(|e| format!("request_device: {e}"))
+    }
 
+    /// Create every persistent GPU buffer and upload the one-shot data (the four
+    /// LCA shift grids). The `cfa`, `rgb`, and `lca` buffers are referenced only
+    /// through the bind group, which keeps them alive, so they are not stored on
+    /// the [`GpuProcessor`].
+    fn create_buffers(device: &wgpu::Device, queue: &wgpu::Queue) -> GpuBuffers {
         let raw_needed = H * STRIDE_SAMPLES * 2;
         let cfa_bytes = (W * H * 4) as u64;
         let grid_bytes = (HH * WW * 4) as u64;
         let yuyv_bytes = OUT_W * OUT_H * 2;
 
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: std::mem::size_of::<Params>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let raw_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let raw = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raw"),
             size: raw_needed as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -453,20 +513,20 @@ impl GpuProcessor {
                 mapped_at_creation: false,
             })
         };
-        let grid_bufs = [
+        let grids = [
             make_grid("g_gr"),
             make_grid("g_r"),
             make_grid("g_b"),
             make_grid("g_gb"),
         ];
-        let cfa_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let cfa = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cfa"),
             size: cfa_bytes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         // Full-res planar linear RGB buffer ([R | G | B]) for the LCA path.
-        let rgb_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let rgb = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rgb"),
             size: (W * H * 3 * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE,
@@ -474,7 +534,7 @@ impl GpuProcessor {
         });
         // The four LCA shift grids concatenated (blue_x, blue_y, red_x, red_y),
         // uploaded once.
-        let lca_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let lca = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("lca"),
             size: (4 * LCA_GH * LCA_GW * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -486,29 +546,35 @@ impl GpuProcessor {
             for g in l.grids() {
                 flat.extend_from_slice(g);
             }
-            queue.write_buffer(&lca_buf, 0, bytemuck::cast_slice(&flat));
+            queue.write_buffer(&lca, 0, bytemuck::cast_slice(&flat));
         }
         // Per-sector colour matrices for the current CCT (9 floats per sector);
-        // rewritten on each re-estimate (see `upload_acm`).
-        let acm_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        // rewritten on each re-estimate (see `upload_params`).
+        let acm = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("acm"),
             size: (ACM_NSEC * 9 * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let yuyv_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let yuyv = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("yuyv"),
             size: yuyv_bytes as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),
             size: yuyv_bytes as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
+        GpuBuffers { params, raw, grids, cfa, rgb, lca, acm, yuyv, staging }
+    }
+
+    /// Compile the shader, build the bind group over `bufs`, and create the four
+    /// compute pipelines (one per shader entry point).
+    fn build_pipelines(device: &wgpu::Device, bufs: &GpuBuffers) -> (wgpu::BindGroup, Pipelines) {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("isp"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -563,17 +629,17 @@ impl GpuProcessor {
             label: Some("isp-bg"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: raw_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: grid_bufs[0].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: grid_bufs[1].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: grid_bufs[2].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: grid_bufs[3].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: cfa_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: yuyv_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: rgb_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: lca_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: acm_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: bufs.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bufs.raw.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bufs.grids[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: bufs.grids[1].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: bufs.grids[2].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: bufs.grids[3].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: bufs.cfa.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: bufs.yuyv.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: bufs.rgb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: bufs.lca.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: bufs.acm.as_entire_binding() },
             ],
         });
 
@@ -592,35 +658,13 @@ impl GpuProcessor {
                 cache: None,
             })
         };
-        let cfa_pipeline = make_pipeline("build_cfa");
-        let pack_pipeline = make_pipeline("render_pack");
-        let planar_pipeline = make_pipeline("mhc_planar");
-        let pack_lca_pipeline = make_pipeline("render_pack_lca");
-
-        Ok(GpuProcessor {
-            device,
-            queue,
-            cfa_pipeline,
-            pack_pipeline,
-            planar_pipeline,
-            pack_lca_pipeline,
-            bind_group,
-            params_buf,
-            raw_buf,
-            grid_bufs,
-            acm_buf,
-            yuyv_buf,
-            staging_buf,
-            interval: awb_interval.max(1),
-            frame: 0,
-            lca_on: lca,
-            est: None,
-            chroma: None,
-            grids_ls: None,
-            yuyv_host: vec![0u8; yuyv_bytes],
-            raw_needed,
-            yuyv_bytes,
-        })
+        let pipelines = Pipelines {
+            cfa: make_pipeline("build_cfa"),
+            pack: make_pipeline("render_pack"),
+            planar: make_pipeline("mhc_planar"),
+            pack_lca: make_pipeline("render_pack_lca"),
+        };
+        (bind_group, pipelines)
     }
 
     /// Output frame dimensions (YUYV).

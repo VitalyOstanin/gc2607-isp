@@ -23,5 +23,10 @@ pub mod output;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+// Shared libcamera capture setup for the live and raw-dump binaries. Needs the
+// libcamera crate, so it is gated behind `capture` (same as the binaries).
+#[cfg(feature = "capture")]
+pub mod camera;
+
 pub use pipeline::Estimate;
 pub use raw::{RawFrame, H, MAXLIN, W};

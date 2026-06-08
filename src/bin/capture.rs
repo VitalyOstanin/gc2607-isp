@@ -19,18 +19,16 @@
 use std::time::Duration;
 
 use libcamera::{
-    camera::CameraConfigurationStatus,
     camera_manager::CameraManager,
     framebuffer::AsFrameBuffer,
-    framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
+    framebuffer_allocator::FrameBuffer,
     framebuffer_map::MemoryMappedFrameBuffer,
-    geometry::Size,
     properties,
     request::ReuseFlag,
-    stream::StreamRole,
 };
 
 use gc2607_isp::ae::{self, AeConfig, AeState};
+use gc2607_isp::camera as cam_setup;
 use gc2607_isp::raw;
 use gc2607_isp::sensor::Sensor;
 
@@ -142,60 +140,24 @@ fn main() {
     }
 
     let mgr = CameraManager::new().expect("CameraManager");
-    let cameras = mgr.cameras();
-    let cam = cameras.get(0).expect("no cameras found");
+    let session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT).expect("open raw camera");
+    let cam_setup::Session { mut cam, stream, rx, requests, adjusted, .. } = session;
     println!(
         "camera: {}",
         *cam.properties().get::<properties::Model>().unwrap()
     );
-    let mut cam = cam.acquire().expect("acquire camera");
-
-    let mut cfgs = cam
-        .generate_configuration(&[StreamRole::Raw])
-        .expect("generate raw configuration");
-    cfgs.get_mut(0).unwrap().set_size(Size {
-        width: WIDTH,
-        height: HEIGHT,
-    });
-
-    match cfgs.validate() {
-        CameraConfigurationStatus::Valid => {}
-        CameraConfigurationStatus::Adjusted => println!("config adjusted"),
-        CameraConfigurationStatus::Invalid => panic!("invalid camera configuration"),
+    if adjusted {
+        println!("config adjusted");
     }
-    cam.configure(&mut cfgs).expect("configure");
-
-    let cfg = cfgs.get(0).unwrap();
-    let stream = cfg.stream().unwrap();
-    println!(
-        "stream: {:?} {}x{} stride={}",
-        cfg.get_pixel_format(),
-        cfg.get_size().width,
-        cfg.get_size().height,
-        cfg.get_stride()
-    );
-
-    let mut alloc = FrameBufferAllocator::new(&cam);
-    let buffers = alloc.alloc(&stream).expect("alloc buffers");
-    let buffers = buffers
-        .into_iter()
-        .map(|buf| MemoryMappedFrameBuffer::new(buf).unwrap())
-        .collect::<Vec<_>>();
-
-    let reqs: Vec<_> = buffers
-        .into_iter()
-        .enumerate()
-        .map(|(i, buf)| {
-            let mut req = cam.create_request(Some(i as u64)).unwrap();
-            req.add_buffer(&stream, buf).unwrap();
-            req
-        })
-        .collect();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    cam.on_request_completed(move |req| {
-        tx.send(req).unwrap();
-    });
+    if let Some(cfg) = stream.configuration() {
+        println!(
+            "stream: {:?} {}x{} stride={}",
+            cfg.get_pixel_format(),
+            cfg.get_size().width,
+            cfg.get_size().height,
+            cfg.get_stride()
+        );
+    }
 
     cam.start(None).expect("start");
 
@@ -205,7 +167,7 @@ fn main() {
         let _ = s.apply(state);
     }
 
-    for req in reqs {
+    for req in requests {
         cam.queue_request(req).map_err(|(_, e)| e).unwrap();
     }
 

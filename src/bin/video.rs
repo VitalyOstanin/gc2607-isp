@@ -29,17 +29,17 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use libcamera::{
-    camera::{ActiveCamera, CameraConfigurationStatus},
+    camera::ActiveCamera,
     camera_manager::CameraManager,
     framebuffer::AsFrameBuffer,
-    framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
+    framebuffer_allocator::FrameBuffer,
     framebuffer_map::MemoryMappedFrameBuffer,
-    geometry::Size,
     request::{Request, ReuseFlag},
-    stream::{Stream, StreamRole},
+    stream::Stream,
 };
 
 use gc2607_isp::ae::{self, AeConfig, AeState};
+use gc2607_isp::camera as cam_setup;
 use gc2607_isp::output::{
     denoise_chroma_yuyv, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv, LoopbackOutput,
 };
@@ -63,15 +63,18 @@ enum Backend {
 /// Either ISP engine, producing a packed YUYV frame from raw capture bytes. The
 /// CPU engine renders RGB then packs (with the centre crop); the GPU engine
 /// packs YUYV directly in the shader.
+// Both engine states are large (the `Processor` holds the CFA/RGB scratch
+// buffers; the `GpuProcessor` owns the wgpu device, queue, pipelines and
+// buffers), so both are boxed to keep `Engine` itself pointer-sized.
 enum Engine {
     Cpu {
-        proc: Processor,
+        proc: Box<Processor>,
         yuyv: Vec<u8>,
         dst_w: usize,
         dst_h: usize,
     },
     #[cfg(feature = "gpu")]
-    Gpu(GpuProcessor),
+    Gpu(Box<GpuProcessor>),
 }
 
 impl Engine {
@@ -241,6 +244,45 @@ fn temporal_luma_for_gain(gain_index: u8, scale: f64) -> f64 {
 /// frame-to-frame change the blend fades out to avoid ghosting on motion.
 const TEMPORAL_MOTION: f64 = 12.0;
 
+/// Apply gain-adaptive denoise to a freshly produced YUYV frame.
+///
+/// Chroma denoise is spatial, luma denoise is temporal; both ramp with analogue
+/// gain and are no-ops at low gain (the well-lit common case). When neither is
+/// active the temporal history is dropped so it re-seeds cleanly (no ghosting)
+/// when gain rises again, and the caller writes the original `yuyv` straight
+/// through. When at least one is active the result is written into `scratch`.
+///
+/// Returns `(chroma_radius, temporal_alpha, used_scratch)`: the first two are for
+/// telemetry, and `used_scratch` is `true` when the denoised frame is in
+/// `scratch` (else the caller uses `yuyv` unchanged).
+fn apply_denoise(
+    yuyv: &[u8],
+    dst_w: usize,
+    dst_h: usize,
+    gain_index: u8,
+    args: &Args,
+    scratch: &mut Vec<u8>,
+    prev_y: &mut Vec<u8>,
+) -> (usize, f64, bool) {
+    let (dr, ds) = chroma_denoise_for_gain(gain_index, args.denoise);
+    let ta = temporal_luma_for_gain(gain_index, args.temporal);
+    let chroma_on = dr > 0 && ds > 0.0;
+    let temporal_on = ta > 0.0;
+    if !chroma_on && !temporal_on {
+        prev_y.clear();
+        return (dr, ta, false);
+    }
+    scratch.clear();
+    scratch.extend_from_slice(yuyv);
+    if chroma_on {
+        denoise_chroma_yuyv(scratch, dst_w, dst_h, dr, ds);
+    }
+    if temporal_on {
+        temporal_denoise_luma_yuyv(scratch, prev_y, dst_w, dst_h, ta, TEMPORAL_MOTION);
+    }
+    (dr, ta, true)
+}
+
 /// Output (cropped) size for a debayer mode: a standard 16:9 size centred in
 /// the slightly larger ISP output.
 fn output_size(mode: DebayerMode) -> (usize, usize) {
@@ -286,7 +328,7 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
                 }
                 let (w, h) = p.out_dims();
                 println!("isp backend: gpu (full-res MHC, lca={})", args.lca);
-                return (Engine::Gpu(p), w, h);
+                return (Engine::Gpu(Box::new(p)), w, h);
             }
             Err(e) => {
                 if args.backend == Backend::Gpu {
@@ -312,7 +354,7 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
     );
     (
         Engine::Cpu {
-            proc: Processor::new(args.mode, AWB_INTERVAL, args.lca),
+            proc: Box::new(Processor::new(args.mode, AWB_INTERVAL, args.lca)),
             yuyv: vec![0u8; dst_w * dst_h * 2],
             dst_w,
             dst_h,
@@ -330,7 +372,7 @@ fn frame_bytes<'a>(req: &'a Request, stream: &Stream) -> Option<&'a [u8]> {
     let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(stream)?;
     // The plane reference borrows the mmap (tied to `req`), so copy it out of the
     // temporary Vec returned by `data()` before that Vec is dropped.
-    let plane: &[u8] = *fb.data().first()?;
+    let plane: &[u8] = fb.data().first()?;
     // `planes()` returns a libcamera wrapper (not a slice), so index with get(0).
     let bytes_used = fb.metadata()?.planes().get(0)?.bytes_used as usize;
     Some(&plane[..bytes_used.min(plane.len())])
@@ -545,17 +587,10 @@ fn run_measure_delay(
     );
 }
 
-fn main() {
-    let args = parse_args();
-
-    // Bound the ISP thread pool to the requested count (the CPU budget is the
-    // user's to set). The GPU backend does its pixel work on the iGPU, so the
-    // pool is only used by the occasional CPU-side AWB estimate.
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(args.threads)
-        .build_global()
-        .expect("build rayon pool");
-
+/// Open the sensor sub-device (if present) and seed the AE state from whatever
+/// exposure/gain/vblank it currently holds. AE is disabled if no sensor control
+/// is available (the ISP still runs on the current sensor state).
+fn init_sensor() -> (Option<Sensor>, AeState) {
     let sensor = match Sensor::open_gc2607() {
         Ok(s) => {
             println!("sensor: {}", s.path().display());
@@ -567,81 +602,73 @@ fn main() {
         }
     };
 
-    // Seed the AE state from whatever the sensor currently holds.
     let mut state = AeState::default();
     if let Some(s) = &sensor {
         state.exposure = s.exposure().unwrap_or(state.exposure);
         state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
         state.vblank = s.vblank().unwrap_or(state.vblank);
     }
+    (sensor, state)
+}
 
-    // --- Camera setup (shared by the live path and --measure-delay). ---
+fn main() {
+    let args = parse_args();
+
+    // Bound the ISP thread pool to the requested count (the CPU budget is the
+    // user's to set). The GPU backend does its pixel work on the iGPU, so the
+    // pool is only used by the occasional CPU-side AWB estimate.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(args.threads)
+        .build_global()
+        .expect("build rayon pool");
+
+    let (sensor, state) = init_sensor();
+
+    // Camera setup (shared by the live path and --measure-delay); the whole
+    // `session` is kept alive here so its held configuration outlives the stream.
     let mgr = CameraManager::new().expect("CameraManager");
-    let cameras = mgr.cameras();
-    let cam = cameras.get(0).expect("no cameras found");
-    let mut cam = cam.acquire().expect("acquire camera");
+    let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
+        .unwrap_or_else(|e| panic!("open raw camera: {e}"));
 
-    let mut cfgs = cam
-        .generate_configuration(&[StreamRole::Raw])
-        .expect("generate raw configuration");
-    cfgs.get_mut(0).expect("raw stream configuration").set_size(Size {
-        width: WIDTH,
-        height: HEIGHT,
-    });
-    if matches!(cfgs.validate(), CameraConfigurationStatus::Invalid) {
-        panic!("invalid camera configuration");
-    }
-    cam.configure(&mut cfgs).expect("configure");
-
-    let cfg = cfgs.get(0).expect("configured stream 0");
-    let stream = cfg.stream().expect("stream handle");
-
-    let mut alloc = FrameBufferAllocator::new(&cam);
-    let buffers = alloc.alloc(&stream).expect("alloc buffers");
-    let buffers = buffers
-        .into_iter()
-        .map(|buf| MemoryMappedFrameBuffer::new(buf).expect("map capture buffer"))
-        .collect::<Vec<_>>();
-
-    let reqs: Vec<_> = buffers
-        .into_iter()
-        .enumerate()
-        .map(|(i, buf)| {
-            let mut req = cam.create_request(Some(i as u64)).expect("create request");
-            req.add_buffer(&stream, buf).expect("add buffer to request");
-            req
-        })
-        .collect();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    cam.on_request_completed(move |req| {
-        // Runs on the libcamera thread. If the main loop has exited and dropped
-        // `rx`, the send fails; ignore it (the daemon is shutting down) rather
-        // than panicking in libcamera's thread.
-        let _ = tx.send(req);
-    });
-
-    cam.start(None).expect("start");
+    session.cam.start(None).expect("start");
     if let Some(s) = &sensor {
         let _ = s.apply(state);
     }
-    for req in reqs {
-        cam.queue_request(req).map_err(|(_, e)| e).expect("queue initial request");
+    for req in std::mem::take(&mut session.requests) {
+        session
+            .cam
+            .queue_request(req)
+            .map_err(|(_, e)| e)
+            .expect("queue initial request");
     }
 
     // --- Sensor apply-delay measurement mode (no loopback, no ISP output). ---
     if args.measure {
         match &sensor {
-            Some(s) => run_measure_delay(&mut cam, &stream, &rx, s, state),
+            Some(s) => run_measure_delay(&mut session.cam, &session.stream, &session.rx, s, state),
             None => eprintln!("--measure-delay needs sensor control, but none is available"),
         }
         return;
     }
 
-    // --- Live path: ISP engine + loopback output. ---
+    run_live(&mut session.cam, &session.stream, &session.rx, sensor, state, &args);
+}
+
+/// Live path: resolve the ISP backend, open the loopback output, and run the
+/// capture/process/AE loop until the camera times out or a write fails. Drops
+/// stale frames so latency stays low when the ISP falls behind, meters output
+/// luma for AE, and applies gain-adaptive denoise to the produced frame.
+fn run_live(
+    cam: &mut ActiveCamera,
+    stream: &Stream,
+    rx: &std::sync::mpsc::Receiver<Request>,
+    sensor: Option<Sensor>,
+    mut state: AeState,
+    args: &Args,
+) {
     // Resolve the backend now (Auto may fall back to CPU), so the output size is
     // known before the loopback is opened.
-    let (mut engine, dst_w, dst_h) = build_engine(&args);
+    let (mut engine, dst_w, dst_h) = build_engine(args);
 
     let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32)
         .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
@@ -703,7 +730,7 @@ fn main() {
             dropped += 1;
         }
 
-        let buf = match frame_bytes(&req, &stream) {
+        let buf = match frame_bytes(&req, stream) {
             Some(b) => b,
             None => {
                 // Malformed/short frame: skip it, requeue the buffer, keep going.
@@ -725,40 +752,22 @@ fn main() {
         let processed = match engine.process(buf) {
             Ok(yuyv) => {
                 luma = Some(mean_luma_norm(yuyv));
-                // Gain-adaptive denoise on the produced frame. Applied here
+                // Gain-adaptive denoise on the produced frame, applied here
                 // (post-process) so it covers both the CPU and GPU backends
-                // uniformly. Chroma is spatial, luma is temporal; both ramp with
-                // analogue gain and are no-ops at low gain (the well-lit common
-                // case), so this whole block is skipped and the frame is written
-                // straight through. When idle the temporal history is dropped so
-                // it re-seeds cleanly (no ghosting) when gain rises again.
-                let (dr, ds) = chroma_denoise_for_gain(state.gain_index, args.denoise);
-                let ta = temporal_luma_for_gain(state.gain_index, args.temporal);
+                // uniformly. No-op at low gain (the common case), where the frame
+                // is written straight through; see `apply_denoise`.
+                let (dr, ta, used) = apply_denoise(
+                    yuyv,
+                    dst_w,
+                    dst_h,
+                    state.gain_index,
+                    args,
+                    &mut denoise_buf,
+                    &mut prev_y,
+                );
                 last_dn = dr;
                 last_ta = ta;
-                let chroma_on = dr > 0 && ds > 0.0;
-                let temporal_on = ta > 0.0;
-                let frame: &[u8] = if chroma_on || temporal_on {
-                    denoise_buf.clear();
-                    denoise_buf.extend_from_slice(yuyv);
-                    if chroma_on {
-                        denoise_chroma_yuyv(&mut denoise_buf, dst_w, dst_h, dr, ds);
-                    }
-                    if temporal_on {
-                        temporal_denoise_luma_yuyv(
-                            &mut denoise_buf,
-                            &mut prev_y,
-                            dst_w,
-                            dst_h,
-                            ta,
-                            TEMPORAL_MOTION,
-                        );
-                    }
-                    &denoise_buf
-                } else {
-                    prev_y.clear();
-                    yuyv
-                };
+                let frame: &[u8] = if used { &denoise_buf } else { yuyv };
                 match out.write_frame(frame) {
                     Ok(()) => true,
                     Err(e) => {
