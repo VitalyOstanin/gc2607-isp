@@ -46,6 +46,9 @@ pub const GAIN_TABLE: [f64; 17] = [
     1024.0 / 64.0,
 ];
 
+/// Highest valid analogue-gain LUT index (`GAIN_TABLE` has 17 entries, 0..=16).
+pub const MAX_GAIN_INDEX: u8 = (GAIN_TABLE.len() - 1) as u8;
+
 /// Active line count used for the frame-length (VTS) computation.
 pub const NATIVE_HEIGHT: i32 = 1088;
 /// Horizontal total size (line length in pixel-clock units): width + hblank.
@@ -195,11 +198,32 @@ pub fn step(cfg: &AeConfig, state: AeState, metric: f64) -> AeState {
         (e, vblank_floor, g)
     };
 
-    AeState {
+    let mut next = AeState {
         exposure,
         gain_index,
         vblank,
+    };
+
+    // Outside the deadband but integer rounding of the exposure produced no
+    // change: nudge one line (or one gain step at the exposure cap) toward the
+    // target so the loop cannot stall just shy of the deadband. Each nudge is a
+    // sub-percent brightness change, so it converges into the deadband without
+    // overshoot. Reachable only for tiny exposures; cheap insurance regardless.
+    if next == state {
+        if ratio > 1.0 {
+            if next.exposure < exposure_max(next.vblank) {
+                next.exposure += 1;
+            } else if next.gain_index < cfg.max_gain_index {
+                next.gain_index += 1;
+            }
+        } else if next.exposure > EXPOSURE_MIN {
+            next.exposure -= 1;
+        } else if next.gain_index > 0 {
+            next.gain_index -= 1;
+        }
     }
+
+    next
 }
 
 #[cfg(test)]
@@ -283,6 +307,30 @@ mod tests {
         let next = step(&cfg, st, cfg.target * 4.0);
         let after = next.exposure as f64 * GAIN_TABLE[next.gain_index as usize];
         assert!(after < before);
+    }
+
+    #[test]
+    fn converges_with_nonlinear_metric() {
+        // The live loop meters post-gamma luma, so the brightness response is
+        // metric = (k * product)^(1/2.4), not the linear model step() assumes.
+        // step() still converges because the response is monotonic; this guards
+        // the actual non-linear regime used in production reaches the target
+        // (the linear test below only covers the model step() was written for).
+        let cfg = AeConfig::default();
+        let mut st = AeState::default();
+        let k = 3.0e-4f64; // scene gain; converged product well within 30 fps range
+        for _ in 0..120 {
+            let product = st.exposure as f64 * GAIN_TABLE[st.gain_index as usize];
+            let metric = (k * product).powf(1.0 / 2.4).min(1.0);
+            st = step(&cfg, st, metric);
+        }
+        let product = st.exposure as f64 * GAIN_TABLE[st.gain_index as usize];
+        let metric = (k * product).powf(1.0 / 2.4);
+        assert!(
+            (metric - cfg.target).abs() < cfg.target * cfg.deadband * 1.5,
+            "non-linear metric {metric} should converge near target {}",
+            cfg.target
+        );
     }
 
     #[test]

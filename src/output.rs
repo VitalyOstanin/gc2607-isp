@@ -316,15 +316,19 @@ pub fn temporal_denoise_luma_yuyv(
         });
 }
 
-/// Full-range BT.601 (JFIF) RGB -> YCbCr.
+/// Neutral chroma level for 8-bit full-range YCbCr (the Cb/Cr zero point).
+const CHROMA_NEUTRAL: f32 = 128.0;
+
+/// Full-range BT.601 (JFIF) RGB -> YCbCr. The WGSL shader (`gpu.rs` `ycbcr`)
+/// mirrors these coefficients; keep both in sync.
 #[inline]
 fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     let rf = r as f32;
     let gf = g as f32;
     let bf = b as f32;
     let y = 0.299 * rf + 0.587 * gf + 0.114 * bf;
-    let cb = 128.0 - 0.168_736 * rf - 0.331_264 * gf + 0.5 * bf;
-    let cr = 128.0 + 0.5 * rf - 0.418_688 * gf - 0.081_312 * bf;
+    let cb = CHROMA_NEUTRAL - 0.168_736 * rf - 0.331_264 * gf + 0.5 * bf;
+    let cr = CHROMA_NEUTRAL + 0.5 * rf - 0.418_688 * gf - 0.081_312 * bf;
     (
         y.round().clamp(0.0, 255.0) as u8,
         cb.round().clamp(0.0, 255.0) as u8,

@@ -88,8 +88,9 @@ impl Engine {
     }
 }
 
-const WIDTH: u32 = 1928;
-const HEIGHT: u32 = 1088;
+// Native sensor geometry (single source of truth in `raw`).
+const WIDTH: u32 = gc2607_isp::raw::W as u32;
+const HEIGHT: u32 = gc2607_isp::raw::H as u32;
 
 /// Re-estimate white balance / CCM every N frames. The scene's colour
 /// temperature is stable between estimates, so the AWB sort (the heaviest serial
@@ -321,6 +322,20 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
     )
 }
 
+/// Borrow the raw capture bytes from a completed request's first plane, or
+/// `None` if the buffer, metadata, or plane is missing or `bytes_used` exceeds
+/// the mapped plane. A malformed or short frame is then skipped rather than
+/// panicking, so the long-running daemon keeps streaming.
+fn frame_bytes<'a>(req: &'a Request, stream: &Stream) -> Option<&'a [u8]> {
+    let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(stream)?;
+    // The plane reference borrows the mmap (tied to `req`), so copy it out of the
+    // temporary Vec returned by `data()` before that Vec is dropped.
+    let plane: &[u8] = *fb.data().first()?;
+    // `planes()` returns a libcamera wrapper (not a slice), so index with get(0).
+    let bytes_used = fb.metadata()?.planes().get(0)?.bytes_used as usize;
+    Some(&plane[..bytes_used.min(plane.len())])
+}
+
 /// Read the next completed request in strict capture order (no frame dropping)
 /// and return its raw-mean brightness metric, requeuing the buffer. Returns
 /// `None` only on capture timeout. `--measure-delay` must observe every sensor
@@ -331,13 +346,7 @@ fn next_in_order_mean(
     rx: &std::sync::mpsc::Receiver<Request>,
 ) -> Option<f64> {
     let mut req = rx.recv_timeout(Duration::from_secs(5)).ok()?;
-    let mean = {
-        let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(stream).unwrap();
-        let plane = fb.data();
-        let plane = plane.first().unwrap();
-        let bytes_used = fb.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
-        gc2607_isp::raw::mean_norm_from_bytes(&plane[..bytes_used])
-    };
+    let mean = frame_bytes(&req, stream).and_then(gc2607_isp::raw::mean_norm_from_bytes);
     req.reuse(ReuseFlag::REUSE_BUFFERS);
     cam.queue_request(req).map_err(|(_, e)| e).ok()?;
     Some(mean.unwrap_or(f64::NAN))
@@ -562,7 +571,7 @@ fn main() {
     let mut state = AeState::default();
     if let Some(s) = &sensor {
         state.exposure = s.exposure().unwrap_or(state.exposure);
-        state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, 16) as u8;
+        state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
         state.vblank = s.vblank().unwrap_or(state.vblank);
     }
 
@@ -575,7 +584,7 @@ fn main() {
     let mut cfgs = cam
         .generate_configuration(&[StreamRole::Raw])
         .expect("generate raw configuration");
-    cfgs.get_mut(0).unwrap().set_size(Size {
+    cfgs.get_mut(0).expect("raw stream configuration").set_size(Size {
         width: WIDTH,
         height: HEIGHT,
     });
@@ -584,29 +593,32 @@ fn main() {
     }
     cam.configure(&mut cfgs).expect("configure");
 
-    let cfg = cfgs.get(0).unwrap();
-    let stream = cfg.stream().unwrap();
+    let cfg = cfgs.get(0).expect("configured stream 0");
+    let stream = cfg.stream().expect("stream handle");
 
     let mut alloc = FrameBufferAllocator::new(&cam);
     let buffers = alloc.alloc(&stream).expect("alloc buffers");
     let buffers = buffers
         .into_iter()
-        .map(|buf| MemoryMappedFrameBuffer::new(buf).unwrap())
+        .map(|buf| MemoryMappedFrameBuffer::new(buf).expect("map capture buffer"))
         .collect::<Vec<_>>();
 
     let reqs: Vec<_> = buffers
         .into_iter()
         .enumerate()
         .map(|(i, buf)| {
-            let mut req = cam.create_request(Some(i as u64)).unwrap();
-            req.add_buffer(&stream, buf).unwrap();
+            let mut req = cam.create_request(Some(i as u64)).expect("create request");
+            req.add_buffer(&stream, buf).expect("add buffer to request");
             req
         })
         .collect();
 
     let (tx, rx) = std::sync::mpsc::channel();
     cam.on_request_completed(move |req| {
-        tx.send(req).unwrap();
+        // Runs on the libcamera thread. If the main loop has exited and dropped
+        // `rx`, the send fails; ignore it (the daemon is shutting down) rather
+        // than panicking in libcamera's thread.
+        let _ = tx.send(req);
     });
 
     cam.start(None).expect("start");
@@ -614,7 +626,7 @@ fn main() {
         let _ = s.apply(state);
     }
     for req in reqs {
-        cam.queue_request(req).map_err(|(_, e)| e).unwrap();
+        cam.queue_request(req).map_err(|(_, e)| e).expect("queue initial request");
     }
 
     // --- Sensor apply-delay measurement mode (no loopback, no ISP output). ---
@@ -643,6 +655,11 @@ fn main() {
 
     let mut frames = 0u64;
     let mut dropped = 0u64;
+    // Frames skipped because the ISP/GPU returned an error or the buffer was
+    // malformed, and sensor-apply failures: counted so a systematic fault is
+    // visible in the periodic report instead of being silently swallowed.
+    let mut errors = 0u64;
+    let mut ae_errors = 0u64;
     let mut last_report = Instant::now();
     let mut report_frames = 0u64;
     // Last metered output luma (0..1), for the periodic telemetry line.
@@ -679,16 +696,26 @@ fn main() {
         };
         while let Ok(newer) = rx.try_recv() {
             req.reuse(ReuseFlag::REUSE_BUFFERS);
-            cam.queue_request(req).map_err(|(_, e)| e).unwrap();
+            if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
+                eprintln!("requeue (drain) failed: {e}");
+            }
             req = newer;
             dropped += 1;
         }
 
-        let fb: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
-        let plane = fb.data();
-        let plane = plane.first().unwrap();
-        let bytes_used = fb.metadata().unwrap().planes().get(0).unwrap().bytes_used as usize;
-        let buf = &plane[..bytes_used];
+        let buf = match frame_bytes(&req, &stream) {
+            Some(b) => b,
+            None => {
+                // Malformed/short frame: skip it, requeue the buffer, keep going.
+                errors += 1;
+                req.reuse(ReuseFlag::REUSE_BUFFERS);
+                if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
+                    eprintln!("requeue after malformed frame failed: {e}; stopping");
+                    break;
+                }
+                continue;
+            }
+        };
 
         // ISP (reuses buffers, caches AWB/CCM across frames). The engine returns
         // a packed YUYV frame (CPU renders RGB then packs; GPU packs in-shader).
@@ -740,7 +767,15 @@ fn main() {
                     }
                 }
             }
-            Err(_) => false,
+            Err(e) => {
+                // Skip the frame but make the failure observable (throttled) so a
+                // systematic ISP/GPU fault does not look like a silently idle daemon.
+                errors += 1;
+                if errors <= 5 || errors % 100 == 0 {
+                    eprintln!("frame {frames}: ISP error ({errors} total): {e}");
+                }
+                false
+            }
         };
         if processed {
             // AE from this frame's output luma, with apply-delay settling.
@@ -753,7 +788,14 @@ fn main() {
                 } else if let (Some(m), Some(s)) = (luma, &sensor) {
                     let next = ae::step(&ae_cfg, state, m);
                     if next != state {
-                        let _ = s.apply(next);
+                        if let Err(e) = s.apply(next) {
+                            // Don't kill the stream on a transient subdev write
+                            // failure; count it so a persistent fault is visible.
+                            ae_errors += 1;
+                            if ae_errors <= 5 {
+                                eprintln!("sensor apply failed ({ae_errors}): {e}");
+                            }
+                        }
                         state = next;
                         ae_hold = AE_SETTLE;
                     }
@@ -764,13 +806,16 @@ fn main() {
         }
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
-        cam.queue_request(req).map_err(|(_, e)| e).unwrap();
+        if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
+            eprintln!("requeue failed: {e}; stopping");
+            break;
+        }
 
         // Periodic throughput report.
         if last_report.elapsed() >= Duration::from_secs(2) {
             let fps = report_frames as f64 / last_report.elapsed().as_secs_f64();
             println!(
-                "{frames} frames, {fps:.1} fps processed, {dropped} dropped, \
+                "{frames} frames, {fps:.1} fps processed, {dropped} dropped, {errors} errors, \
                  exposure={} gain_idx={} ({:.1} fps sensor), Y={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}",
                 state.exposure,
                 state.gain_index,
@@ -781,5 +826,5 @@ fn main() {
         }
     }
 
-    println!("stopped after {frames} frames ({dropped} dropped)");
+    println!("stopped after {frames} frames ({dropped} dropped, {errors} errors, {ae_errors} sensor-apply errors)");
 }

@@ -117,6 +117,8 @@ fn build_cfa(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Highlight-desaturation knee; must match pipeline::HIGHLIGHT_KNEE.
 const HIGHLIGHT_KNEE: f32 = 0.95;
 
+// Mirrors pipeline::srgb (constants SRGB_LIN_THRESH/SLOPE/SCALE/GAMMA/OFFSET);
+// keep the literals below in sync with that single Rust source.
 fn srgb(x: f32) -> f32 {
     let v = clamp(x, 0.0, 1.0);
     if (v <= 0.0031308) { return 12.92 * v; }
@@ -224,6 +226,7 @@ fn to_rgb8(lin: vec3<f32>) -> vec3<f32> {
 }
 
 // Full-range BT.601 (JFIF) RGB(0..255) -> YCbCr(0..255), rounded and clamped.
+// Mirrors output::rgb_to_ycbcr (128.0 == output::CHROMA_NEUTRAL); keep in sync.
 fn ycbcr(c: vec3<f32>) -> vec3<f32> {
     let yy = 0.299 * c.x + 0.587 * c.y + 0.114 * c.z;
     let cb = 128.0 - 0.168736 * c.x - 0.331264 * c.y + 0.5 * c.z;
@@ -661,7 +664,7 @@ impl GpuProcessor {
     /// Pack the current estimate into the uniform block and upload it, along with
     /// this frame's per-sector ACM matrices (CCT-interpolated on the CPU).
     fn upload_params(&self) {
-        let est = self.est.as_ref().unwrap();
+        let est = self.est.as_ref().expect("estimate present (upload_params runs right after reestimate)");
         let g = est.gains;
         let c = est.ccm;
         let params = Params {
@@ -767,11 +770,24 @@ impl GpuProcessor {
         rx.recv()
             .map_err(|e| io::Error::other(format!("gpu map channel: {e}")))?
             .map_err(|e| io::Error::other(format!("gpu map: {e}")))?;
-        {
+        // Copy the readback out, guarding against a size mismatch (which would
+        // make copy_from_slice panic) by surfacing it as an Err instead. `data`
+        // is dropped before unmap so the buffer is no longer borrowed.
+        let mismatch = {
             let data = slice.get_mapped_range();
-            self.yuyv_host.copy_from_slice(&data);
-        }
+            if data.len() == self.yuyv_host.len() {
+                self.yuyv_host.copy_from_slice(&data);
+                None
+            } else {
+                Some((data.len(), self.yuyv_host.len()))
+            }
+        };
         self.staging_buf.unmap();
+        if let Some((got, want)) = mismatch {
+            return Err(io::Error::other(format!(
+                "gpu readback size {got} != expected {want}"
+            )));
+        }
 
         self.frame = self.frame.wrapping_add(1);
         Ok(&self.yuyv_host)

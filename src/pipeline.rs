@@ -87,7 +87,8 @@ fn percentile_sorted(sorted: &[f32], q: f64) -> f64 {
 /// Median of a slice (numpy-compatible: average of the two middles when even).
 fn median(values: &mut [f32]) -> f64 {
     let n = values.len();
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // total_cmp orders NaN deterministically instead of panicking on partial_cmp.
+    values.sort_by(f32::total_cmp);
     if n % 2 == 1 {
         values[n / 2] as f64
     } else {
@@ -132,15 +133,24 @@ pub(crate) fn desaturate_highlight(r: &mut f64, g: &mut f64, b: &mut f64) {
     }
 }
 
+/// Fraction of full scale above which a pixel is treated as clipped and excluded
+/// from the AWB statistics. Numerically equal to [`HIGHLIGHT_KNEE`] but a
+/// distinct concept (clip rejection vs highlight desaturation).
+const AWB_CLIP_FRACTION: f32 = 0.95;
+
+/// Minimum number of pixels a mask must select before its median chroma is
+/// trusted; below this the next, looser mask is tried.
+const AWB_MIN_SAMPLES: usize = 100;
+
 /// Robust-neutral AWB: median chroma over bright, non-clipped pixels, with
 /// graceful fallbacks so the selection never collapses to empty.
 pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
     let n = p.hh * p.ww;
     let green: Vec<f32> = (0..n).map(|i| 0.5 * (p.gr[i] + p.gb[i])).collect();
-    let clip = 0.95 * MAXLIN;
+    let clip = AWB_CLIP_FRACTION * MAXLIN;
 
     let mut sorted = green.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(f32::total_cmp);
     let p60 = percentile_sorted(&sorted, 60.0) as f32;
 
     let not_clipped: Vec<bool> = (0..n)
@@ -157,7 +167,7 @@ pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
 
     for mask in masks.iter() {
         let idx: Vec<usize> = (0..n).filter(|&i| mask(i)).collect();
-        if idx.len() >= 100 {
+        if idx.len() >= AWB_MIN_SAMPLES {
             let mut rg: Vec<f32> = idx.iter().map(|&i| p.r[i] / green[i]).collect();
             let mut bg: Vec<f32> = idx.iter().map(|&i| p.b[i] / green[i]).collect();
             return (median(&mut rg) as f32, median(&mut bg) as f32);
@@ -171,6 +181,11 @@ pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
         sr += p.r[i] as f64;
         sg += green[i] as f64;
         sb += p.b[i] as f64;
+    }
+    // Degenerate (near-black) frame with no valid green: assume neutral rather
+    // than dividing by zero and propagating NaN through the gains.
+    if sg <= 0.0 {
+        return (1.0, 1.0);
     }
     ((sr / sg) as f32, (sb / sg) as f32)
 }
@@ -400,6 +415,10 @@ pub(crate) fn smooth_chroma(prev: Option<(f32, f32)>, rg: f32, bg: f32) -> (f32,
 /// chosen scene chroma. `prev_ls` enables LSC switch hysteresis for the live
 /// runtimes; stateless callers pass `None`.
 pub(crate) fn estimate_from_chroma(rg: f32, bg: f32, prev_ls: Option<usize>) -> Estimate {
+    // Guard against a degenerate chroma (zero/NaN from a black frame): fall back
+    // to neutral so the gains stay finite instead of becoming inf/NaN.
+    let rg = if rg.is_finite() && rg > 0.0 { rg } else { 1.0 };
+    let bg = if bg.is_finite() && bg > 0.0 { bg } else { 1.0 };
     let gains = [1.0 / rg as f64, 1.0, 1.0 / bg as f64];
     let cct = estimate_cct(rg as f64, bg as f64);
     let ls = select_ls_hyst(rg as f64, bg as f64, prev_ls);
@@ -442,12 +461,21 @@ fn resize_grid(grid: &[f32], gh: usize, gw: usize, out_h: usize, out_w: usize) -
     out
 }
 
+/// sRGB OETF (linear -> gamma) breakpoint and coefficients. The WGSL shader
+/// (`gpu.rs` `srgb`) and the Python reference mirror these literals; keep all
+/// three in sync.
+const SRGB_LIN_THRESH: f64 = 0.003_130_8;
+const SRGB_LIN_SLOPE: f64 = 12.92;
+const SRGB_SCALE: f64 = 1.055;
+const SRGB_GAMMA: f64 = 1.0 / 2.4;
+const SRGB_OFFSET: f64 = 0.055;
+
 fn srgb(x: f64) -> f64 {
     let x = x.clamp(0.0, 1.0);
-    if x <= 0.0031308 {
-        12.92 * x
+    if x <= SRGB_LIN_THRESH {
+        SRGB_LIN_SLOPE * x
     } else {
-        1.055 * x.powf(1.0 / 2.4) - 0.055
+        SRGB_SCALE * x.powf(SRGB_GAMMA) - SRGB_OFFSET
     }
 }
 
@@ -1079,21 +1107,21 @@ impl Processor {
                 if estimating {
                     self.reestimate();
                 }
-                let gains = self.est.as_ref().unwrap().gains;
-                let ccm = self.est.as_ref().unwrap().ccm;
+                let gains = self.est.as_ref().expect("estimate present after first frame").gains;
+                let ccm = self.est.as_ref().expect("estimate present after first frame").ccm;
                 let Self { out, planes, grids, acm, .. } = &mut *self;
-                render_half_into(out, planes, gains, ccm, grids.as_ref().unwrap(), acm.as_ref().unwrap());
+                render_half_into(out, planes, gains, ccm, grids.as_ref().expect("grids built after first estimate"), acm.as_ref().expect("acm built after first estimate"));
             }
             DebayerMode::Mhc => {
                 if estimating {
                     fill_planes_blc_from_bytes(bytes, &mut self.planes);
                     self.reestimate();
                 }
-                let gains = self.est.as_ref().unwrap().gains;
-                let ccm = self.est.as_ref().unwrap().ccm;
+                let gains = self.est.as_ref().expect("estimate present after first frame").gains;
+                let ccm = self.est.as_ref().expect("estimate present after first frame").ccm;
                 {
                     let Self { cfa, grids, .. } = &mut *self;
-                    fill_cfa_lscwb_from_bytes(bytes, cfa, grids.as_ref().unwrap(), gains);
+                    fill_cfa_lscwb_from_bytes(bytes, cfa, grids.as_ref().expect("grids built after first estimate"), gains);
                 }
                 if self.lca.is_some() {
                     {
@@ -1101,10 +1129,10 @@ impl Processor {
                         mhc_to_planar_into(planar, cfa, W, H);
                     }
                     let Self { out, planar, lca, acm, .. } = &mut *self;
-                    render_lca_color_into(out, planar, W, H, ccm, acm.as_ref().unwrap(), lca.as_ref().unwrap());
+                    render_lca_color_into(out, planar, W, H, ccm, acm.as_ref().expect("acm built after first estimate"), lca.as_ref().unwrap());
                 } else {
                     let Self { out, cfa, acm, .. } = &mut *self;
-                    render_mhc_fused_into(out, cfa, W, H, ccm, acm.as_ref().unwrap());
+                    render_mhc_fused_into(out, cfa, W, H, ccm, acm.as_ref().expect("acm built after first estimate"));
                 }
             }
         }

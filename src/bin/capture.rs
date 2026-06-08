@@ -115,14 +115,14 @@ fn main() {
     let mut state = AeState::default();
     if let Some(s) = &sensor {
         state.exposure = s.exposure().unwrap_or(state.exposure);
-        state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, 16) as u8;
+        state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
         state.vblank = s.vblank().unwrap_or(state.vblank);
     }
     if let Some(e) = args.exposure {
         state.exposure = e;
     }
     if let Some(g) = args.gain {
-        state.gain_index = g.min(16);
+        state.gain_index = g.min(ae::MAX_GAIN_INDEX);
     }
     if let Some(v) = args.vblank {
         state.vblank = v;
