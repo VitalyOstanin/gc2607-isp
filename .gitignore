@@ -13,3 +13,9 @@ __pycache__/
 # capture binary built in container, copied to host for running
 /gc2607-capture
 /gc2607-video
+
+# timestamped backups of the host-deployed binaries before a redeploy
+*.bak-*
+
+# local project-check review reports (generated, not part of the source)
+/docs/reviews/
