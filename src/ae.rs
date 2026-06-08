@@ -165,7 +165,9 @@ pub fn step(cfg: &AeConfig, state: AeState, metric: f64) -> AeState {
     }
 
     // Damp and clamp the per-frame correction.
-    let r = ratio.powf(cfg.damping).clamp(1.0 / cfg.max_step, cfg.max_step);
+    let r = ratio
+        .powf(cfg.damping)
+        .clamp(1.0 / cfg.max_step, cfg.max_step);
 
     let cur_mult = GAIN_TABLE[state.gain_index as usize];
     let cur_product = state.exposure as f64 * cur_mult;

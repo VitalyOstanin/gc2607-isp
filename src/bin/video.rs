@@ -34,6 +34,7 @@
 //!                [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>]
 //!                [--threads <n>] [--on-demand auto|on|off] [--measure-delay]
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -102,7 +103,12 @@ enum Engine {
 impl Engine {
     fn process(&mut self, buf: &[u8]) -> io::Result<&[u8]> {
         match self {
-            Engine::Cpu { proc, yuyv, dst_w, dst_h } => {
+            Engine::Cpu {
+                proc,
+                yuyv,
+                dst_w,
+                dst_h,
+            } => {
                 let (w, h, rgb) = proc.process(buf)?;
                 rgb_to_yuyv_crop(rgb, w, h, yuyv, *dst_w, *dst_h);
                 Ok(yuyv)
@@ -214,9 +220,21 @@ fn parse_args() -> Args {
             "--no-ae" => ae = false,
             "--no-lca" => lca = false,
             "--no-denoise" => denoise = 0.0,
-            "--denoise" => denoise = it.next().and_then(|s| s.parse().ok()).unwrap_or(denoise).max(0.0),
+            "--denoise" => {
+                denoise = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(denoise)
+                    .max(0.0)
+            }
             "--no-temporal" => temporal = 0.0,
-            "--temporal" => temporal = it.next().and_then(|s| s.parse().ok()).unwrap_or(temporal).max(0.0),
+            "--temporal" => {
+                temporal = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(temporal)
+                    .max(0.0)
+            }
             "--measure-delay" => measure = true,
             "--on-demand" => match it.next().as_deref() {
                 Some("auto") => on_demand = OnDemandMode::Auto,
@@ -229,7 +247,13 @@ fn parse_args() -> Args {
             },
             "--target" => target = it.next().and_then(|s| s.parse().ok()).unwrap_or(target),
             "--max-gain" => max_gain = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_gain),
-            "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads).max(1),
+            "--threads" => {
+                threads = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(threads)
+                    .max(1)
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "usage: gc2607-video [--device /dev/videoN] [--device-label <name>] \
@@ -352,7 +376,7 @@ fn apply_denoise(
 /// the slightly larger ISP output.
 fn output_size(mode: DebayerMode) -> (usize, usize) {
     match mode {
-        DebayerMode::Mhc => (1920, 1080),  // from 1928x1088
+        DebayerMode::Mhc => (1920, 1080),   // from 1928x1088
         DebayerMode::HalfRes => (960, 540), // from 964x544
     }
 }
@@ -435,7 +459,9 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
 
     #[cfg(not(feature = "gpu"))]
     if args.backend == Backend::Gpu {
-        eprintln!("this binary was built without the `gpu` feature; rebuild with --features capture,gpu");
+        eprintln!(
+            "this binary was built without the `gpu` feature; rebuild with --features capture,gpu"
+        );
         std::process::exit(1);
     }
 
@@ -480,7 +506,7 @@ fn next_in_order_mean(
     stream: &Stream,
     rx: &std::sync::mpsc::Receiver<Request>,
 ) -> Option<f64> {
-    let mut req = rx.recv_timeout(Duration::from_secs(5)).ok()?;
+    let mut req = rx.recv_timeout(cam_setup::RECV_TIMEOUT).ok()?;
     let mean = frame_bytes(&req, stream).and_then(gc2607_isp::raw::mean_norm_from_bytes);
     req.reuse(ReuseFlag::REUSE_BUFFERS);
     cam.queue_request(req).map_err(|(_, e)| e).ok()?;
@@ -529,7 +555,13 @@ fn record_means(
 
 /// Settled level after a step: the mean of the last few recorded frames.
 fn plateau_of(means: &[f64]) -> f64 {
-    let tail: Vec<f64> = means.iter().rev().take(4).copied().filter(|m| m.is_finite()).collect();
+    let tail: Vec<f64> = means
+        .iter()
+        .rev()
+        .take(4)
+        .copied()
+        .filter(|m| m.is_finite())
+        .collect();
     if tail.is_empty() {
         f64::NAN
     } else {
@@ -554,7 +586,11 @@ fn detect_delay(base: f64, plateau: f64, means: &[f64]) -> Option<usize> {
 fn report_step(header: &str, base: f64, plateau: f64, means: &[f64], delay: Option<usize>) {
     println!("{header}: base mean {base:.3}, settled {plateau:.3}");
     for (i, m) in means.iter().enumerate() {
-        let marker = if delay == Some(i + 1) { "  <- delay" } else { "" };
+        let marker = if delay == Some(i + 1) {
+            "  <- delay"
+        } else {
+            ""
+        };
         println!("  +{:>2}: mean {m:.3}{marker}", i + 1);
     }
     println!();
@@ -671,7 +707,9 @@ fn run_measure_delay(
     print_delay("exposure", exp_delay);
     print_delay("gain", gain_delay);
     match (exp_delay, gain_delay) {
-        (Some(a), Some(b)) => println!("suggested AE_SETTLE = {} frames (max of the two)", a.max(b)),
+        (Some(a), Some(b)) => {
+            println!("suggested AE_SETTLE = {} frames (max of the two)", a.max(b))
+        }
         _ => println!("could not auto-detect one or both delays; read the per-frame tables above"),
     }
     println!(
@@ -698,7 +736,10 @@ fn init_sensor() -> (Option<Sensor>, AeState) {
     let mut state = AeState::default();
     if let Some(s) = &sensor {
         state.exposure = s.exposure().unwrap_or(state.exposure);
-        state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
+        state.gain_index = s
+            .analogue_gain()
+            .unwrap_or(0)
+            .clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
         state.vblank = s.vblank().unwrap_or(state.vblank);
     }
     (sensor, state)
@@ -747,27 +788,38 @@ fn main() {
     // v4l2loopback) falls back to always-on.
     let on_demand = match args.on_demand {
         OnDemandMode::Off => false,
-        mode => match out.subscribe_client_usage() {
-            Ok(()) => {
-                println!("on-demand: camera runs only while a consumer captures (client-usage event)");
-                true
-            }
-            Err(e) => {
-                if mode == OnDemandMode::On {
-                    eprintln!(
-                        "on-demand requested but the v4l2loopback client-usage event is \
-                         unavailable ({e}); falling back to always-on"
-                    );
-                } else {
-                    eprintln!("note: v4l2loopback client-usage event unavailable ({e}); running always-on");
+        mode => {
+            match out.subscribe_client_usage() {
+                Ok(()) => {
+                    println!("on-demand: camera runs only while a consumer captures (client-usage event)");
+                    true
                 }
-                false
+                Err(e) => {
+                    if mode == OnDemandMode::On {
+                        eprintln!(
+                            "on-demand requested but the v4l2loopback client-usage event is \
+                         unavailable ({e}); falling back to always-on"
+                        );
+                    } else {
+                        eprintln!("note: v4l2loopback client-usage event unavailable ({e}); running always-on");
+                    }
+                    false
+                }
             }
-        },
+        }
     };
 
     if on_demand {
-        run_on_demand(&mgr, &mut out, dst_w, dst_h, &mut engine, &sensor, &mut state, &args);
+        run_on_demand(
+            &mgr,
+            &mut out,
+            dst_w,
+            dst_h,
+            &mut engine,
+            &sensor,
+            &mut state,
+            &args,
+        );
     } else {
         // Always-on: open and start the camera once, stream until a fatal error.
         let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
@@ -778,8 +830,17 @@ fn main() {
         }
         queue_initial(&mut session);
         run_live(
-            &mut engine, &mut out, &mut session.cam, &session.stream, &session.rx,
-            dst_w, dst_h, &sensor, &mut state, &args, false,
+            &mut engine,
+            &mut out,
+            &mut session.cam,
+            &session.stream,
+            &session.rx,
+            dst_w,
+            dst_h,
+            &sensor,
+            &mut state,
+            &args,
+            false,
         );
     }
 }
@@ -802,7 +863,11 @@ enum FrameOutcome {
     /// Written to the loopback. Carries the output mean linear luminance (the AE
     /// control variable; see [`mean_linear_luma`]) and the applied denoise
     /// strengths (chroma radius, temporal alpha).
-    Written { luma: f64, chroma_radius: usize, temporal_alpha: f64 },
+    Written {
+        luma: f64,
+        chroma_radius: usize,
+        temporal_alpha: f64,
+    },
     /// The ISP/GPU returned an error or the frame work panicked; the frame is
     /// skipped. Carries a human-readable reason for the throttled log.
     Skipped(String),
@@ -838,7 +903,11 @@ fn process_and_write(
             apply_denoise(yuyv, dst_w, dst_h, gain_index, args, denoise_buf, prev_y);
         let frame: &[u8] = if used { denoise_buf.as_slice() } else { yuyv };
         match out.write_frame(frame) {
-            Ok(()) => FrameOutcome::Written { luma, chroma_radius, temporal_alpha },
+            Ok(()) => FrameOutcome::Written {
+                luma,
+                chroma_radius,
+                temporal_alpha,
+            },
             Err(e) => FrameOutcome::WriteFailed(e),
         }
     }));
@@ -916,15 +985,30 @@ fn run_live(
     const AE_SETTLE: u32 = 3;
     let mut ae_hold = 0u32;
 
+    // Denoise strength is keyed on the gain the frame was *exposed* with. A new
+    // AE gain reaches the pixels with the same apply delay AE_SETTLE budgets for
+    // (`--measure-delay` observed 2 frames), so the gain commanded now does not
+    // describe the frame in hand. `gain_log` records the commanded gain per
+    // processed frame; the value APPLY_DELAY frames back is the one this frame
+    // was captured with. Until that much history exists, the earliest known gain
+    // is used.
+    const APPLY_DELAY: usize = 2;
+    let mut gain_log: VecDeque<u8> = VecDeque::new();
+
     let exit = loop {
         // On-demand: stop as soon as the last consumer disconnects. The event
         // queue is drained non-blocking each iteration (~per frame), so the
         // shutdown latency is at most one frame.
         if watch_consumer {
-            let mut left = false;
+            // Fold the drained events to the *last* observed state, matching the
+            // idle loop in `run_on_demand`. Accumulating `left |= !active` would
+            // trip Idle even when a disconnect is immediately followed by a
+            // reconnect within the same drain pass (a fast consumer restart),
+            // causing an unnecessary camera stop/start cycle.
+            let mut last_active: Option<bool> = None;
             loop {
                 match out.poll_client_usage() {
-                    Ok(Some(active)) => left |= !active,
+                    Ok(Some(active)) => last_active = Some(active),
                     Ok(None) => break,
                     Err(e) => {
                         eprintln!("client-usage event poll failed: {e}");
@@ -932,7 +1016,7 @@ fn run_live(
                     }
                 }
             }
-            if left {
+            if last_active == Some(false) {
                 println!("on-demand: consumer disconnected");
                 break LiveExit::Idle;
             }
@@ -940,7 +1024,7 @@ fn run_live(
 
         // Block for one completed request, then drain any extra ready ones,
         // requeuing all but the freshest so we always process the newest frame.
-        let mut req = match rx.recv_timeout(Duration::from_secs(5)) {
+        let mut req = match rx.recv_timeout(cam_setup::RECV_TIMEOUT) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!("camera timed out, stopping");
@@ -970,6 +1054,15 @@ fn run_live(
             }
         };
 
+        // Gain this frame was exposed with (commanded gain from APPLY_DELAY
+        // frames ago), used to pick the denoise strength.
+        gain_log.push_back(state.gain_index);
+        let frame_gain = if gain_log.len() > APPLY_DELAY {
+            gain_log.pop_front().unwrap()
+        } else {
+            *gain_log.front().unwrap()
+        };
+
         // ISP + denoise + loopback write for this frame, isolated against panics
         // (see `process_and_write`). The output luma is metered inside as the AE
         // control variable; denoise is a no-op at low gain (the common case).
@@ -980,12 +1073,16 @@ fn run_live(
             buf,
             dst_w,
             dst_h,
-            state.gain_index,
+            frame_gain,
             args,
             &mut denoise_buf,
             &mut prev_y,
         ) {
-            FrameOutcome::Written { luma: m, chroma_radius, temporal_alpha } => {
+            FrameOutcome::Written {
+                luma: m,
+                chroma_radius,
+                temporal_alpha,
+            } => {
                 luma = Some(m);
                 last_dn = chroma_radius;
                 last_ta = temporal_alpha;
@@ -1093,7 +1190,10 @@ fn run_on_demand(
     }
 
     loop {
-        println!("on-demand: camera idle (standby, camera off), waiting for a consumer on {}", args.device);
+        println!(
+            "on-demand: camera idle (standby, camera off), waiting for a consumer on {}",
+            args.device
+        );
         // Idle keepalive: write standby frames so the device stays negotiable,
         // polling the client-usage event between frames. The hardware camera and
         // ISP stay off; this is a plain memset+write, no per-pixel work.
@@ -1145,8 +1245,17 @@ fn run_on_demand(
 
         let exit = if queued {
             run_live(
-                engine, out, &mut session.cam, &session.stream, &session.rx,
-                dst_w, dst_h, sensor, state, args, true,
+                engine,
+                out,
+                &mut session.cam,
+                &session.stream,
+                &session.rx,
+                dst_w,
+                dst_h,
+                sensor,
+                state,
+                args,
+                true,
             )
         } else {
             LiveExit::Idle

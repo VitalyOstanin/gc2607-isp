@@ -15,11 +15,19 @@ use rayon::prelude::*;
 /// with the `video` feature, serial otherwise. Rows are independent, so the
 /// result is identical either way (the golden test still holds). Parallelism is
 /// row-granular (not per-pixel) to keep each task substantial.
-fn for_each_row_mut<T: Send>(buf: &mut [T], row: usize, body: impl Fn(usize, &mut [T]) + Sync + Send) {
+fn for_each_row_mut<T: Send>(
+    buf: &mut [T],
+    row: usize,
+    body: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
     #[cfg(feature = "video")]
-    buf.par_chunks_mut(row).enumerate().for_each(|(y, r)| body(y, r));
+    buf.par_chunks_mut(row)
+        .enumerate()
+        .for_each(|(y, r)| body(y, r));
     #[cfg(not(feature = "video"))]
-    buf.chunks_mut(row).enumerate().for_each(|(y, r)| body(y, r));
+    buf.chunks_mut(row)
+        .enumerate()
+        .for_each(|(y, r)| body(y, r));
 }
 
 /// Half-resolution Bayer channel planes (GRBG). Each is `hh*ww`, row-major.
@@ -63,7 +71,14 @@ pub fn bayer_planes(raw: &RawFrame) -> Planes {
             gb[o + x] = raw.data[r1 + 2 * x + 1];
         }
     }
-    Planes { hh, ww, gr, r, b, gb }
+    Planes {
+        hh,
+        ww,
+        gr,
+        r,
+        b,
+        gb,
+    }
 }
 
 /// numpy-compatible linear-interpolation percentile over a sorted slice.
@@ -321,7 +336,13 @@ pub fn interp_acm(cct: f64) -> AcmFrame {
 /// corrected linear RGB (before sRGB gamma). The hue/saturation that select the
 /// sector are taken from the globally-corrected colour `ccm * rgb`.
 #[inline(always)]
-pub(crate) fn acm_color(rl: f64, gl: f64, bl: f64, ccm: &[f64; 9], acm: &AcmFrame) -> (f64, f64, f64) {
+pub(crate) fn acm_color(
+    rl: f64,
+    gl: f64,
+    bl: f64,
+    ccm: &[f64; 9],
+    acm: &AcmFrame,
+) -> (f64, f64, f64) {
     let g0 = ccm[0] * rl + ccm[1] * gl + ccm[2] * bl;
     let g1 = ccm[3] * rl + ccm[4] * gl + ccm[5] * bl;
     let g2 = ccm[6] * rl + ccm[7] * gl + ccm[8] * bl;
@@ -419,7 +440,13 @@ pub(crate) fn estimate_from_chroma(rg: f32, bg: f32, prev_ls: Option<usize>) -> 
     let cct = estimate_cct(rg as f64, bg as f64);
     let ls = select_ls_hyst(rg as f64, bg as f64, prev_ls);
     let ccm = interp_ccm(cct);
-    Estimate { chroma: (rg, bg), gains, cct, ls, ccm }
+    Estimate {
+        chroma: (rg, bg),
+        gains,
+        cct,
+        ls,
+        ccm,
+    }
 }
 
 /// Estimate WB gains, CCT, LSC light source and CCM from the (pre-LSC) planes.
@@ -432,8 +459,16 @@ pub fn estimate(p: &Planes) -> Estimate {
 
 /// Bilinear resize of a `gh*gw` grid to `out_h*out_w` (numpy linspace semantics).
 fn resize_grid(grid: &[f32], gh: usize, gw: usize, out_h: usize, out_w: usize) -> Vec<f64> {
-    let sy = if out_h > 1 { (gh as f64 - 1.0) / (out_h as f64 - 1.0) } else { 0.0 };
-    let sx = if out_w > 1 { (gw as f64 - 1.0) / (out_w as f64 - 1.0) } else { 0.0 };
+    let sy = if out_h > 1 {
+        (gh as f64 - 1.0) / (out_h as f64 - 1.0)
+    } else {
+        0.0
+    };
+    let sx = if out_w > 1 {
+        (gw as f64 - 1.0) / (out_w as f64 - 1.0)
+    } else {
+        0.0
+    };
     let mut out = vec![0f64; out_h * out_w];
     for oy in 0..out_h {
         let fy = oy as f64 * sy;
@@ -519,7 +554,14 @@ pub fn build_grids(ls: usize, hh: usize, ww: usize) -> Grids {
 
 /// Core half-res render into a caller-owned buffer using pre-resized grids.
 /// `out` must be `p.hh*p.ww*3` bytes. Row-parallel with the `video` feature.
-fn render_half_into(out: &mut [u8], p: &Planes, gains: [f64; 3], ccm: [f64; 9], grids: &Grids, acm: &AcmFrame) {
+fn render_half_into(
+    out: &mut [u8],
+    p: &Planes,
+    gains: [f64; 3],
+    ccm: [f64; 9],
+    grids: &Grids,
+    acm: &AcmFrame,
+) {
     let inv = 1.0 / MAXLIN as f64;
     let ww = p.ww;
     let (g_gr, g_r, g_b, g_gb) = (&grids.g_gr, &grids.g_r, &grids.g_b, &grids.g_gb);
@@ -708,7 +750,14 @@ pub fn mhc_debayer(cfa: &[f32], w: usize, h: usize) -> Vec<f32> {
 /// (LSC+WB-applied) CFA into RGB8, row-parallel, with no planar intermediate.
 /// Interior pixels take the unclamped fast path; the 2-pixel border uses the
 /// clamped [`mhc_rgb_at`]. sRGB uses the LUT (see [`srgb255`]).
-fn render_mhc_fused_into(out: &mut [u8], cfa: &[f32], w: usize, h: usize, ccm: [f64; 9], acm: &AcmFrame) {
+fn render_mhc_fused_into(
+    out: &mut [u8],
+    cfa: &[f32],
+    w: usize,
+    h: usize,
+    ccm: [f64; 9],
+    acm: &AcmFrame,
+) {
     let inv = 1.0 / MAXLIN as f64;
     let lut = srgb255_lut();
     let color = |r: f32, g: f32, b: f32, orow: &mut [u8], x: usize| {
@@ -864,7 +913,15 @@ fn mhc_to_planar_into(planar: &mut [f32], cfa: &[f32], w: usize, h: usize) {
 /// Stage 2 of the full-res LCA path: per output pixel, take green from the
 /// planar buffer, resample red/blue at their green-aligned (LCA-shifted)
 /// positions, then highlight-desaturate, CCM and sRGB gamma into RGB8.
-fn render_lca_color_into(out: &mut [u8], planar: &[f32], w: usize, h: usize, ccm: [f64; 9], acm: &AcmFrame, lca: &Lca) {
+fn render_lca_color_into(
+    out: &mut [u8],
+    planar: &[f32],
+    w: usize,
+    h: usize,
+    ccm: [f64; 9],
+    acm: &AcmFrame,
+    lca: &Lca,
+) {
     let plane = w * h;
     let inv = 1.0 / MAXLIN as f64;
     let lut = srgb255_lut();
@@ -875,8 +932,20 @@ fn render_lca_color_into(out: &mut [u8], planar: &[f32], w: usize, h: usize, ccm
         for x in 0..w {
             let fx = x as f32;
             let g = gp[y * w + x];
-            let r = plane_sample(rp, w, h, fx + lca_sample(&lca.rx, fx, fy), fy + lca_sample(&lca.ry, fx, fy));
-            let b = plane_sample(bp, w, h, fx + lca_sample(&lca.bx, fx, fy), fy + lca_sample(&lca.by, fx, fy));
+            let r = plane_sample(
+                rp,
+                w,
+                h,
+                fx + lca_sample(&lca.rx, fx, fy),
+                fy + lca_sample(&lca.ry, fx, fy),
+            );
+            let b = plane_sample(
+                bp,
+                w,
+                h,
+                fx + lca_sample(&lca.bx, fx, fy),
+                fy + lca_sample(&lca.by, fx, fy),
+            );
             let mut rl = r as f64 * inv;
             let mut gl = g as f64 * inv;
             let mut bl = b as f64 * inv;
@@ -892,7 +961,13 @@ fn render_lca_color_into(out: &mut [u8], planar: &[f32], w: usize, h: usize, ccm
 /// Full-resolution render: LSC + per-channel WB applied to the Bayer frame,
 /// then MHC debayer, then lateral-CA correction, CCM and sRGB gamma. Returns
 /// (W, H, RGB8).
-pub fn render_mhc(raw: &RawFrame, gains: [f64; 3], ccm: [f64; 9], cct: f64, ls: usize) -> (usize, usize, Vec<u8>) {
+pub fn render_mhc(
+    raw: &RawFrame,
+    gains: [f64; 3],
+    ccm: [f64; 9],
+    cct: f64,
+    ls: usize,
+) -> (usize, usize, Vec<u8>) {
     let (w, h) = (raw.w, raw.h);
     let (ww, hh) = (w / 2, h / 2);
     let grids = build_grids(ls, hh, ww);
@@ -1118,32 +1193,87 @@ impl Processor {
                 if estimating {
                     self.reestimate();
                 }
-                let gains = self.est.as_ref().expect("estimate present after first frame").gains;
-                let ccm = self.est.as_ref().expect("estimate present after first frame").ccm;
-                let Self { out, planes, grids, acm, .. } = &mut *self;
-                render_half_into(out, planes, gains, ccm, grids.as_ref().expect("grids built after first estimate"), acm.as_ref().expect("acm built after first estimate"));
+                let gains = self
+                    .est
+                    .as_ref()
+                    .expect("estimate present after first frame")
+                    .gains;
+                let ccm = self
+                    .est
+                    .as_ref()
+                    .expect("estimate present after first frame")
+                    .ccm;
+                let Self {
+                    out,
+                    planes,
+                    grids,
+                    acm,
+                    ..
+                } = &mut *self;
+                render_half_into(
+                    out,
+                    planes,
+                    gains,
+                    ccm,
+                    grids.as_ref().expect("grids built after first estimate"),
+                    acm.as_ref().expect("acm built after first estimate"),
+                );
             }
             DebayerMode::Mhc => {
                 if estimating {
                     fill_planes_blc_from_bytes(bytes, &mut self.planes);
                     self.reestimate();
                 }
-                let gains = self.est.as_ref().expect("estimate present after first frame").gains;
-                let ccm = self.est.as_ref().expect("estimate present after first frame").ccm;
+                let gains = self
+                    .est
+                    .as_ref()
+                    .expect("estimate present after first frame")
+                    .gains;
+                let ccm = self
+                    .est
+                    .as_ref()
+                    .expect("estimate present after first frame")
+                    .ccm;
                 {
                     let Self { cfa, grids, .. } = &mut *self;
-                    fill_cfa_lscwb_from_bytes(bytes, cfa, grids.as_ref().expect("grids built after first estimate"), gains);
+                    fill_cfa_lscwb_from_bytes(
+                        bytes,
+                        cfa,
+                        grids.as_ref().expect("grids built after first estimate"),
+                        gains,
+                    );
                 }
                 if self.lca.is_some() {
                     {
                         let Self { planar, cfa, .. } = &mut *self;
                         mhc_to_planar_into(planar, cfa, W, H);
                     }
-                    let Self { out, planar, lca, acm, .. } = &mut *self;
-                    render_lca_color_into(out, planar, W, H, ccm, acm.as_ref().expect("acm built after first estimate"), lca.as_ref().unwrap());
+                    let Self {
+                        out,
+                        planar,
+                        lca,
+                        acm,
+                        ..
+                    } = &mut *self;
+                    render_lca_color_into(
+                        out,
+                        planar,
+                        W,
+                        H,
+                        ccm,
+                        acm.as_ref().expect("acm built after first estimate"),
+                        lca.as_ref().unwrap(),
+                    );
                 } else {
                     let Self { out, cfa, acm, .. } = &mut *self;
-                    render_mhc_fused_into(out, cfa, W, H, ccm, acm.as_ref().expect("acm built after first estimate"));
+                    render_mhc_fused_into(
+                        out,
+                        cfa,
+                        W,
+                        H,
+                        ccm,
+                        acm.as_ref().expect("acm built after first estimate"),
+                    );
                 }
             }
         }

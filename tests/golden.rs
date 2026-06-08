@@ -14,7 +14,9 @@ use gc2607_isp::pipeline;
 use gc2607_isp::raw;
 
 fn data(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
 }
 
 /// Sensor captures and golden artifacts derived from them are private to the
@@ -30,7 +32,9 @@ fn have_local_data() -> bool {
 /// Minimal extraction of the few JSON fields we need (avoids a serde dep).
 fn json_number_array(json: &str, key: &str) -> Vec<f64> {
     let k = format!("\"{key}\"");
-    let start = json.find(&k).unwrap_or_else(|| panic!("key {key} not found"));
+    let start = json
+        .find(&k)
+        .unwrap_or_else(|| panic!("key {key} not found"));
     let after = &json[start + k.len()..];
     let lb = after.find('[').expect("expected '['");
     let rb = after.find(']').expect("expected ']'");
@@ -42,13 +46,13 @@ fn json_number_array(json: &str, key: &str) -> Vec<f64> {
 
 fn json_scalar(json: &str, key: &str) -> f64 {
     let k = format!("\"{key}\"");
-    let start = json.find(&k).unwrap_or_else(|| panic!("key {key} not found"));
+    let start = json
+        .find(&k)
+        .unwrap_or_else(|| panic!("key {key} not found"));
     let after = &json[start + k.len()..];
     let colon = after.find(':').expect("expected ':'");
     let tail = &after[colon + 1..];
-    let end = tail
-        .find([',', '}', '\n'])
-        .unwrap_or(tail.len());
+    let end = tail.find([',', '}', '\n']).unwrap_or(tail.len());
     tail[..end].trim().parse::<f64>().expect("scalar")
 }
 
@@ -69,10 +73,30 @@ fn estimate_matches_reference() {
     let ls = json_scalar(&golden, "lsc_ls") as usize;
 
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-9);
-    assert!(rel(est.chroma.0 as f64, chroma[0]) < 1e-3, "r/g {} vs {}", est.chroma.0, chroma[0]);
-    assert!(rel(est.chroma.1 as f64, chroma[1]) < 1e-3, "b/g {} vs {}", est.chroma.1, chroma[1]);
-    assert!(rel(est.gains[0], gains[0]) < 1e-3, "gainR {} vs {}", est.gains[0], gains[0]);
-    assert!(rel(est.gains[2], gains[2]) < 1e-3, "gainB {} vs {}", est.gains[2], gains[2]);
+    assert!(
+        rel(est.chroma.0 as f64, chroma[0]) < 1e-3,
+        "r/g {} vs {}",
+        est.chroma.0,
+        chroma[0]
+    );
+    assert!(
+        rel(est.chroma.1 as f64, chroma[1]) < 1e-3,
+        "b/g {} vs {}",
+        est.chroma.1,
+        chroma[1]
+    );
+    assert!(
+        rel(est.gains[0], gains[0]) < 1e-3,
+        "gainR {} vs {}",
+        est.gains[0],
+        gains[0]
+    );
+    assert!(
+        rel(est.gains[2], gains[2]) < 1e-3,
+        "gainB {} vs {}",
+        est.gains[2],
+        gains[2]
+    );
     assert!(rel(est.cct, cct) < 1e-3, "cct {} vs {}", est.cct, cct);
     assert_eq!(est.ls, ls, "LSC light source mismatch");
 }
@@ -134,8 +158,15 @@ fn mhc_debayer_matches_reference_crate() {
 
     let pattern = demosaic::CfaPattern::bayer_grbg();
     let mut theirs = vec![0f32; 3 * plane];
-    demosaic::demosaic(&frame.data, w, h, &pattern, demosaic::Algorithm::Mhc, &mut theirs)
-        .expect("reference demosaic");
+    demosaic::demosaic(
+        &frame.data,
+        w,
+        h,
+        &pattern,
+        demosaic::Algorithm::Mhc,
+        &mut theirs,
+    )
+    .expect("reference demosaic");
 
     // Compare interior (3-pixel margin), all three planes.
     let margin = 3usize;
@@ -151,7 +182,10 @@ fn mhc_debayer_matches_reference_crate() {
             }
         }
     }
-    assert!(max_diff < 1.0, "MHC diverges from reference: max interior diff = {max_diff}");
+    assert!(
+        max_diff < 1.0,
+        "MHC diverges from reference: max interior diff = {max_diff}"
+    );
 }
 
 /// The live `Processor` (half-res) must reproduce the free-function `process`

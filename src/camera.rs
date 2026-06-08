@@ -37,6 +37,11 @@ use libcamera::{
 /// device and fail to configure a raw stream on it.
 const GC2607_MODEL: &str = "gc2607";
 
+/// How long to wait for a completed capture request before declaring the camera
+/// stalled. Shared by the live (`gc2607-video`) and raw-dump (`gc2607-capture`)
+/// receive loops so the stall timeout stays consistent across binaries.
+pub const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A configured, allocated raw-capture session that has **not** been started.
 ///
 /// The caller starts the camera (`session.cam.start(None)`), applies any initial
@@ -75,7 +80,11 @@ pub fn open_raw(mgr: &CameraManager, width: u32, height: u32) -> io::Result<Sess
             .get::<properties::Model>()
             .ok()
             .map(|m| m.to_string());
-        seen.push(format!("{} ({})", model.as_deref().unwrap_or("?"), cam.id()));
+        seen.push(format!(
+            "{} ({})",
+            model.as_deref().unwrap_or("?"),
+            cam.id()
+        ));
         if model.as_deref() == Some(GC2607_MODEL) {
             chosen = Some(cam);
             break;

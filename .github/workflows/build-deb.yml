@@ -12,6 +12,10 @@ permissions:
 jobs:
   deb:
     runs-on: ubuntu-latest
+    # Cap the job so a hung apt-get/rustup/network step cannot hold the runner
+    # for the 6-hour default. A cold build of the Rust binary plus the .deb fits
+    # comfortably; warm cache is a few minutes.
+    timeout-minutes: 45
     # Build inside ubuntu:26.04 so the binary links against libcamera 0.7 (the
     # version on the target host); GitHub-hosted runners are older releases.
     container:
@@ -32,7 +36,8 @@ jobs:
       - name: Install Rust 1.88.0
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+            | sh -s -- -y --profile minimal --default-toolchain 1.88.0 \
+              --component rustfmt,clippy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo
@@ -44,6 +49,20 @@ jobs:
             target
           key: cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Lint the same feature set that ships in the .deb (capture + gpu) so GPU
+      # code is covered; clippy only compiles it, no GPU is needed.
+      - name: Clippy
+        run: cargo clippy --all-targets --features capture,gpu -- -D warnings
+
+      # Run the CPU/logic tests (golden, AE, output). The golden tests skip when
+      # the private sensor sample is absent (it is not committed). tests/gpu.rs is
+      # gated on the `gpu` feature and so is excluded here, needing no GPU.
+      - name: Test
+        run: cargo test --features capture
 
       # The GPU feature only links wgpu/Vulkan; it compiles without a GPU. Its
       # runtime tests (tests/gpu.rs, gpu-probe) need a real GPU and are not run here.

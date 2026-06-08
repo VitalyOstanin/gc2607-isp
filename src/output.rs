@@ -314,25 +314,27 @@ pub fn rgb_to_yuyv_crop(
     let off_y = (src_h - dst_h) / 2;
 
     // Row-parallel: each output row depends only on its own source row.
-    dst.par_chunks_mut(dst_w * 2).enumerate().for_each(|(y, drow)| {
-        let src_row = (off_y + y) * src_w + off_x;
-        let mut x = 0;
-        while x < dst_w {
-            let i0 = (src_row + x) * 3;
-            let i1 = (src_row + x + 1) * 3;
-            let (y0, cb0, cr0) = rgb_to_ycbcr(rgb[i0], rgb[i0 + 1], rgb[i0 + 2]);
-            let (y1, cb1, cr1) = rgb_to_ycbcr(rgb[i1], rgb[i1 + 1], rgb[i1 + 2]);
-            // Subsample chroma by averaging the pixel pair.
-            let cb = ((cb0 as u16 + cb1 as u16) / 2) as u8;
-            let cr = ((cr0 as u16 + cr1 as u16) / 2) as u8;
-            let o = x * 2;
-            drow[o] = y0;
-            drow[o + 1] = cb;
-            drow[o + 2] = y1;
-            drow[o + 3] = cr;
-            x += 2;
-        }
-    });
+    dst.par_chunks_mut(dst_w * 2)
+        .enumerate()
+        .for_each(|(y, drow)| {
+            let src_row = (off_y + y) * src_w + off_x;
+            let mut x = 0;
+            while x < dst_w {
+                let i0 = (src_row + x) * 3;
+                let i1 = (src_row + x + 1) * 3;
+                let (y0, cb0, cr0) = rgb_to_ycbcr(rgb[i0], rgb[i0 + 1], rgb[i0 + 2]);
+                let (y1, cb1, cr1) = rgb_to_ycbcr(rgb[i1], rgb[i1 + 1], rgb[i1 + 2]);
+                // Subsample chroma by averaging the pixel pair.
+                let cb = ((cb0 as u16 + cb1 as u16) / 2) as u8;
+                let cr = ((cr0 as u16 + cr1 as u16) / 2) as u8;
+                let o = x * 2;
+                drow[o] = y0;
+                drow[o + 1] = cb;
+                drow[o + 2] = y1;
+                drow[o + 3] = cr;
+                x += 2;
+            }
+        });
 }
 
 /// Spatially denoise the chroma of a packed YUYV frame in place, leaving luma
@@ -371,8 +373,12 @@ pub fn denoise_chroma_yuyv(buf: &mut [u8], w: usize, h: usize, radius: usize, st
         let row = y * w * 2;
         for c in 0..cw {
             let i = y * cw + c;
-            let nb = (cb[i] as f64 * inv + cb_b[i] as f64 * s).round().clamp(0.0, 255.0) as u8;
-            let nr = (cr[i] as f64 * inv + cr_b[i] as f64 * s).round().clamp(0.0, 255.0) as u8;
+            let nb = (cb[i] as f64 * inv + cb_b[i] as f64 * s)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let nr = (cr[i] as f64 * inv + cr_b[i] as f64 * s)
+                .round()
+                .clamp(0.0, 255.0) as u8;
             buf[row + 4 * c + 1] = nb;
             buf[row + 4 * c + 3] = nr;
         }
@@ -558,7 +564,7 @@ mod tests {
             for c in 0..w / 2 {
                 buf[row + 4 * c] = (10 * c) as u8; // Y0
                 buf[row + 4 * c + 2] = (10 * c + 5) as u8; // Y1
-                // Checkerboard chroma around the 128 neutral: 100 / 156.
+                                                           // Checkerboard chroma around the 128 neutral: 100 / 156.
                 let v = if (c + y) % 2 == 0 { 100u8 } else { 156u8 };
                 buf[row + 4 * c + 1] = v; // Cb
                 buf[row + 4 * c + 3] = 255 - v; // Cr (also 155 / 99)

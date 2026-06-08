@@ -19,7 +19,9 @@ use gc2607_isp::pipeline;
 use gc2607_isp::raw;
 
 fn data(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
 }
 
 #[test]

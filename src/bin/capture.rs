@@ -16,15 +16,9 @@
 //!                  [--ae] [--exposure <lines>] [--gain <idx>] [--vblank <lines>]
 //!   out-prefix "-" disables writing frames (useful with --ae for tuning).
 
-use std::time::Duration;
-
 use libcamera::{
-    camera_manager::CameraManager,
-    framebuffer::AsFrameBuffer,
-    framebuffer_allocator::FrameBuffer,
-    framebuffer_map::MemoryMappedFrameBuffer,
-    properties,
-    request::ReuseFlag,
+    camera_manager::CameraManager, framebuffer::AsFrameBuffer, framebuffer_allocator::FrameBuffer,
+    framebuffer_map::MemoryMappedFrameBuffer, properties, request::ReuseFlag,
 };
 
 use gc2607_isp::ae::{self, AeConfig, AeState};
@@ -113,7 +107,10 @@ fn main() {
     let mut state = AeState::default();
     if let Some(s) = &sensor {
         state.exposure = s.exposure().unwrap_or(state.exposure);
-        state.gain_index = s.analogue_gain().unwrap_or(0).clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
+        state.gain_index = s
+            .analogue_gain()
+            .unwrap_or(0)
+            .clamp(0, ae::MAX_GAIN_INDEX as i32) as u8;
         state.vblank = s.vblank().unwrap_or(state.vblank);
     }
     if let Some(e) = args.exposure {
@@ -141,7 +138,14 @@ fn main() {
 
     let mgr = CameraManager::new().expect("CameraManager");
     let session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT).expect("open raw camera");
-    let cam_setup::Session { mut cam, stream, rx, requests, adjusted, .. } = session;
+    let cam_setup::Session {
+        mut cam,
+        stream,
+        rx,
+        requests,
+        adjusted,
+        ..
+    } = session;
     println!(
         "camera: {}",
         *cam.properties().get::<properties::Model>().unwrap()
@@ -173,7 +177,7 @@ fn main() {
 
     let mut done = 0;
     while done < args.frames {
-        let mut req = match rx.recv_timeout(Duration::from_secs(5)) {
+        let mut req = match rx.recv_timeout(cam_setup::RECV_TIMEOUT) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!("camera request timed out, stopping");
@@ -216,7 +220,9 @@ fn main() {
         } else {
             println!(
                 "frame {done:03}: mean={}",
-                metric.map(|m| format!("{:.1}%", m * 100.0)).unwrap_or_else(|| "n/a".into())
+                metric
+                    .map(|m| format!("{:.1}%", m * 100.0))
+                    .unwrap_or_else(|| "n/a".into())
             );
         }
 

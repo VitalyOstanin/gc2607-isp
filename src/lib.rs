@@ -5,18 +5,18 @@
 //! gamma. Tuning (CCM, ACM sectors, white locus, LSC/LCA grids) is parsed from
 //! the camera's `.aiqb` tuning file; see `tools/` and `data/`.
 
-pub mod tuning_data;
-pub mod tuning;
-pub mod raw;
-pub mod pipeline;
 pub mod ae;
+pub mod pipeline;
+pub mod raw;
+pub mod tuning;
+pub mod tuning_data;
 
 // Live V4L2 sensor control (AE) and loopback output need raw ioctls; gated to
 // keep the offline ISP std-only.
 #[cfg(feature = "video")]
-pub mod sensor;
-#[cfg(feature = "video")]
 pub mod output;
+#[cfg(feature = "video")]
+pub mod sensor;
 
 // GPU backend (wgpu / Vulkan): per-pixel ISP stages as compute shaders. Gated to
 // keep the host build dependency-light when not used.

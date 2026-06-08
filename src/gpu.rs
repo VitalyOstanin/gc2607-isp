@@ -23,9 +23,11 @@
 
 use std::io;
 
-use crate::pipeline::{self, ACM_SAT_KNEE, Estimate, Lca, interp_acm};
-use crate::raw::{BLACK, H, MAXLIN, RawFrame, STRIDE_SAMPLES, W};
-use crate::tuning_data::{ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, LCA_CELL_X, LCA_CELL_Y, LCA_GH, LCA_GW};
+use crate::pipeline::{self, interp_acm, Estimate, Lca, ACM_SAT_KNEE};
+use crate::raw::{RawFrame, BLACK, H, MAXLIN, STRIDE_SAMPLES, W};
+use crate::tuning_data::{
+    ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, LCA_CELL_X, LCA_CELL_Y, LCA_GH, LCA_GW,
+};
 
 /// Output (centre-cropped) size for the GPU MHC path: 1920x1080 from 1928x1088.
 pub const OUT_W: usize = 1920;
@@ -238,6 +240,16 @@ fn ycbcr(c: vec3<f32>) -> vec3<f32> {
     );
 }
 
+// Pack two adjacent YCbCr pixels into one YUYV word; the shared chroma is the
+// average of the pair (4:2:2 subsampling).
+fn pack_yuyv(yc0: vec3<f32>, yc1: vec3<f32>) -> u32 {
+    let y0 = u32(yc0.x);
+    let y1 = u32(yc1.x);
+    let cb = (u32(yc0.y) + u32(yc1.y)) / 2u;
+    let cr = (u32(yc0.z) + u32(yc1.z)) / 2u;
+    return y0 | (cb << 8u) | (y1 << 16u) | (cr << 24u);
+}
+
 // Pass 2: one thread per output pixel pair -> MHC + colour + YUYV pack.
 @compute @workgroup_size(64)
 fn render_pack(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -255,11 +267,7 @@ fn render_pack(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let yc0 = ycbcr(to_rgb8(mhc(sy, sx0)));
     let yc1 = ycbcr(to_rgb8(mhc(sy, sx1)));
-    let y0 = u32(yc0.x);
-    let y1 = u32(yc1.x);
-    let cb = (u32(yc0.y) + u32(yc1.y)) / 2u;
-    let cr = (u32(yc0.z) + u32(yc1.z)) / 2u;
-    yuyv[gidx] = y0 | (cb << 8u) | (y1 << 16u) | (cr << 24u);
+    yuyv[gidx] = pack_yuyv(yc0, yc1);
 }
 
 // --- Lateral chromatic aberration path (three passes) ---
@@ -351,11 +359,7 @@ fn render_pack_lca(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let yc0 = ycbcr(lca_color(sy, sx0));
     let yc1 = ycbcr(lca_color(sy, sx1));
-    let y0 = u32(yc0.x);
-    let y1 = u32(yc1.x);
-    let cb = (u32(yc0.y) + u32(yc1.y)) / 2u;
-    let cr = (u32(yc0.z) + u32(yc1.z)) / 2u;
-    yuyv[gidx] = y0 | (cb << 8u) | (y1 << 16u) | (cr << 24u);
+    yuyv[gidx] = pack_yuyv(yc0, yc1);
 }
 "#;
 
@@ -470,7 +474,10 @@ impl GpuProcessor {
             .await
             .map_err(|e| format!("no Vulkan adapter: {e}"))?;
         let info = adapter.get_info();
-        eprintln!("gpu: {} ({:?}, {:?})", info.name, info.device_type, info.backend);
+        eprintln!(
+            "gpu: {} ({:?}, {:?})",
+            info.name, info.device_type, info.backend
+        );
 
         adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -569,7 +576,17 @@ impl GpuProcessor {
             mapped_at_creation: false,
         });
 
-        GpuBuffers { params, raw, grids, cfa, rgb, lca, acm, yuyv, staging }
+        GpuBuffers {
+            params,
+            raw,
+            grids,
+            cfa,
+            rgb,
+            lca,
+            acm,
+            yuyv,
+            staging,
+        }
     }
 
     /// Compile the shader, build the bind group over `bufs`, and create the four
@@ -629,17 +646,50 @@ impl GpuProcessor {
             label: Some("isp-bg"),
             layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: bufs.params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bufs.raw.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: bufs.grids[0].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: bufs.grids[1].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: bufs.grids[2].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: bufs.grids[3].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: bufs.cfa.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: bufs.yuyv.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: bufs.rgb.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: bufs.lca.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: bufs.acm.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bufs.params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bufs.raw.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bufs.grids[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: bufs.grids[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: bufs.grids[2].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: bufs.grids[3].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: bufs.cfa.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: bufs.yuyv.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: bufs.rgb.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: bufs.lca.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: bufs.acm.as_entire_binding(),
+                },
             ],
         });
 
@@ -708,12 +758,20 @@ impl GpuProcessor {
     /// Pack the current estimate into the uniform block and upload it, along with
     /// this frame's per-sector ACM matrices (CCT-interpolated on the CPU).
     fn upload_params(&self) {
-        let est = self.est.as_ref().expect("estimate present (upload_params runs right after reestimate)");
+        let est = self
+            .est
+            .as_ref()
+            .expect("estimate present (upload_params runs right after reestimate)");
         let g = est.gains;
         let c = est.ccm;
         let params = Params {
             dims: [W as u32, H as u32, WW as u32, HH as u32],
-            out_dims: [OUT_W as u32, OUT_H as u32, ((W - OUT_W) / 2) as u32, ((H - OUT_H) / 2) as u32],
+            out_dims: [
+                OUT_W as u32,
+                OUT_H as u32,
+                ((W - OUT_W) / 2) as u32,
+                ((H - OUT_H) / 2) as u32,
+            ],
             misc: [STRIDE_SAMPLES as u32, (OUT_W / 2) as u32, 0, 0],
             consts: [BLACK, 1.0 / MAXLIN, 0.0, 0.0],
             gains: [g[0] as f32, g[1] as f32, g[2] as f32, 0.0],
@@ -723,7 +781,8 @@ impl GpuProcessor {
             lca: [LCA_GW as f32, LCA_GH as f32, LCA_CELL_X, LCA_CELL_Y],
             acm_cfg: [ACM_HUE0, ACM_HUE_STEP, ACM_SAT_KNEE as f32, ACM_NSEC as f32],
         };
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Per-sector matrices for this CCT, flattened sector-major row-major.
         let acm = interp_acm(est.cct);
@@ -733,7 +792,8 @@ impl GpuProcessor {
                 flat[s * 9 + k] = mat[k] as f32;
             }
         }
-        self.queue.write_buffer(&self.acm_buf, 0, bytemuck::cast_slice(&flat));
+        self.queue
+            .write_buffer(&self.acm_buf, 0, bytemuck::cast_slice(&flat));
     }
 
     /// Process one raw SGRBG10 frame; returns the packed YUYV bytes (length
@@ -742,7 +802,11 @@ impl GpuProcessor {
         if bytes.len() < self.raw_needed {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("raw too small: {} bytes, need >= {}", bytes.len(), self.raw_needed),
+                format!(
+                    "raw too small: {} bytes, need >= {}",
+                    bytes.len(),
+                    self.raw_needed
+                ),
             ));
         }
 
@@ -753,11 +817,14 @@ impl GpuProcessor {
         }
 
         // Upload this frame's raw and dispatch the two passes.
-        self.queue.write_buffer(&self.raw_buf, 0, &bytes[..self.raw_needed]);
+        self.queue
+            .write_buffer(&self.raw_buf, 0, &bytes[..self.raw_needed]);
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_cfa"),
@@ -799,7 +866,13 @@ impl GpuProcessor {
             let groups = (((OUT_W / 2) * OUT_H) as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&self.yuyv_buf, 0, &self.staging_buf, 0, self.yuyv_bytes as u64);
+        encoder.copy_buffer_to_buffer(
+            &self.yuyv_buf,
+            0,
+            &self.staging_buf,
+            0,
+            self.yuyv_bytes as u64,
+        );
         self.queue.submit(Some(encoder.finish()));
 
         // Read the packed YUYV back.
@@ -809,7 +882,10 @@ impl GpuProcessor {
             let _ = tx.send(r);
         });
         self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
             .map_err(|e| io::Error::other(format!("gpu poll: {e}")))?;
         rx.recv()
             .map_err(|e| io::Error::other(format!("gpu map channel: {e}")))?
