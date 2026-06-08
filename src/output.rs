@@ -14,7 +14,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -62,6 +62,64 @@ struct V4l2Format {
 
 // VIDIOC_S_FMT = _IOWR('V', 5, struct v4l2_format)
 nix::ioctl_readwrite!(vidioc_s_fmt, b'V', 5, V4l2Format);
+
+// --- v4l2loopback client-usage event (on-demand camera gating) ---
+//
+// The Ubuntu/IPU6 build of v4l2loopback queues a private "client usage" V4L2
+// event whenever a capture client starts or stops streaming on the loopback;
+// the event payload's leading `count` is non-zero while at least one consumer
+// is capturing. A producer (this binary) subscribes to it to run the hardware
+// camera and ISP only while the virtual webcam is actually in use. This is the
+// same mechanism v4l2-relayd uses. A v4l2loopback without the patch rejects the
+// subscription with EINVAL, which the caller treats as "always-on".
+
+/// `V4L2_EVENT_PRIVATE_START` (uapi videodev2.h).
+const V4L2_EVENT_PRIVATE_START: u32 = 0x0800_0000;
+/// v4l2loopback's `V4L2_EVENT_PRI_CLIENT_USAGE` (module base + 0x08E00000 + 1).
+const V4L2_EVENT_PRI_CLIENT_USAGE: u32 = V4L2_EVENT_PRIVATE_START + 0x08E0_0000 + 1;
+/// `V4L2_EVENT_SUB_FL_SEND_INITIAL`: deliver the current state right after
+/// subscribing, so a consumer already capturing at startup is noticed at once.
+const V4L2_EVENT_SUB_FL_SEND_INITIAL: u32 = 1;
+
+/// `struct v4l2_event_subscription` (uapi videodev2.h), 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct V4l2EventSubscription {
+    type_: u32,
+    id: u32,
+    flags: u32,
+    reserved: [u32; 5],
+}
+
+/// `struct v4l2_event` (uapi videodev2.h), 136 bytes on 64-bit. Only `type_`
+/// (offset 0) and the payload's first `u32` (`u`, offset 8 -- the client-usage
+/// `count`) are read; the remaining fields are reserved to match the kernel ABI
+/// size exactly, so their internal layout (the `timespec` etc.) is irrelevant.
+/// The layout is asserted below against the size/offsets the kernel headers give.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct V4l2Event {
+    type_: u32,
+    _pad0: u32,
+    u: [u8; 64],
+    pending: u32,
+    sequence: u32,
+    timestamp: [u8; 16],
+    id: u32,
+    reserved: [u32; 8],
+}
+
+// Guard the hand-laid ABI: a wrong size/offset would make the kernel reject or
+// mis-copy the ioctl (matches the verified layout: size 136, type@0, u@8).
+const _: () = assert!(core::mem::size_of::<V4l2EventSubscription>() == 32);
+const _: () = assert!(core::mem::size_of::<V4l2Event>() == 136);
+const _: () = assert!(core::mem::offset_of!(V4l2Event, type_) == 0);
+const _: () = assert!(core::mem::offset_of!(V4l2Event, u) == 8);
+
+// VIDIOC_SUBSCRIBE_EVENT = _IOW('V', 90, struct v4l2_event_subscription)
+nix::ioctl_write_ptr!(vidioc_subscribe_event, b'V', 90, V4l2EventSubscription);
+// VIDIOC_DQEVENT = _IOR('V', 89, struct v4l2_event)
+nix::ioctl_read!(vidioc_dqevent, b'V', 89, V4l2Event);
 
 /// A loopback output node configured for YUYV frames of a fixed size.
 pub struct LoopbackOutput {
@@ -128,6 +186,71 @@ impl LoopbackOutput {
             ));
         }
         self.file.write_all(yuyv)
+    }
+
+    /// Subscribe to the v4l2loopback client-usage event so the producer can run
+    /// the camera only while a consumer is capturing. `SEND_INITIAL` delivers the
+    /// current state immediately. Returns an error (typically `EINVAL`) on a
+    /// v4l2loopback build without this event, letting the caller fall back to
+    /// always-on streaming.
+    pub fn subscribe_client_usage(&self) -> io::Result<()> {
+        let sub = V4l2EventSubscription {
+            type_: V4L2_EVENT_PRI_CLIENT_USAGE,
+            flags: V4L2_EVENT_SUB_FL_SEND_INITIAL,
+            ..Default::default()
+        };
+        // SAFETY: `sub` is a correctly-sized v4l2_event_subscription; fd is open.
+        unsafe { vidioc_subscribe_event(self.file.as_raw_fd(), &sub) }
+            .map(|_| ())
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))
+    }
+
+    /// Dequeue one pending client-usage event without blocking: `Some(active)`
+    /// where `active` is true while at least one consumer is capturing, or `None`
+    /// when the event queue is empty. Requires a prior [`Self::subscribe_client_usage`].
+    ///
+    /// The loopback fd is opened blocking (so `write_frame` is reliable), and on a
+    /// blocking fd `VIDIOC_DQEVENT` *waits* for an event instead of returning
+    /// `ENOENT` -- which would deadlock the idle keepalive loop. So gate the
+    /// dequeue on a zero-timeout `poll(POLLPRI)`: only call `VIDIOC_DQEVENT` when
+    /// the kernel reports a pending event, in which case it returns at once.
+    pub fn poll_client_usage(&self) -> io::Result<Option<bool>> {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+
+        let mut fds = [PollFd::new(self.file.as_fd(), PollFlags::POLLPRI)];
+        let ready = poll(&mut fds, PollTimeout::ZERO)
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        if ready == 0
+            || !fds[0]
+                .revents()
+                .is_some_and(|r| r.contains(PollFlags::POLLPRI))
+        {
+            return Ok(None);
+        }
+
+        let mut ev = V4l2Event {
+            type_: 0,
+            _pad0: 0,
+            u: [0u8; 64],
+            pending: 0,
+            sequence: 0,
+            timestamp: [0u8; 16],
+            id: 0,
+            reserved: [0u32; 8],
+        };
+        // SAFETY: `ev` is a correctly-sized v4l2_event; the kernel fills it. An
+        // event is pending (POLLPRI), so this does not block.
+        match unsafe { vidioc_dqevent(self.file.as_raw_fd(), &mut ev) } {
+            Ok(_) => {
+                // The client-usage payload is a single u32 `count` at the start
+                // of the event union; non-zero means a consumer is capturing.
+                let count = u32::from_ne_bytes([ev.u[0], ev.u[1], ev.u[2], ev.u[3]]);
+                Ok(Some(count != 0))
+            }
+            // Raced away between poll and dequeue: treat as no event.
+            Err(nix::errno::Errno::ENOENT) => Ok(None),
+            Err(e) => Err(io::Error::from_raw_os_error(e as i32)),
+        }
     }
 }
 

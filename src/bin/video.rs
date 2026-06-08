@@ -20,10 +20,16 @@
 //! frames the sensor takes to apply each change (used to tune the AE settle
 //! count and to fill libcamera's sensor-delays database). No loopback is opened.
 //!
+//! By default the camera and ISP run on demand: the binary keeps the loopback
+//! open (so the virtual webcam is visible) but opens the sensor and processes
+//! frames only while an application is capturing, driven by the v4l2loopback
+//! client-usage V4L2 event. Where that event is unavailable it streams always-on.
+//! `--on-demand off` forces always-on; `--on-demand on` requires the event.
+//!
 //! Usage:
 //!   gc2607-video [--device /dev/videoN] [--backend cpu|gpu] [--debayer half|mhc]
 //!                [--no-ae] [--target <0..1>] [--max-gain <idx>] [--threads <n>]
-//!                [--measure-delay]
+//!                [--on-demand auto|on|off] [--measure-delay]
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -58,6 +64,18 @@ enum Backend {
     Auto,
     Cpu,
     Gpu,
+}
+
+/// On-demand camera gating. `Auto` (the default) subscribes to the v4l2loopback
+/// client-usage event and runs the camera + ISP only while a consumer is
+/// capturing, falling back silently to always-on when the event is unavailable
+/// (a v4l2loopback without the patch); `On` is the same but logs the fallback;
+/// `Off` always streams from start-up (the original behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDemandMode {
+    Auto,
+    On,
+    Off,
 }
 
 /// Either ISP engine, producing a packed YUYV frame from raw capture bytes. The
@@ -107,6 +125,12 @@ const AWB_INTERVAL: u64 = 8;
 /// self-corrects for the pipeline's brightness gain. Override with `--target`.
 const AE_TARGET_LUMA: f64 = 0.42;
 
+/// Interval between standby frames written while on-demand idle (~10 fps). Just
+/// frequent enough to keep the loopback a negotiable capture device for a
+/// connecting consumer; the hardware camera stays off, so this is a memset+write
+/// only. Lower is more responsive to a new consumer; higher means fewer wake-ups.
+const STANDBY_PERIOD: Duration = Duration::from_millis(100);
+
 struct Args {
     device: String,
     backend: Backend,
@@ -119,6 +143,7 @@ struct Args {
     measure: bool,
     denoise: f64,
     temporal: f64,
+    on_demand: OnDemandMode,
 }
 
 fn parse_args() -> Args {
@@ -142,6 +167,9 @@ fn parse_args() -> Args {
     // Gain-adaptive temporal luma-denoise scaler (0 disables; 1 is the default;
     // >1 strengthens). See `temporal_luma_for_gain`.
     let mut temporal = 1.0f64;
+    // On-demand camera gating: open the camera only while a consumer captures.
+    // Auto by default (uses the v4l2loopback client-usage event when available).
+    let mut on_demand = OnDemandMode::Auto;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -175,6 +203,15 @@ fn parse_args() -> Args {
             "--no-temporal" => temporal = 0.0,
             "--temporal" => temporal = it.next().and_then(|s| s.parse().ok()).unwrap_or(temporal).max(0.0),
             "--measure-delay" => measure = true,
+            "--on-demand" => match it.next().as_deref() {
+                Some("auto") => on_demand = OnDemandMode::Auto,
+                Some("on") => on_demand = OnDemandMode::On,
+                Some("off") => on_demand = OnDemandMode::Off,
+                other => {
+                    eprintln!("unknown on-demand mode: {other:?} (use auto|on|off)");
+                    std::process::exit(1);
+                }
+            },
             "--target" => target = it.next().and_then(|s| s.parse().ok()).unwrap_or(target),
             "--max-gain" => max_gain = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_gain),
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads).max(1),
@@ -184,7 +221,7 @@ fn parse_args() -> Args {
                      [--debayer half|mhc] [--no-ae] [--no-lca] [--no-denoise] \
                      [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
                      [--target <0..1>] [--max-gain <idx>] [--threads <n>] \
-                     [--measure-delay]"
+                     [--on-demand auto|on|off] [--measure-delay]"
                 );
                 std::process::exit(0);
             }
@@ -206,6 +243,7 @@ fn parse_args() -> Args {
         measure,
         denoise,
         temporal,
+        on_demand,
     }
 }
 
@@ -622,28 +660,18 @@ fn main() {
         .build_global()
         .expect("build rayon pool");
 
-    let (sensor, state) = init_sensor();
-
-    // Camera setup (shared by the live path and --measure-delay); the whole
-    // `session` is kept alive here so its held configuration outlives the stream.
+    let (sensor, mut state) = init_sensor();
     let mgr = CameraManager::new().expect("CameraManager");
-    let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
-        .unwrap_or_else(|e| panic!("open raw camera: {e}"));
-
-    session.cam.start(None).expect("start");
-    if let Some(s) = &sensor {
-        let _ = s.apply(state);
-    }
-    for req in std::mem::take(&mut session.requests) {
-        session
-            .cam
-            .queue_request(req)
-            .map_err(|(_, e)| e)
-            .expect("queue initial request");
-    }
 
     // --- Sensor apply-delay measurement mode (no loopback, no ISP output). ---
     if args.measure {
+        let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
+            .unwrap_or_else(|e| panic!("open raw camera: {e}"));
+        session.cam.start(None).expect("start");
+        if let Some(s) = &sensor {
+            let _ = s.apply(state);
+        }
+        queue_initial(&mut session);
         match &sensor {
             Some(s) => run_measure_delay(&mut session.cam, &session.stream, &session.rx, s, state),
             None => eprintln!("--measure-delay needs sensor control, but none is available"),
@@ -651,7 +679,67 @@ fn main() {
         return;
     }
 
-    run_live(&mut session.cam, &session.stream, &session.rx, sensor, state, &args);
+    // Build the ISP engine once (GPU init etc.) and open the loopback up front,
+    // before choosing on-demand vs always-on: the loopback must stay open so the
+    // virtual webcam is visible to applications while the camera is idle.
+    let (mut engine, dst_w, dst_h) = build_engine(&args);
+    let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32)
+        .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
+    println!("output: {} {dst_w}x{dst_h} YUYV", args.device);
+
+    // On-demand gating: subscribe to the v4l2loopback client-usage event so the
+    // camera runs only while a consumer captures. Unavailable (un-patched
+    // v4l2loopback) falls back to always-on.
+    let on_demand = match args.on_demand {
+        OnDemandMode::Off => false,
+        mode => match out.subscribe_client_usage() {
+            Ok(()) => {
+                println!("on-demand: camera runs only while a consumer captures (client-usage event)");
+                true
+            }
+            Err(e) => {
+                if mode == OnDemandMode::On {
+                    eprintln!(
+                        "on-demand requested but the v4l2loopback client-usage event is \
+                         unavailable ({e}); falling back to always-on"
+                    );
+                } else {
+                    eprintln!("note: v4l2loopback client-usage event unavailable ({e}); running always-on");
+                }
+                false
+            }
+        },
+    };
+
+    if on_demand {
+        run_on_demand(&mgr, &mut out, dst_w, dst_h, &mut engine, &sensor, &mut state, &args);
+    } else {
+        // Always-on: open and start the camera once, stream until a fatal error.
+        let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
+            .unwrap_or_else(|e| panic!("open raw camera: {e}"));
+        session.cam.start(None).expect("start");
+        if let Some(s) = &sensor {
+            let _ = s.apply(state);
+        }
+        queue_initial(&mut session);
+        run_live(
+            &mut engine, &mut out, &mut session.cam, &session.stream, &session.rx,
+            dst_w, dst_h, &sensor, &mut state, &args, false,
+        );
+    }
+}
+
+/// Queue a freshly started session's initial requests, panicking on the first
+/// failure (a new session must accept its own buffers; a failure here means a
+/// broken setup, not a transient runtime condition).
+fn queue_initial(session: &mut cam_setup::Session<'_>) {
+    for req in std::mem::take(&mut session.requests) {
+        session
+            .cam
+            .queue_request(req)
+            .map_err(|(_, e)| e)
+            .expect("queue initial request");
+    }
 }
 
 /// Outcome of processing and writing one frame (see `process_and_write`).
@@ -701,26 +789,40 @@ fn process_and_write(
     result.unwrap_or_else(|_| FrameOutcome::Skipped("panic in frame processing".to_string()))
 }
 
-/// Live path: resolve the ISP backend, open the loopback output, and run the
-/// capture/process/AE loop until the camera times out or a write fails. Drops
-/// stale frames so latency stays low when the ISP falls behind, meters output
-/// luma for AE, and applies gain-adaptive denoise to the produced frame.
+/// Why the live loop returned (see `run_live`).
+enum LiveExit {
+    /// On-demand: the last consumer disconnected. The caller should stop the
+    /// camera and wait for the next consumer.
+    Idle,
+    /// A fatal condition (camera timeout or loopback write failure). The caller
+    /// should stop the daemon.
+    Stop,
+}
+
+/// Live path: run the capture/process/AE loop on an already-started `cam`,
+/// writing to an already-open `out`. Drops stale frames so latency stays low
+/// when the ISP falls behind, meters output luma for AE, and applies
+/// gain-adaptive denoise to the produced frame.
+///
+/// When `watch_consumer` is set (on-demand mode) the loop also drains the
+/// v4l2loopback client-usage event each iteration and returns [`LiveExit::Idle`]
+/// as soon as the last consumer disconnects; otherwise it runs until a fatal
+/// condition and returns [`LiveExit::Stop`]. The engine, loopback and AE state
+/// are owned by the caller so they persist across on-demand activations.
+#[allow(clippy::too_many_arguments)]
 fn run_live(
+    engine: &mut Engine,
+    out: &mut LoopbackOutput,
     cam: &mut ActiveCamera,
     stream: &Stream,
     rx: &std::sync::mpsc::Receiver<Request>,
-    sensor: Option<Sensor>,
-    mut state: AeState,
+    dst_w: usize,
+    dst_h: usize,
+    sensor: &Option<Sensor>,
+    state: &mut AeState,
     args: &Args,
-) {
-    // Resolve the backend now (Auto may fall back to CPU), so the output size is
-    // known before the loopback is opened.
-    let (mut engine, dst_w, dst_h) = build_engine(args);
-
-    let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32)
-        .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
-    println!("output: {} {dst_w}x{dst_h} YUYV", args.device);
-
+    watch_consumer: bool,
+) -> LiveExit {
     let ae_cfg = AeConfig {
         target: args.target,
         max_gain_index: args.max_gain,
@@ -758,14 +860,35 @@ fn run_live(
     const AE_SETTLE: u32 = 3;
     let mut ae_hold = 0u32;
 
-    loop {
+    let exit = loop {
+        // On-demand: stop as soon as the last consumer disconnects. The event
+        // queue is drained non-blocking each iteration (~per frame), so the
+        // shutdown latency is at most one frame.
+        if watch_consumer {
+            let mut left = false;
+            loop {
+                match out.poll_client_usage() {
+                    Ok(Some(active)) => left |= !active,
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("client-usage event poll failed: {e}");
+                        break;
+                    }
+                }
+            }
+            if left {
+                println!("on-demand: consumer disconnected");
+                break LiveExit::Idle;
+            }
+        }
+
         // Block for one completed request, then drain any extra ready ones,
         // requeuing all but the freshest so we always process the newest frame.
         let mut req = match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!("camera timed out, stopping");
-                break;
+                break LiveExit::Stop;
             }
         };
         while let Ok(newer) = rx.try_recv() {
@@ -785,7 +908,7 @@ fn run_live(
                 req.reuse(ReuseFlag::REUSE_BUFFERS);
                 if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
                     eprintln!("requeue after malformed frame failed: {e}; stopping");
-                    break;
+                    break LiveExit::Stop;
                 }
                 continue;
             }
@@ -796,8 +919,8 @@ fn run_live(
         // control variable; denoise is a no-op at low gain (the common case).
         let mut luma = None;
         let processed = match process_and_write(
-            &mut engine,
-            &mut out,
+            engine,
+            out,
             buf,
             dst_w,
             dst_h,
@@ -823,7 +946,7 @@ fn run_live(
             }
             FrameOutcome::WriteFailed(e) => {
                 eprintln!("loopback write failed: {e}");
-                break;
+                break LiveExit::Stop;
             }
         };
         if processed {
@@ -834,9 +957,9 @@ fn run_live(
             if args.ae {
                 if ae_hold > 0 {
                     ae_hold -= 1;
-                } else if let (Some(m), Some(s)) = (luma, &sensor) {
-                    let next = ae::step(&ae_cfg, state, m);
-                    if next != state {
+                } else if let (Some(m), Some(s)) = (luma, sensor) {
+                    let next = ae::step(&ae_cfg, *state, m);
+                    if next != *state {
                         if let Err(e) = s.apply(next) {
                             // Don't kill the stream on a transient subdev write
                             // failure; count it so a persistent fault is visible.
@@ -845,7 +968,7 @@ fn run_live(
                                 eprintln!("sensor apply failed ({ae_errors}): {e}");
                             }
                         }
-                        state = next;
+                        *state = next;
                         ae_hold = AE_SETTLE;
                     }
                 }
@@ -857,7 +980,7 @@ fn run_live(
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
             eprintln!("requeue failed: {e}; stopping");
-            break;
+            break LiveExit::Stop;
         }
 
         // Periodic throughput report.
@@ -873,7 +996,114 @@ fn run_live(
             last_report = Instant::now();
             report_frames = 0;
         }
-    }
+    };
 
     println!("stopped after {frames} frames ({dropped} dropped, {errors} errors, {ae_errors} sensor-apply errors)");
+    exit
+}
+
+/// On-demand path: keep the loopback open so the virtual webcam stays visible,
+/// and open/start the GC2607 only while a consumer is capturing. Blocks on the
+/// client-usage event when idle; on connect, opens and starts the camera and
+/// runs [`run_live`] until the consumer disconnects ([`LiveExit::Idle`], back to
+/// idle) or a fatal error ([`LiveExit::Stop`], stop the daemon). Dropping the
+/// session stops and releases the camera, so the sensor powers down between uses.
+///
+/// The engine and AE `state` persist across activations: the GPU device is built
+/// once, and exposure/gain resume near their last values rather than re-converging
+/// from default on every reconnect.
+#[allow(clippy::too_many_arguments)]
+fn run_on_demand(
+    mgr: &CameraManager,
+    out: &mut LoopbackOutput,
+    dst_w: usize,
+    dst_h: usize,
+    engine: &mut Engine,
+    sensor: &Option<Sensor>,
+    state: &mut AeState,
+    args: &Args,
+) {
+    // Standby frame (black YUYV: Y=0, Cb/Cr=128) written while idle. Under
+    // exclusive_caps=1 the loopback only presents a usable CAPTURE stream while a
+    // producer is actively streaming, so a consumer cannot negotiate (let alone
+    // STREAMON to fire the activation event) against an idle, silent producer.
+    // Writing a cheap standby frame keeps the device live and negotiable with the
+    // hardware camera and ISP off -- the same approach v4l2-relayd takes with its
+    // test/splash source. (A single priming write is not enough: consumers need a
+    // continuously streaming producer to negotiate and pre-roll.)
+    let mut standby = vec![0u8; out.frame_size()];
+    for px in standby.chunks_exact_mut(2) {
+        px[1] = 128;
+    }
+
+    loop {
+        println!("on-demand: camera idle (standby, camera off), waiting for a consumer on {}", args.device);
+        // Idle keepalive: write standby frames so the device stays negotiable,
+        // polling the client-usage event between frames. The hardware camera and
+        // ISP stay off; this is a plain memset+write, no per-pixel work.
+        loop {
+            let mut active = None;
+            loop {
+                match out.poll_client_usage() {
+                    Ok(Some(a)) => active = Some(a),
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("client-usage event poll failed: {e}");
+                        break;
+                    }
+                }
+            }
+            if active == Some(true) {
+                break;
+            }
+            if let Err(e) = out.write_frame(&standby) {
+                eprintln!("standby write failed: {e}; stopping");
+                return;
+            }
+            std::thread::sleep(STANDBY_PERIOD);
+        }
+
+        println!("on-demand: consumer connected, starting camera");
+        let mut session = match cam_setup::open_raw(mgr, WIDTH, HEIGHT) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("open raw camera failed: {e}; back to idle");
+                continue;
+            }
+        };
+        if let Err(e) = session.cam.start(None) {
+            eprintln!("camera start failed: {e}; back to idle");
+            continue;
+        }
+        if let Some(s) = sensor {
+            let _ = s.apply(*state);
+        }
+        let mut queued = true;
+        for req in std::mem::take(&mut session.requests) {
+            if let Err(e) = session.cam.queue_request(req).map_err(|(_, e)| e) {
+                eprintln!("queue initial request failed: {e}; back to idle");
+                queued = false;
+                break;
+            }
+        }
+
+        let exit = if queued {
+            run_live(
+                engine, out, &mut session.cam, &session.stream, &session.rx,
+                dst_w, dst_h, sensor, state, args, true,
+            )
+        } else {
+            LiveExit::Idle
+        };
+
+        // Dropping the session stops and releases the camera (libcamera's Drop
+        // calls stop + release), powering the sensor down via runtime PM.
+        drop(session);
+        println!("on-demand: camera stopped");
+
+        match exit {
+            LiveExit::Idle => continue,
+            LiveExit::Stop => return,
+        }
+    }
 }

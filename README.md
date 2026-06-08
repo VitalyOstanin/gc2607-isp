@@ -8,11 +8,13 @@ extracted sensor tuning.
 ## Contents
 
 - [Purpose](#purpose)
+- [Architecture: the camera stack](#architecture-the-camera-stack)
 - [Processing pipeline](#processing-pipeline)
 - [Tuning source](#tuning-source)
 - [Layout](#layout)
 - [Build and run (offline CLI)](#build-and-run-offline-cli)
 - [Live webcam (gc2607-video)](#live-webcam-gc2607-video)
+  - [Troubleshooting: washed-out / banded image after changing resolution](#troubleshooting-washed-out--banded-image-after-changing-resolution)
 - [Building on other distributions](#building-on-other-distributions)
 - [Correctness check (golden)](#correctness-check-golden)
 - [Roadmap](#roadmap)
@@ -24,6 +26,73 @@ residual grey-world AWB tint, no vignetting correction. This project implements
 its own CPU pipeline using extracted sensor tuning (colour-correction
 matrices, lens-shading maps, white locus) that the libcamera tuning does not
 have.
+
+## Architecture: the camera stack
+
+This ISP is one stage in a chain from the raw sensor to a regular webcam node.
+Each layer below feeds the next:
+
+```
+GC2607 sensor (MIPI CSI-2, I2C control)
+  -> gc2607.ko              V4L2 subdev driver: streaming + exposure/gain/vblank controls, runtime PM
+  -> ipu-bridge (patched)   binds the GCTI2607 sensor to the Intel IPU6 (ACPI/_DSM clock + bridge table)
+  -> intel_ipu6 / ipu6-isys IPU6 CSI-2 receiver: delivers the raw Bayer frame, exposes V4L2 capture + subdev nodes
+  -> libcamera (0.7)        enumerates the IPU6 pipeline + the gc2607 sensor; used here ONLY to pull the raw stream
+  -> gc2607-video (this)    the ISP: raw Bayer -> colour YUYV (CPU or GPU); AE drives the sensor over the V4L2 subdev
+  -> v4l2loopback           this binary is the producer; the loopback node looks like a normal webcam
+  -> application            browser / OBS / ffplay opens /dev/videoN
+```
+
+Two things deserve explanation: why the colour processing is a separate binary
+rather than libcamera's own ISP, and why frames reach applications through
+v4l2loopback rather than a GStreamer element.
+
+### Why a custom ISP, not libcamera's SoftISP
+
+libcamera ships a software ISP (the "simple" / soft pipeline) for sensors without
+a hardware ISP. It is intentionally minimal: basic debayer, grey-world AWB,
+gamma, and it only exposes Gamma/Contrast/Saturation controls. It cannot apply
+the per-device factory tuning this project relies on for image quality:
+
+- 5 colour-correction matrices interpolated by colour temperature, plus 24
+  per-hue-sector matrices (see [Processing pipeline](#processing-pipeline) and
+  [Tuning source](#tuning-source));
+- per-Bayer-channel lens-shading correction with light-source selection;
+- lateral chromatic-aberration correction;
+- gain-dependent chroma/luma denoise;
+- a GPU (Vulkan) backend for the per-pixel stages.
+
+It also has no manual-exposure path: in raw mode libcamera's IPA does not run and
+request controls are dropped, so a custom auto-exposure loop cannot go through it.
+This project therefore uses libcamera **only as a raw-capture API** and controls
+exposure/gain/vblank directly over the V4L2 subdev ([src/sensor.rs](src/sensor.rs)),
+which runs in parallel with libcamera's raw stream.
+
+### Why not integrate the ISP into libcamera or GStreamer
+
+The processing could in principle live inside libcamera (extending the soft IPA)
+or inside a GStreamer element. Neither is done, on purpose:
+
+- **Inside libcamera** would mean forking the SimplePipelineHandler and its soft
+  IPA (C++) and tracking their internal API across releases. The IPA interface is
+  not meant to host an out-of-tree pipeline with a wgpu/Vulkan backend; the
+  maintenance cost is high and it ties the project to one libcamera version.
+- **As a GStreamer element** would mean either using `libcamerasrc` (which routes
+  through the soft ISP rejected above) or writing and shipping a custom GStreamer
+  plugin wrapping the Rust ISP. That is extra surface for no gain here: the binary
+  already produces finished YUYV frames, so it writes them straight to a
+  v4l2loopback node, which every webcam application opens with no plugin.
+
+### Relationship to v4l2-relayd
+
+[v4l2-relayd](https://github.com/9elements/v4l2-relayd) is the Ubuntu/IPU6 helper
+that feeds a v4l2loopback node on demand from a GStreamer source. It is not used
+as the producer here for the same reason: its source is a GStreamer pipeline,
+which would bypass this ISP. Its **on-demand mechanism**, however — the
+v4l2loopback `V4L2_EVENT_PRI_CLIENT_USAGE` event, which fires when an application
+starts or stops capturing — is the right way to power the camera only while it is
+in use, and is adopted directly inside `gc2607-video` (the `--on-demand` flag)
+rather than by running relayd (see [Roadmap](#roadmap)).
 
 ## Processing pipeline
 
@@ -200,6 +269,7 @@ ffplay -f v4l2 /dev/video0
 | `--no-ae` | (AE on) | disable auto-exposure (use current sensor settings) |
 | `--target <0..1>` | `0.35` | AE target mean brightness |
 | `--max-gain <idx>` | `16` | AE max analogue-gain LUT index |
+| `--on-demand auto\|on\|off` | `auto` | open the camera and run the ISP only while an application is capturing (see [Roadmap](#roadmap)). `auto` self-gates when v4l2loopback exposes the client-usage event and otherwise streams always-on; `on` requires the event (warns and falls back if absent); `off` forces always-on. While idle the camera sensor stays runtime-suspended; the producer only writes cheap black keepalive frames so consumers can still negotiate the format. |
 
 Performance (Core Ultra 185H): `mhc` sustains the sensor's 30 fps at 8 threads
 (~29 at 4); `half` reaches 30 fps at 4 threads (~27 single-threaded). The
@@ -211,6 +281,27 @@ path to within 1 LSB, `tests/gpu.rs`) while offloading the per-pixel work. In on
 fixed scene the whole-process CPU use dropped from ~154% (CPU `mhc`, 8 threads)
 to ~37% (GPU) at the same frame rate — roughly a 4x CPU reduction, which matters
 on this thermally constrained laptop.
+
+### Troubleshooting: washed-out / banded image after changing resolution
+
+v4l2loopback keeps the capture-side format that was first fixed on the node. If
+the daemon is run once at half-res (`--debayer half`, 960x540) and then at the
+default full-res (`mhc`, 1920x1080) *without reloading the module*, the producer
+writes 1920x1080 frames into a node whose capture format is still pinned to
+960x540. Consumers then dequeue short frames (e.g. `1026048` bytes instead of
+the expected size), which shows up as a low-contrast, washed-out, colour-shifted
+image with horizontal banding (a torn frame), not as an outright error.
+
+Fix: reload the module so the format is reset, then start the daemon at the
+intended resolution:
+
+```sh
+sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+```
+
+To avoid it, run the daemon at a consistent resolution (the default full-res
+`mhc` is recommended). Switching `--debayer` between runs requires a module
+reload.
 
 ## Building on other distributions
 
@@ -293,3 +384,4 @@ the tests skip instead of failing. To run them, place a raw frame at
 | 5. Output | done | write to v4l2loopback `/dev/video0` (binary only, no systemd service) |
 | 6. Performance | done | `Processor` (buffer reuse, AWB/grid caching), parallel front-end + MHC + YUYV pack; 30 fps at full-res |
 | 7. GPU offload | done | `--backend gpu`: per-pixel stages (unpack/BLC/LSC/WB, MHC, CCM, gamma, YUYV pack) as Vulkan compute shaders; AWB on the CPU. ~4x lower CPU at the same frame rate |
+| 8. On-demand capture | done | `--on-demand auto` opens the camera + runs the ISP only while an application is capturing, driven by the v4l2loopback `V4L2_EVENT_PRI_CLIENT_USAGE` event (the v4l2-relayd mechanism, implemented in-process); the sensor stays runtime-suspended while idle. Falls back to always-on where the event is unavailable |
