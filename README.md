@@ -13,6 +13,7 @@ extracted sensor tuning.
 - [Layout](#layout)
 - [Build and run (offline CLI)](#build-and-run-offline-cli)
 - [Live webcam (gc2607-video)](#live-webcam-gc2607-video)
+- [Building on other distributions](#building-on-other-distributions)
 - [Correctness check (golden)](#correctness-check-golden)
 - [Roadmap](#roadmap)
 
@@ -151,6 +152,29 @@ podman run --rm \
 To build a CPU-only binary, drop the `gpu` feature (`--features capture`); then
 `auto` resolves to the CPU path and `--backend gpu` reports an error.
 
+#### Why a container
+
+The container is only for the `capture` feature — the offline CLI and the GPU
+backend are pure Rust and build directly on the host. The `libcamera` crate
+needs three things **at build time** that this project deliberately keeps off
+the host: the libcamera headers (`libcamera-dev`), `clang` (the `libcamera-sys`
+crate generates its bindings from those headers with bindgen), and
+`pkg-config`. The image carries them plus its own pinned Rust toolchain; the
+cargo registry and target directory are mounted as named volumes, so crates are
+not re-downloaded and nothing is written into the host's `~/.cargo`. (Rust
+itself is not the reason for the container — the host already has cargo and uses
+it for the offline and GPU builds.)
+
+The image is `ubuntu:26.04` specifically because its libcamera (0.7) matches the
+laptop's runtime `libcamera.so.0.7`: the binary links libcamera **dynamically**,
+is copied out to the host, and runs there against the host's libcamera runtime
+(no `-dev` package needed on the host). Building against a different libcamera
+version would produce a binary that does not match the host runtime.
+
+If you are willing to install `libcamera-dev` and `clang` on the build machine,
+you can skip the container and build natively — see
+[Building on other distributions](#building-on-other-distributions).
+
 ### Run
 
 ```sh
@@ -187,6 +211,59 @@ path to within 1 LSB, `tests/gpu.rs`) while offloading the per-pixel work. In on
 fixed scene the whole-process CPU use dropped from ~154% (CPU `mhc`, 8 threads)
 to ~37% (GPU) at the same frame rate — roughly a 4x CPU reduction, which matters
 on this thermally constrained laptop.
+
+## Building on other distributions
+
+The project has three build profiles with different system requirements:
+
+| Profile                                       | Cargo features    | Build-time system deps                                       | Runtime deps                                                  |
+|-----------------------------------------------|-------------------|--------------------------------------------------------------|---------------------------------------------------------------|
+| Offline CLI (`gc2607-isp`)                    | none (default)    | Rust toolchain only                                          | none                                                          |
+| + GPU backend                                 | `gpu`             | Rust toolchain only (wgpu is vendored)                       | a working Vulkan driver (Mesa ANV for the Intel iGPU)         |
+| Live / capture (`gc2607-video`, `gc2607-capture`) | `capture[,gpu]` | libcamera headers, `clang` (for bindgen), `pkg-config`, a C++ toolchain | libcamera runtime + the GC2607 sensor stack (see Prerequisites) |
+
+The offline CLI and the GPU backend are pure Rust and build on any distribution
+with a current stable toolchain; they were developed and tested with Rust
+1.88.0 (pinned in `Containerfile`). Only the `capture` feature needs system
+libraries.
+
+### libcamera version
+
+The `libcamera` crate (0.7) binds to the system libcamera through `pkg-config`
+and `bindgen`. Only the current release of each distribution is targeted, and
+all of them ship libcamera new enough for the crate (upstream: "known to build
+with libcamera v0.4.0 and up"). As of 2026-06-08, per repology.org:
+
+| Distribution         | libcamera                | Native `capture` build      |
+|----------------------|--------------------------|-----------------------------|
+| Ubuntu 26.04 LTS     | 0.7.0                    | yes (verified)              |
+| Debian 13 (trixie)   | 0.4.0 (backports 0.7.1)  | should work (untested here) |
+| Fedora 43 / 44       | 0.5.2 / 0.7.x            | should work (untested here) |
+
+"yes (verified)" marks the only combination this project has actually been
+built and run on — the podman `ubuntu:26.04` image, which matches the laptop's
+runtime libcamera 0.7.0 ABI. The other rows meet the crate's `>= 0.4.0`
+requirement but are untested here; API differences between libcamera minor
+versions may need small adjustments.
+
+Install the build dependencies, then build natively instead of in the container:
+
+```sh
+# Debian / Ubuntu
+sudo apt install libcamera-dev clang pkg-config build-essential
+# Fedora
+sudo dnf install libcamera-devel clang pkgconf-pkg-config gcc-c++
+
+cargo build --release --features capture,gpu
+```
+
+### Hardware scope
+
+This ISP targets one specific device — the MateBook X Pro 2024 GC2607 camera.
+The offline CLI is portable (it processes a saved raw frame on any machine), but
+`gc2607-video` / `gc2607-capture` are only useful on that laptop, where the
+`gc2607` sensor driver, the patched `ipu-bridge`, and the tuning are present. On
+other hardware the capture binaries build but find no `gc2607` camera to open.
 
 ## Correctness check (golden)
 
