@@ -30,9 +30,9 @@
 //! `--on-demand off` forces always-on; `--on-demand on` requires the event.
 //!
 //! Usage:
-//!   gc2607-video [--device /dev/videoN] [--backend cpu|gpu] [--debayer half|mhc]
-//!                [--no-ae] [--target <0..1>] [--max-gain <idx>] [--threads <n>]
-//!                [--on-demand auto|on|off] [--measure-delay]
+//!   gc2607-video [--device /dev/videoN] [--device-label <name>] [--backend cpu|gpu]
+//!                [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>]
+//!                [--threads <n>] [--on-demand auto|on|off] [--measure-delay]
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -50,7 +50,8 @@ use libcamera::{
 use gc2607_isp::ae::{self, AeConfig, AeState};
 use gc2607_isp::camera as cam_setup;
 use gc2607_isp::output::{
-    denoise_chroma_yuyv, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv, LoopbackOutput,
+    denoise_chroma_yuyv, find_loopback_by_label, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv,
+    LoopbackOutput,
 };
 use gc2607_isp::pipeline::{DebayerMode, Processor};
 use gc2607_isp::sensor::Sensor;
@@ -153,6 +154,10 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut device = "/dev/video0".to_string();
+    // Optional: resolve the loopback node by its v4l2loopback card_label instead
+    // of a fixed /dev/videoN (whose number depends on probe order). When given it
+    // overrides --device. See `find_loopback_by_label`.
+    let mut device_label: Option<String> = None;
     // Default backend is Auto: prefer the GPU (full-res MHC, ~4x lower CPU) and
     // fall back to the CPU path if no GPU is available. The CPU defaults (#24)
     // are full-res MHC at 8 threads, overridable via --debayer / --threads.
@@ -182,6 +187,11 @@ fn parse_args() -> Args {
             "--device" => {
                 if let Some(v) = it.next() {
                     device = v;
+                }
+            }
+            "--device-label" => {
+                if let Some(v) = it.next() {
+                    device_label = Some(v);
                 }
             }
             "--backend" => match it.next().as_deref() {
@@ -222,7 +232,8 @@ fn parse_args() -> Args {
             "--threads" => threads = it.next().and_then(|s| s.parse().ok()).unwrap_or(threads).max(1),
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: gc2607-video [--device /dev/videoN] [--backend auto|cpu|gpu] \
+                    "usage: gc2607-video [--device /dev/videoN] [--device-label <name>] \
+                     [--backend auto|cpu|gpu] \
                      [--debayer half|mhc] [--no-ae] [--no-lca] [--no-denoise] \
                      [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
                      [--target <0..1>] [--max-gain <idx>] [--threads <n>] \
@@ -232,6 +243,17 @@ fn parse_args() -> Args {
             }
             _ => {
                 eprintln!("unexpected argument: {a}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // Resolve the loopback by label if requested; this overrides --device. Done
+    // after the parse loop so the label always wins regardless of argument order.
+    if let Some(label) = device_label {
+        match find_loopback_by_label(&label) {
+            Ok(path) => device = path.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!("--device-label {label:?}: {e}");
                 std::process::exit(1);
             }
         }

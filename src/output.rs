@@ -15,7 +15,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
@@ -120,6 +120,44 @@ const _: () = assert!(core::mem::offset_of!(V4l2Event, u) == 8);
 nix::ioctl_write_ptr!(vidioc_subscribe_event, b'V', 90, V4l2EventSubscription);
 // VIDIOC_DQEVENT = _IOR('V', 89, struct v4l2_event)
 nix::ioctl_read!(vidioc_dqevent, b'V', 89, V4l2Event);
+
+/// Resolve a v4l2loopback node by its `card_label` (the string set with the
+/// `card_label=` module option, exposed at `/sys/class/video4linux/videoN/name`).
+///
+/// This makes the output device addressable by a stable label instead of a
+/// `/dev/videoN` number that depends on probe order: on an Intel IPU6 machine the
+/// ISYS alone registers dozens of `/dev/video*` nodes, so the loopback's number is
+/// not fixed. The lookup mirrors how the GC2607 sub-device is found by entity name
+/// in `sensor.rs`. The label match also works regardless of `exclusive_caps`: the
+/// sysfs `name` does not change when the device flips between output and capture
+/// caps as a producer attaches.
+///
+/// Note: V4L2 stores the card string in a 32-byte field (31 chars + NUL), so a
+/// label longer than 31 characters is truncated by the kernel; the comparison is
+/// against whatever sysfs reports, so the requested label must fit.
+pub fn find_loopback_by_label(label: &str) -> io::Result<PathBuf> {
+    let want = label.trim();
+    let sys = Path::new("/sys/class/video4linux");
+    for entry in std::fs::read_dir(sys)? {
+        let entry = entry?;
+        let node = entry.file_name();
+        let node = node.to_string_lossy();
+        if !node.starts_with("video") {
+            continue;
+        }
+        let name = std::fs::read_to_string(entry.path().join("name")).unwrap_or_default();
+        if name.trim() == want {
+            return Ok(PathBuf::from("/dev").join(node.as_ref()));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no v4l2loopback device labelled {want:?} found; create it with \
+             `modprobe v4l2loopback card_label=\"{want}\" exclusive_caps=1`"
+        ),
+    ))
+}
 
 /// A loopback output node configured for YUYV frames of a fixed size.
 pub struct LoopbackOutput {

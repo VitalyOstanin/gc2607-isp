@@ -211,6 +211,7 @@ Rust data is generated from the sources by [tools/gen_tuning.py](tools/gen_tunin
 | [tools/gen_golden.py](tools/gen_golden.py) | golden artifact generation |
 | [tests/golden.rs](tests/golden.rs) | checks the Rust output against the Python reference + reference MHC crate |
 | [tests/gpu.rs](tests/gpu.rs) | checks the GPU backend matches the CPU MHC path within 1 LSB (`gpu`+`video`) |
+| [packaging/](packaging/) | systemd unit + loopback config to run the daemon as an on-demand service |
 
 ## Build and run (offline CLI)
 
@@ -320,6 +321,7 @@ ffplay -f v4l2 /dev/video0
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--device /dev/videoN` | `/dev/video0` | v4l2loopback output node |
+| `--device-label <name>` | (unset) | locate the loopback by its `card_label` instead of a fixed `/dev/videoN`; overrides `--device`. Robust to probe order (the IPU6 ISYS registers dozens of `/dev/video*`). Used by the systemd service. |
 | `--backend auto\|cpu\|gpu` | `auto` | `auto` prefers the GPU and falls back to the CPU if none is available. `gpu` forces the GPU (per-pixel stages as Vulkan compute, AWB on CPU; always full-res MHC, ignores `--debayer`) and fails if it cannot initialise. `cpu` forces the CPU path. GPU needs the `gpu` build feature; without it `auto` is CPU and `gpu` errors. |
 | `--debayer half\|mhc` | `mhc` | `mhc` = full-res 1920x1080; `half` = 960x540, lighter (CPU backend only) |
 | `--threads N` | `8` | ISP worker threads (CPU budget; see note). On the GPU backend only the occasional CPU-side AWB uses them. |
@@ -359,6 +361,27 @@ sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
 To avoid it, run the daemon at a consistent resolution (the default full-res
 `mhc` is recommended). Switching `--debayer` between runs requires a module
 reload.
+
+### Run as a system service (on-demand)
+
+[`packaging/`](packaging/) holds a systemd unit and the loopback configuration to
+run `gc2607-video` as an on-demand service: the virtual webcam is always present,
+but the sensor and ISP run only while an application captures. The loopback is
+created at boot with a fixed `card_label` and the daemon finds it by label
+(`--device-label`), so no `/dev/videoN` number is hard-coded. Telemetry (stdout)
+is discarded; warnings and errors (stderr) go to the journal.
+
+Install and management steps, plus a hardened (non-root) variant, are in
+[`packaging/README.md`](packaging/README.md). In short:
+
+```sh
+sudo install -m 0755 gc2607-video /usr/local/bin/gc2607-video
+sudo install -m 0644 packaging/modules-load.d/gc2607-loopback.conf /etc/modules-load.d/
+sudo install -m 0644 packaging/modprobe.d/gc2607-loopback.conf     /etc/modprobe.d/
+sudo install -m 0644 packaging/systemd/gc2607-camera.service       /etc/systemd/system/
+sudo modprobe v4l2loopback
+sudo systemctl daemon-reload && sudo systemctl enable --now gc2607-camera
+```
 
 ## Building on other distributions
 

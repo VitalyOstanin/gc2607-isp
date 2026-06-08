@@ -1,0 +1,37 @@
+[Unit]
+Description=GC2607 colour camera ISP (on-demand virtual webcam)
+Documentation=https://github.com/VitalyOstanin/gc2607-isp
+# The v4l2loopback module is loaded by modules-load.d/gc2607-loopback.conf with
+# options from modprobe.d/gc2607-loopback.conf; that happens during
+# systemd-modules-load.service. The loopback node may appear a moment later (udev),
+# so if the daemon starts before it exists the label lookup fails and the service
+# is restarted (Restart=on-failure) until the node is present.
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+# Resolve the loopback by its card_label, not a fixed /dev/videoN: the IPU6 ISYS
+# registers dozens of /dev/video* nodes, so the loopback's number is not stable.
+# The label must match card_label in modprobe.d/gc2607-loopback.conf.
+ExecStart=/usr/local/bin/gc2607-video --device-label "MateBook Camera (GC2607)" --on-demand auto
+Restart=on-failure
+RestartSec=2
+
+# Telemetry is printed to stdout (one line every 2 s while a consumer streams);
+# warnings and errors go to stderr. Discard the former, keep the latter in the
+# journal.
+StandardOutput=null
+StandardError=journal
+
+# Deprioritise slightly so the camera never starves interactive work. This only
+# lowers scheduling priority; it does not raise any resource limit.
+Nice=5
+
+# Device access. The daemon needs the v4l2loopback node, the IPU6 ISYS capture
+# nodes and the GC2607 sensor sub-device (all char-major 81, "video4linux"), and
+# the GPU render node for the default GPU backend. Running as root is the
+# simplest; see packaging/README.md for a hardened (DynamicUser + groups) variant.
+User=root
+
+[Install]
+WantedBy=multi-user.target
