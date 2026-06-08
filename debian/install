@@ -1,0 +1,4 @@
+gc2607-video                                   usr/bin/
+packaging/systemd/gc2607-camera.service       usr/lib/systemd/system/
+packaging/modprobe.d/gc2607-loopback.conf     etc/modprobe.d/
+packaging/modules-load.d/gc2607-loopback.conf etc/modules-load.d/

@@ -13,7 +13,7 @@ Type=simple
 # Resolve the loopback by its card_label, not a fixed /dev/videoN: the IPU6 ISYS
 # registers dozens of /dev/video* nodes, so the loopback's number is not stable.
 # The label must match card_label in modprobe.d/gc2607-loopback.conf.
-ExecStart=/usr/local/bin/gc2607-video --device-label "MateBook Camera (GC2607)" --on-demand auto
+ExecStart=/usr/bin/gc2607-video --device-label "MateBook Camera (GC2607)" --on-demand auto
 Restart=on-failure
 RestartSec=2
 

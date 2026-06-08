@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+# Prebuilt-binary package: gc2607-video is compiled separately (cargo, in a
+# container or CI) and only packaged here; dpkg-buildpackage does not compile.
+# dh_install places it and the service files; dh_shlibdeps derives the libcamera
+# dependency by scanning the ELF; dh_installsystemd enables the unit.
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+override_dh_auto_build:
+override_dh_auto_test:
+override_dh_auto_install:
+override_dh_auto_clean:
+
+# Enable the service for the next boot but do not start it during install: the
+# v4l2loopback node is created at boot by modules-load.d and is not present yet.
+override_dh_installsystemd:
+	dh_installsystemd --no-start

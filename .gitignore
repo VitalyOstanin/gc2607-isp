@@ -19,3 +19,16 @@ __pycache__/
 
 # local project-check review reports (generated, not part of the source)
 /docs/reviews/
+
+# Debian packaging build artefacts
+/debian/.debhelper/
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper
+/debian/*.debhelper.log
+/debian/debhelper-build-stamp
+/debian/gc2607-isp/
+/debian/tmp/
+
+# CI deb collection
+/dist/

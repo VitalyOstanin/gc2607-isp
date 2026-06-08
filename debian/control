@@ -1,0 +1,23 @@
+Source: gc2607-isp
+Section: video
+Priority: optional
+Maintainer: Vitaly Ostanin <vitaly.ostanin@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/VitalyOstanin/gc2607-isp
+Rules-Requires-Root: no
+
+Package: gc2607-isp
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: mesa-vulkan-drivers, v4l2loopback-dkms, gc2607-driver-dkms, gc2607-ipu-bridge-dkms
+Description: software ISP for the GalaxyCore GC2607 colour camera (on-demand webcam)
+ gc2607-video captures raw Bayer frames from the GalaxyCore GC2607 (Huawei
+ MateBook X Pro 2024, Intel IPU6) via libcamera, runs a full ISP (black level,
+ lens-shading, AWB, debayer, colour-correction, sRGB) on the CPU or the GPU, and
+ publishes the result to a v4l2loopback node as an on-demand virtual webcam: the
+ sensor and ISP run only while an application is capturing.
+ .
+ This package ships a prebuilt binary that links against libcamera 0.7, so it
+ targets Ubuntu 26.04. The GC2607 sensor driver and the patched ipu-bridge
+ (separate packages) and a v4l2loopback module are required for a working camera.

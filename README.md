@@ -31,6 +31,7 @@ here, and is left alone.
 - [Live webcam (gc2607-video)](#live-webcam-gc2607-video)
   - [Troubleshooting: washed-out / banded image after changing resolution](#troubleshooting-washed-out--banded-image-after-changing-resolution)
 - [Building on other distributions](#building-on-other-distributions)
+- [Debian package (.deb)](#debian-package-deb)
 - [Correctness check (golden)](#correctness-check-golden)
 - [Roadmap](#roadmap)
 - [Related projects](#related-projects)
@@ -435,6 +436,39 @@ The offline CLI is portable (it processes a saved raw frame on any machine), but
 `gc2607-video` / `gc2607-capture` are only useful on that laptop, where the
 `gc2607` sensor driver, the patched `ipu-bridge`, and the tuning are present. On
 other hardware the capture binaries build but find no `gc2607` camera to open.
+
+## Debian package (.deb)
+
+For Ubuntu 26.04 the live webcam is packaged as `gc2607-isp` (amd64): it installs
+`gc2607-video` to `/usr/bin`, the on-demand systemd service and the loopback
+configuration (the files in [`packaging/`](packaging/)). The binary is built
+separately and the package only wraps it (`debian/rules` overrides the compile
+steps), so `dpkg-shlibdeps` derives the `libcamera0.7` dependency by scanning the
+ELF.
+
+Build it after the binary exists:
+
+```sh
+# build the binary in the container (see "Live webcam" above), then copy it to the
+# repository root where debian/install expects it:
+cp target/release/gc2607-video ./gc2607-video
+sudo apt install -y debhelper dpkg-dev          # packaging tools, once
+dpkg-buildpackage -us -uc -b                     # -> ../gc2607-isp_0.1.0_amd64.deb
+sudo apt install ../gc2607-isp_0.1.0_amd64.deb
+```
+
+The package `Recommends` `mesa-vulkan-drivers`, `v4l2loopback-dkms`,
+`gc2607-driver-dkms` and `gc2607-ipu-bridge-dkms`. It enables `gc2607-camera.service`
+for the next boot but does not start it during install (the loopback node is
+created at boot); see [`packaging/README.md`](packaging/README.md).
+
+### CI
+
+[`.github/workflows/build-deb.yml`](.github/workflows/build-deb.yml) builds the
+binary and the `.deb` inside an `ubuntu:26.04` container (to match libcamera 0.7)
+on every push and pull request and uploads the `.deb` as a workflow artifact. On a
+`v*` tag it also attaches the `.deb` to a GitHub release. The GPU feature is
+compiled but not runtime-tested (the hosted runners have no GPU).
 
 ## Correctness check (golden)
 

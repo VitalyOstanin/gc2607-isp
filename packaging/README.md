@@ -39,12 +39,19 @@ constrained laptop.
 
 ## Install
 
-Build `gc2607-video` (see the top-level README — it is built in a podman
-container) and install it plus the service files:
+The easiest route is the Debian package (`gc2607-isp_*_amd64.deb`), which installs
+the binary to `/usr/bin`, ships all of the files below and enables the service for
+the next boot. Build it with `dpkg-buildpackage -us -uc -b` after building the
+binary, or download it from a GitHub release (built by the CI workflow). See the
+top-level README for the deb build.
+
+To install the pieces by hand instead, build `gc2607-video` (it is built in a
+podman container — see the top-level README) and install it plus the service
+files:
 
 ```sh
-# 1. the binary on a stable path the unit refers to
-sudo install -m 0755 gc2607-video /usr/local/bin/gc2607-video
+# 1. the binary on the path the unit refers to
+sudo install -m 0755 gc2607-video /usr/bin/gc2607-video
 
 # 2. loopback setup
 sudo install -m 0644 packaging/modules-load.d/gc2607-loopback.conf /etc/modules-load.d/gc2607-loopback.conf
@@ -106,5 +113,5 @@ sudo rm /etc/modules-load.d/gc2607-loopback.conf
 sudo rm /etc/modprobe.d/gc2607-loopback.conf
 sudo systemctl daemon-reload
 sudo rmmod v4l2loopback        # optional: drop the loopback now
-sudo rm /usr/local/bin/gc2607-video
+sudo rm /usr/bin/gc2607-video
 ```

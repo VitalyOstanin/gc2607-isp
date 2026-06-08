@@ -1,0 +1,74 @@
+name: build-deb
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write # required to attach the .deb to a release on tag
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    # Build inside ubuntu:26.04 so the binary links against libcamera 0.7 (the
+    # version on the target host); GitHub-hosted runners are older releases.
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git \
+            build-essential pkg-config clang \
+            libcamera-dev \
+            debhelper dpkg-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      # The GPU feature only links wgpu/Vulkan; it compiles without a GPU. Its
+      # runtime tests (tests/gpu.rs, gpu-probe) need a real GPU and are not run here.
+      - name: Build gc2607-video (capture + gpu)
+        run: cargo build --release --features capture,gpu --bin gc2607-video
+
+      - name: Stage prebuilt binary
+        run: cp target/release/gc2607-video ./gc2607-video
+
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Collect artefacts
+        run: |
+          mkdir -p dist
+          cp ../gc2607-isp_*_amd64.deb dist/
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc2607-isp-deb
+          path: dist/*.deb
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
