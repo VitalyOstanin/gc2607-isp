@@ -88,16 +88,12 @@ pub fn vblank_for_fps(fps: f64) -> i32 {
 
 /// Index of the gain table entry whose multiplier is closest to `mult`.
 pub fn pick_gain_index(mult: f64) -> u8 {
-    let mut best = 0u8;
-    let mut best_err = f64::INFINITY;
-    for (i, &g) in GAIN_TABLE.iter().enumerate() {
-        let err = (g - mult).abs();
-        if err < best_err {
-            best_err = err;
-            best = i as u8;
-        }
-    }
-    best
+    GAIN_TABLE
+        .iter()
+        .enumerate()
+        .min_by(|(_, &a), (_, &b)| (a - mult).abs().total_cmp(&(b - mult).abs()))
+        .map(|(i, _)| i as u8)
+        .unwrap_or(0)
 }
 
 /// Sensor exposure state the AE loop reads and writes.

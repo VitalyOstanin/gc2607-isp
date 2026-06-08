@@ -192,8 +192,8 @@ pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
 
 /// Project chromaticity onto the locus polyline; return (segment index, t).
 fn project_to_locus(rg: f64, bg: f64) -> (usize, f64) {
-    let mut best = (f64::INFINITY, 0usize, 0.0f64);
-    for i in 0..NUM_CCM - 1 {
+    // Distance from (rg, bg) to segment i, with the clamped projection parameter.
+    let segment = |i: usize| {
         let ax = CCM_LOCUS[i][0] as f64;
         let ay = CCM_LOCUS[i][1] as f64;
         let bx = CCM_LOCUS[i + 1][0] as f64;
@@ -202,14 +202,14 @@ fn project_to_locus(rg: f64, bg: f64) -> (usize, f64) {
         let aby = by - ay;
         let denom = abx * abx + aby * aby;
         let t = (((rg - ax) * abx + (bg - ay) * aby) / denom).clamp(0.0, 1.0);
-        let px = ax + t * abx;
-        let py = ay + t * aby;
-        let d = (rg - px).hypot(bg - py);
-        if d < best.0 {
-            best = (d, i, t);
-        }
-    }
-    (best.1, best.2)
+        let d = (rg - (ax + t * abx)).hypot(bg - (ay + t * aby));
+        (d, i, t)
+    };
+    (0..NUM_CCM - 1)
+        .map(segment)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, i, t)| (i, t))
+        .unwrap_or((0, 0.0))
 }
 
 fn estimate_cct(rg: f64, bg: f64) -> f64 {
@@ -386,16 +386,12 @@ fn ls_dist(k: usize, rg: f64, bg: f64) -> f64 {
 /// closer (see [`LS_HYST`]). `prev = None` (stateless callers) picks the plain
 /// nearest source, matching the original `select_ls`.
 fn select_ls_hyst(rg: f64, bg: f64, prev: Option<usize>) -> usize {
-    let mut best = (f64::INFINITY, 0usize);
-    for k in 0..LSC_CHROMA.len() {
-        let d = ls_dist(k, rg, bg);
-        if d < best.0 {
-            best = (d, k);
-        }
-    }
+    let best = (0..LSC_CHROMA.len())
+        .min_by(|&a, &b| ls_dist(a, rg, bg).total_cmp(&ls_dist(b, rg, bg)))
+        .unwrap_or(0);
     match prev {
-        Some(p) if ls_dist(p, rg, bg) <= best.0 / LS_HYST => p,
-        _ => best.1,
+        Some(p) if ls_dist(p, rg, bg) <= ls_dist(best, rg, bg) / LS_HYST => p,
+        _ => best,
     }
 }
 
