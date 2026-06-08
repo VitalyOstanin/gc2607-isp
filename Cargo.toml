@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Software ISP for the GalaxyCore GC2607 colour camera (MateBook X Pro 2024)."
 license = "MIT"
+repository = "https://github.com/VitalyOstanin/gc2607-isp"
 
 [dependencies]
 # PNG output for the offline CLI (PNG only, to keep the dependency tree small).
