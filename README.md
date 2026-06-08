@@ -1,13 +1,28 @@
 # gc2607-isp
 
+> **Status: testing / experimental.** Targets one specific device (MateBook X
+> Pro 2024 GC2607); it works end-to-end on the development machine, but
+> interfaces, defaults and tuning may still change.
+
 A software ISP (image signal processor) in Rust for the built-in colour camera
 GalaxyCore GC2607 of the Huawei MateBook X Pro 2024 (Intel Meteor Lake, IPU6)
 on Linux. It turns the sensor's raw Bayer frame into a colour image using
 extracted sensor tuning.
 
+**Image quality is the primary goal**: the point of this project is a better
+picture than the generic software ISP gives (see [Features](#features) and
+[Purpose](#purpose)).
+
+The laptop has two GalaxyCore sensors. This project drives only the front
+**colour** camera, **GC2607** (ACPI `GCTI2607`). The other one, **GC1029**
+(ACPI `GCTI1029`), is a separate **infra-red** sensor (Windows Hello) on a
+different I2C bus; it is **not needed** for a colour webcam, has no Linux driver
+here, and is left alone.
+
 ## Contents
 
 - [Purpose](#purpose)
+- [Features](#features)
 - [Architecture: the camera stack](#architecture-the-camera-stack)
 - [Processing pipeline](#processing-pipeline)
 - [Tuning source](#tuning-source)
@@ -18,6 +33,7 @@ extracted sensor tuning.
 - [Building on other distributions](#building-on-other-distributions)
 - [Correctness check (golden)](#correctness-check-golden)
 - [Roadmap](#roadmap)
+- [Acknowledgements](#acknowledgements)
 
 ## Purpose
 
@@ -26,6 +42,46 @@ residual grey-world AWB tint, no vignetting correction. This project implements
 its own CPU pipeline using extracted sensor tuning (colour-correction
 matrices, lens-shading maps, white locus) that the libcamera tuning does not
 have.
+
+## Features
+
+The main goal is image quality; everything below serves that, with performance
+and power kept in check so it is usable as a daily webcam on a thin laptop.
+
+**Image processing** (per-device factory tuning, see [Tuning source](#tuning-source)):
+
+- black-level subtraction and per-Bayer-channel **lens-shading correction** with
+  scene-based light-source selection (strong vignetting, gain up to ~5.5x);
+- **robust-neutral auto white balance** (median chroma of bright, non-clipped
+  pixels) with colour-temperature estimation against the sensor's white locus;
+- **full-resolution Malvar-He-Cutler debayer** (own row-parallel implementation),
+  plus a lighter half-res mode;
+- **hue-sectored colour correction**: 5 CCMs interpolated by CCT, refined by 24
+  per-hue-sector matrices fading to the global matrix near neutral;
+- **lateral chromatic-aberration correction**;
+- **gain-adaptive denoise**: chroma box blur + temporal luma (IIR with a motion
+  gate), engaged only as analogue gain rises in dim light;
+- sRGB gamma output, packed YUYV 4:2:2.
+
+**Auto-exposure**: an exposure-priority loop drives exposure/gain/vblank directly
+on the sensor over the V4L2 subdev, metering the produced frame's mean luminance
+in linear light (no dependence on libcamera's AGC).
+
+**GPU backend**: the per-pixel stages run as Vulkan compute shaders (wgpu, Mesa
+ANV on the Intel iGPU), validated to within 1 LSB of the CPU path; `--backend
+auto` prefers the GPU and cuts whole-process CPU use ~4x at the same frame rate.
+
+**On-demand capture**: the camera is opened and the ISP runs only while an
+application is capturing (v4l2loopback client-usage event); the sensor stays
+runtime-suspended while idle.
+
+**Integration**: the GC2607 is picked by its libcamera `Model` name, not by
+enumeration index, so it is found correctly even with another camera (e.g. a
+plugged-in USB webcam) present. The output is a v4l2loopback node any webcam
+application opens (browser, OBS, `ffplay`); the privacy LED lights automatically
+while streaming (handled by the V4L2 core / INT3472), and the laptop's physical
+side camera switch is respected (with it off, the sensor delivers no usable
+frame). An offline CLI converts a saved raw frame to PNG/PPM on any machine.
 
 ## Architecture: the camera stack
 
@@ -188,7 +244,7 @@ regular webcam.
 2. libcamera 0.7 runtime is installed.
 3. A v4l2loopback device exists for the output, e.g.:
    ```sh
-   sudo modprobe v4l2loopback card_label="Virtual Camera" exclusive_caps=1
+   sudo modprobe v4l2loopback card_label="MateBook Camera (GC2607)" exclusive_caps=1
    ```
    Note the created node (this project defaults to `/dev/video0`).
 
@@ -251,8 +307,8 @@ you can skip the container and build natively — see
 ./gc2607-video --backend cpu   # force the CPU path (--debayer mhc --threads 8 by default)
 ```
 
-Then open the loopback node (`/dev/video0` "Virtual Camera") in any app, or
-preview it directly:
+Then open the loopback node (`/dev/video0`, e.g. "MateBook Camera (GC2607)") in
+any app, or preview it directly:
 
 ```sh
 ffplay -f v4l2 /dev/video0
@@ -380,8 +436,26 @@ the tests skip instead of failing. To run them, place a raw frame at
 | 1. CPU core (offline) | done | half-res debayer, golden check vs Python |
 | 2. Quality + CLI | done | own row-parallel MHC debayer (replaced the `demosaic` crate), PNG output |
 | 3. Capture | done | raw + exposure/gain controls via the `libcamera` crate (built in podman ubuntu:26.04) |
-| 4. AE loop | done | auto-exposure, exposure-priority (target ~35%), hardware-validated |
+| 4. AE loop | done | auto-exposure, exposure-priority, linear-light metric, hardware-validated |
 | 5. Output | done | write to v4l2loopback `/dev/video0` (binary only, no systemd service) |
 | 6. Performance | done | `Processor` (buffer reuse, AWB/grid caching), parallel front-end + MHC + YUYV pack; 30 fps at full-res |
 | 7. GPU offload | done | `--backend gpu`: per-pixel stages (unpack/BLC/LSC/WB, MHC, CCM, gamma, YUYV pack) as Vulkan compute shaders; AWB on the CPU. ~4x lower CPU at the same frame rate |
 | 8. On-demand capture | done | `--on-demand auto` opens the camera + runs the ISP only while an application is capturing, driven by the v4l2loopback `V4L2_EVENT_PRI_CLIENT_USAGE` event (the v4l2-relayd mechanism, implemented in-process); the sensor stays runtime-suspended while idle. Falls back to always-on where the event is unavailable |
+
+## Acknowledgements
+
+Two earlier community efforts to run the MateBook GC2607 on Linux were the
+starting point that got this work going — thanks to their authors:
+
+- [abbood/gc2607-v4l2-driver](https://github.com/abbood/gc2607-v4l2-driver) — a
+  GC2607 V4L2 sub-device driver with INT3472 power and an `ipu_bridge` patch,
+  feeding a `v4l2loopback` node via GStreamer (developed on Arch). The basis for
+  this project's own [gc2607-driver](../gc2607-driver).
+- [antonbiluta/gc2607-driver](https://github.com/antonbiluta/gc2607-driver) — a
+  GC2607 driver and `ipu_bridge` patch (Fedora), another early reference for
+  bringing the sensor up.
+
+This project then went its own way — a from-scratch sensor driver written to the
+kernel camera-sensor guidelines, a dedicated `ipu-bridge` patch, and this Rust
+ISP with extracted factory tuning — but those projects showed it was possible
+and where to start.
