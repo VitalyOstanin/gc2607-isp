@@ -589,7 +589,7 @@ the tests skip instead of failing. To run them, place a raw frame at
 | 2. Quality + CLI | done | own row-parallel MHC debayer (replaced the `demosaic` crate), PNG output |
 | 3. Capture | done | raw + exposure/gain controls via the `libcamera` crate (built in podman ubuntu:26.04) |
 | 4. AE loop | done | auto-exposure, exposure-priority, linear-light metric, hardware-validated |
-| 5. Output | done | write to v4l2loopback `/dev/video0` (binary only, no systemd service) |
+| 5. Output | done | write frames to v4l2loopback `/dev/video0` |
 | 6. Performance | done | `Processor` (buffer reuse, AWB/grid caching), parallel front-end + MHC + YUYV pack; 30 fps at full-res |
 | 7. GPU offload | done | `--backend gpu`: per-pixel stages (unpack/BLC/LSC/WB, MHC, CCM, gamma, YUYV pack) as Vulkan compute shaders; AWB on the CPU. ~4x lower CPU at the same frame rate |
 | 8. On-demand capture | done | `--on-demand auto` opens the camera + runs the ISP only while an application is capturing, driven by the v4l2loopback `V4L2_EVENT_PRI_CLIENT_USAGE` event (the v4l2-relayd mechanism, implemented in-process); the sensor stays runtime-suspended while idle. Falls back to always-on where the event is unavailable |
