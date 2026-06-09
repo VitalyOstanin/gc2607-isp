@@ -96,26 +96,58 @@ enum Engine {
         yuyv: Vec<u8>,
         dst_w: usize,
         dst_h: usize,
+        // Temporal-denoise luma history (see `temporal_denoise_luma_yuyv`).
+        prev_y: Vec<u8>,
     },
     #[cfg(feature = "gpu")]
     Gpu(Box<GpuProcessor>),
 }
 
 impl Engine {
-    fn process(&mut self, buf: &[u8]) -> io::Result<&[u8]> {
+    /// Run the ISP on one raw frame and apply gain-adaptive denoise (`dn`),
+    /// returning the produced (post-denoise) YUYV. The CPU path runs the host
+    /// denoise functions in place; the GPU path runs the equivalent compute
+    /// passes inside `process`.
+    fn process(&mut self, buf: &[u8], dn: &DenoiseSpec) -> io::Result<&[u8]> {
         match self {
             Engine::Cpu {
                 proc,
                 yuyv,
                 dst_w,
                 dst_h,
+                prev_y,
             } => {
                 let (w, h, rgb) = proc.process(buf)?;
                 rgb_to_yuyv_crop(rgb, w, h, yuyv, *dst_w, *dst_h);
+                if dn.chroma_on() {
+                    denoise_chroma_yuyv(yuyv, *dst_w, *dst_h, dn.chroma_radius, dn.chroma_strength);
+                }
+                if dn.temporal_on() {
+                    temporal_denoise_luma_yuyv(
+                        yuyv,
+                        prev_y,
+                        *dst_w,
+                        *dst_h,
+                        dn.temporal_alpha,
+                        dn.temporal_motion,
+                    );
+                } else {
+                    // Drop the history so it re-seeds cleanly when temporal
+                    // denoise restarts (no ghosting from a stale frame).
+                    prev_y.clear();
+                }
                 Ok(yuyv)
             }
             #[cfg(feature = "gpu")]
-            Engine::Gpu(p) => p.process(buf),
+            Engine::Gpu(p) => p.process(
+                buf,
+                gc2607_isp::gpu::DenoiseParams {
+                    chroma_radius: dn.chroma_radius as u32,
+                    chroma_strength: dn.chroma_strength as f32,
+                    temporal_alpha: dn.temporal_alpha as f32,
+                    temporal_motion: dn.temporal_motion as f32,
+                },
+            ),
         }
     }
 }
@@ -352,43 +384,41 @@ fn temporal_luma_for_gain(gain_index: u8, scale: f64) -> f64 {
 /// frame-to-frame change the blend fades out to avoid ghosting on motion.
 const TEMPORAL_MOTION: f64 = 12.0;
 
-/// Apply gain-adaptive denoise to a freshly produced YUYV frame.
+/// Gain-adaptive denoise strengths for one frame, resolved from the gain the
+/// frame was exposed with. Chroma denoise is spatial (box-blur radius + blend
+/// strength), luma denoise is temporal (IIR weight + motion gate); both ramp
+/// with analogue gain and are no-ops at low gain (the well-lit common case).
 ///
-/// Chroma denoise is spatial, luma denoise is temporal; both ramp with analogue
-/// gain and are no-ops at low gain (the well-lit common case). When neither is
-/// active the temporal history is dropped so it re-seeds cleanly (no ghosting)
-/// when gain rises again, and the caller writes the original `yuyv` straight
-/// through. When at least one is active the result is written into `scratch`.
-///
-/// Returns `(chroma_radius, temporal_alpha, used_scratch)`: the first two are for
-/// telemetry, and `used_scratch` is `true` when the denoised frame is in
-/// `scratch` (else the caller uses `yuyv` unchanged).
-fn apply_denoise(
-    yuyv: &[u8],
-    dst_w: usize,
-    dst_h: usize,
-    gain_index: u8,
-    args: &Args,
-    scratch: &mut Vec<u8>,
-    prev_y: &mut Vec<u8>,
-) -> (usize, f64, bool) {
-    let (dr, ds) = chroma_denoise_for_gain(gain_index, args.denoise);
-    let ta = temporal_luma_for_gain(gain_index, args.temporal);
-    let chroma_on = dr > 0 && ds > 0.0;
-    let temporal_on = ta > 0.0;
-    if !chroma_on && !temporal_on {
-        prev_y.clear();
-        return (dr, ta, false);
+/// The same spec drives either backend: the CPU path runs the `output::*`
+/// denoise functions on the host, the GPU path runs the equivalent compute
+/// passes (see `gpu::GpuProcessor::process`). Applied by the engine in
+/// `Engine::process`, so denoise is part of the produced frame.
+#[derive(Clone, Copy)]
+struct DenoiseSpec {
+    chroma_radius: usize,
+    chroma_strength: f64,
+    temporal_alpha: f64,
+    temporal_motion: f64,
+}
+
+impl DenoiseSpec {
+    fn from_gain(gain_index: u8, args: &Args) -> DenoiseSpec {
+        let (chroma_radius, chroma_strength) = chroma_denoise_for_gain(gain_index, args.denoise);
+        DenoiseSpec {
+            chroma_radius,
+            chroma_strength,
+            temporal_alpha: temporal_luma_for_gain(gain_index, args.temporal),
+            temporal_motion: TEMPORAL_MOTION,
+        }
     }
-    scratch.clear();
-    scratch.extend_from_slice(yuyv);
-    if chroma_on {
-        denoise_chroma_yuyv(scratch, dst_w, dst_h, dr, ds);
+
+    fn chroma_on(&self) -> bool {
+        self.chroma_radius > 0 && self.chroma_strength > 0.0
     }
-    if temporal_on {
-        temporal_denoise_luma_yuyv(scratch, prev_y, dst_w, dst_h, ta, TEMPORAL_MOTION);
+
+    fn temporal_on(&self) -> bool {
+        self.temporal_alpha > 0.0
     }
-    (dr, ta, true)
 }
 
 /// Output (cropped) size for a debayer mode: a standard 16:9 size centred in
@@ -496,6 +526,7 @@ fn build_engine(args: &Args) -> (Engine, usize, usize) {
             yuyv: vec![0u8; dst_w * dst_h * 2],
             dst_w,
             dst_h,
+            prev_y: Vec::new(),
         },
         dst_w,
         dst_h,
@@ -842,16 +873,7 @@ fn main() {
     };
 
     if on_demand {
-        run_on_demand(
-            &mgr,
-            &mut out,
-            dst_w,
-            dst_h,
-            &mut engine,
-            &sensor,
-            &mut state,
-            &args,
-        );
+        run_on_demand(&mgr, &mut out, &mut engine, &sensor, &mut state, &args);
     } else {
         // Always-on: open and start the camera once, stream until a fatal error.
         let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
@@ -867,8 +889,6 @@ fn main() {
             &mut session.cam,
             &session.stream,
             &session.rx,
-            dst_w,
-            dst_h,
             &sensor,
             &mut state,
             &args,
@@ -913,33 +933,29 @@ enum FrameOutcome {
 /// one frame instead of killing the long-running daemon; the panic message is
 /// still printed by the default hook. ISP errors and write failures are returned
 /// as variants, not panics.
-#[allow(clippy::too_many_arguments)]
 fn process_and_write(
     engine: &mut Engine,
     out: &mut LoopbackOutput,
     buf: &[u8],
-    dst_w: usize,
-    dst_h: usize,
     gain_index: u8,
     timestamp_ns: u64,
     args: &Args,
-    denoise_buf: &mut Vec<u8>,
-    prev_y: &mut Vec<u8>,
 ) -> FrameOutcome {
+    // Denoise strength for the gain this frame was exposed with; the engine
+    // applies it (CPU in place, GPU as compute passes), so `yuyv` is the
+    // denoised frame and the AE luma metric is metered on it (post-denoise).
+    let dn = DenoiseSpec::from_gain(gain_index, args);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let yuyv = match engine.process(buf) {
+        let yuyv = match engine.process(buf, &dn) {
             Ok(y) => y,
             Err(e) => return FrameOutcome::Skipped(e.to_string()),
         };
         let luma = mean_linear_luma(yuyv);
-        let (chroma_radius, temporal_alpha, used) =
-            apply_denoise(yuyv, dst_w, dst_h, gain_index, args, denoise_buf, prev_y);
-        let frame: &[u8] = if used { denoise_buf.as_slice() } else { yuyv };
-        match out.write_frame(frame, timestamp_ns) {
+        match out.write_frame(yuyv, timestamp_ns) {
             Ok(()) => FrameOutcome::Written {
                 luma,
-                chroma_radius,
-                temporal_alpha,
+                chroma_radius: dn.chroma_radius,
+                temporal_alpha: dn.temporal_alpha,
             },
             Err(e) => FrameOutcome::WriteFailed(e),
         }
@@ -974,8 +990,6 @@ fn run_live(
     cam: &mut ActiveCamera,
     stream: &Stream,
     rx: &std::sync::mpsc::Receiver<Request>,
-    dst_w: usize,
-    dst_h: usize,
     sensor: &Option<Sensor>,
     state: &mut AeState,
     args: &Args,
@@ -999,11 +1013,8 @@ fn run_live(
     let mut report_frames = 0u64;
     // Last metered output mean linear luminance (0..1), for the telemetry line.
     let mut last_luma = 0f64;
-    // Scratch for the denoise post-pass (only filled when a denoise stage runs),
-    // the temporal-denoise luma history, and the last applied strengths (for
-    // telemetry).
-    let mut denoise_buf: Vec<u8> = Vec::new();
-    let mut prev_y: Vec<u8> = Vec::new();
+    // Last applied denoise strengths, for the telemetry line. (The temporal
+    // history and any scratch now live inside the engine; see `Engine::process`.)
     let mut last_dn = 0usize;
     let mut last_ta = 0f64;
 
@@ -1102,18 +1113,7 @@ fn run_live(
         // (see `process_and_write`). The output luma is metered inside as the AE
         // control variable; denoise is a no-op at low gain (the common case).
         let mut luma = None;
-        let processed = match process_and_write(
-            engine,
-            out,
-            buf,
-            dst_w,
-            dst_h,
-            frame_gain,
-            ts,
-            args,
-            &mut denoise_buf,
-            &mut prev_y,
-        ) {
+        let processed = match process_and_write(engine, out, buf, frame_gain, ts, args) {
             FrameOutcome::Written {
                 luma: m,
                 chroma_radius,
@@ -1201,12 +1201,9 @@ fn run_live(
 /// The engine and AE `state` persist across activations: the GPU device is built
 /// once, and exposure/gain resume near their last values rather than re-converging
 /// from default on every reconnect.
-#[allow(clippy::too_many_arguments)]
 fn run_on_demand(
     mgr: &CameraManager,
     out: &mut LoopbackOutput,
-    dst_w: usize,
-    dst_h: usize,
     engine: &mut Engine,
     sensor: &Option<Sensor>,
     state: &mut AeState,
@@ -1288,8 +1285,6 @@ fn run_on_demand(
                 &mut session.cam,
                 &session.stream,
                 &session.rx,
-                dst_w,
-                dst_h,
                 sensor,
                 state,
                 args,

@@ -23,6 +23,8 @@
 
 use std::io;
 
+use bytemuck::Zeroable;
+
 use crate::pipeline::{self, interp_acm, Estimate, Lca, ACM_SAT_KNEE};
 use crate::raw::{RawFrame, BLACK, H, MAXLIN, STRIDE_SAMPLES, W};
 use crate::tuning_data::{
@@ -51,6 +53,8 @@ struct Params {
     ccm2: [f32; 4],     // ccm[6..9]
     lca: [f32; 4],      // lca grid_w, grid_h, cell_x, cell_y
     acm_cfg: [f32; 4],  // hue0, hue_step, sat_knee, nsec
+    dn_i: [u32; 4],     // chroma_radius, chroma_on, temporal_on, temporal_reset
+    dn_f: [f32; 4],     // chroma_strength, temporal_alpha, temporal_motion, _
 }
 
 const SHADER: &str = r#"
@@ -65,6 +69,8 @@ struct Params {
     ccm2: vec4<f32>,
     lca: vec4<f32>,
     acm_cfg: vec4<f32>,
+    dn_i: vec4<u32>,
+    dn_f: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -80,6 +86,11 @@ struct Params {
 // Per-sector colour matrices for this frame's CCT: 9 floats per sector
 // (row-major 3x3), nsec sectors, concatenated. Uploaded on each re-estimate.
 @group(0) @binding(10) var<storage, read> acm: array<f32>;
+// Denoise scratch: horizontally-blurred chroma (one word per YUYV word, Cb in
+// the low 16 bits and Cr in the high 16) and the temporal luma history (one Y
+// value per output pixel). Both are written by the denoise passes only.
+@group(0) @binding(11) var<storage, read_write> ctmp: array<u32>;
+@group(0) @binding(12) var<storage, read_write> prev_y: array<u32>;
 
 // Pass 1: unpack + black level + LSC + white balance into the full-res CFA.
 @compute @workgroup_size(64)
@@ -361,12 +372,123 @@ fn render_pack_lca(@builtin(global_invocation_id) gid: vec3<u32>) {
     let yc1 = ycbcr(lca_color(sy, sx1));
     yuyv[gidx] = pack_yuyv(yc0, yc1);
 }
+
+// --- Gain-adaptive denoise (mirrors output::denoise_chroma_yuyv and
+// output::temporal_denoise_luma_yuyv). One YUYV word holds two pixels and one
+// shared chroma sample, so the chroma grid is exactly the word grid: cw words
+// per row (cw == groups_per_row == P.misc.y), dst_h rows. The box blur is
+// separable (horizontal then vertical); each border window shrinks to the
+// available samples and the mean uses integer truncation, matching the CPU
+// running-sum result bit-for-bit. The blend and the temporal IIR use f32 (the
+// CPU uses f64), so the final bytes match within rounding, not bit-for-bit.
+
+// Chroma pass 1: horizontal integer box blur of Cb/Cr into `ctmp`.
+@compute @workgroup_size(64)
+fn chroma_h(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let cw = P.misc.y;
+    let h = P.out_dims.y;
+    let idx = gid.x;
+    if (idx >= cw * h) { return; }
+    let r = P.dn_i.x;
+    let y = idx / cw;
+    let c = idx % cw;
+    let lo = max(c, r) - r;
+    let hi = min(c + r, cw - 1u);
+    var sb: u32 = 0u;
+    var sr: u32 = 0u;
+    for (var cc = lo; cc <= hi; cc = cc + 1u) {
+        let w = yuyv[y * cw + cc];
+        sb = sb + ((w >> 8u) & 0xFFu);
+        sr = sr + ((w >> 24u) & 0xFFu);
+    }
+    let n = hi - lo + 1u;
+    ctmp[idx] = (sb / n) | ((sr / n) << 16u);
+}
+
+// Chroma pass 2: vertical integer box blur of `ctmp`, then blend the blurred
+// chroma back over the original at `strength`, writing into `yuyv` (luma kept).
+@compute @workgroup_size(64)
+fn chroma_v(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let cw = P.misc.y;
+    let h = P.out_dims.y;
+    let idx = gid.x;
+    if (idx >= cw * h) { return; }
+    let r = P.dn_i.x;
+    let y = idx / cw;
+    let lo = max(y, r) - r;
+    let hi = min(y + r, h - 1u);
+    var sb: u32 = 0u;
+    var sr: u32 = 0u;
+    for (var yy = lo; yy <= hi; yy = yy + 1u) {
+        let t = ctmp[yy * cw + (idx % cw)];
+        sb = sb + (t & 0xFFFFu);
+        sr = sr + (t >> 16u);
+    }
+    let n = hi - lo + 1u;
+    let bb = f32(sb / n);
+    let br = f32(sr / n);
+
+    let s = clamp(P.dn_f.x, 0.0, 1.0);
+    let inv = 1.0 - s;
+    let w = yuyv[idx];
+    let ocb = f32((w >> 8u) & 0xFFu);
+    let ocr = f32((w >> 24u) & 0xFFu);
+    let ncb = u32(clamp(floor(ocb * inv + bb * s + 0.5), 0.0, 255.0));
+    let ncr = u32(clamp(floor(ocr * inv + br * s + 0.5), 0.0, 255.0));
+    yuyv[idx] = (w & 0x00FF00FFu) | (ncb << 8u) | (ncr << 24u);
+}
+
+// Temporal luma IIR with a per-pixel motion gate; updates the history in place.
+// One thread per YUYV word handles both packed luma samples.
+fn temporal_one(cur: u32, prev: u32) -> u32 {
+    if (P.dn_i.w == 1u) { return cur; } // reset: seed history, no blend
+    let a = clamp(P.dn_f.y, 0.0, 1.0);
+    let mthr = max(P.dn_f.z, 1.0);
+    let fc = f32(cur);
+    let fp = f32(prev);
+    let diff = abs(fc - fp);
+    let gate = clamp(1.0 - diff / mthr, 0.0, 1.0);
+    let eff = a * gate;
+    return u32(clamp(floor(fc * (1.0 - eff) + fp * eff + 0.5), 0.0, 255.0));
+}
+
+@compute @workgroup_size(64)
+fn temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let cw = P.misc.y;
+    let h = P.out_dims.y;
+    let idx = gid.x;
+    if (idx >= cw * h) { return; }
+    let dst_w = P.out_dims.x;
+    let y = idx / cw;
+    let c = idx % cw;
+    let p0 = y * dst_w + 2u * c;
+    let p1 = p0 + 1u;
+    let w = yuyv[idx];
+    let y0 = temporal_one(w & 0xFFu, prev_y[p0]);
+    let y1 = temporal_one((w >> 16u) & 0xFFu, prev_y[p1]);
+    prev_y[p0] = y0;
+    prev_y[p1] = y1;
+    yuyv[idx] = (w & 0xFF00FF00u) | y0 | (y1 << 16u);
+}
 "#;
 
 /// GPU-resident ISP for the live webcam path. Holds the device, both compute
 /// pipelines, and all persistent buffers; per frame it uploads the raw bytes,
 /// dispatches the two passes, and reads the packed YUYV back into a reused host
 /// buffer. AWB/CCM estimation runs on the CPU every `awb_interval` frames.
+/// Gain-adaptive denoise strengths for one frame, computed by the caller from
+/// the frame's analogue gain (see `chroma_denoise_for_gain` /
+/// `temporal_luma_for_gain` in the video binary). The processor decides on/off
+/// (radius and strength > 0 for chroma; alpha > 0 for temporal) and tracks the
+/// temporal history reset internally.
+#[derive(Clone, Copy, Default)]
+pub struct DenoiseParams {
+    pub chroma_radius: u32,
+    pub chroma_strength: f32,
+    pub temporal_alpha: f32,
+    pub temporal_motion: f32,
+}
+
 pub struct GpuProcessor {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -374,6 +496,9 @@ pub struct GpuProcessor {
     pack_pipeline: wgpu::ComputePipeline,
     planar_pipeline: wgpu::ComputePipeline,
     pack_lca_pipeline: wgpu::ComputePipeline,
+    chroma_h_pipeline: wgpu::ComputePipeline,
+    chroma_v_pipeline: wgpu::ComputePipeline,
+    temporal_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     raw_buf: wgpu::Buffer,
@@ -382,9 +507,16 @@ pub struct GpuProcessor {
     yuyv_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
 
+    // Cached uniform: the scene-derived fields are refreshed on each re-estimate
+    // (`upload_params`); the per-frame denoise fields are set in `process`, which
+    // writes the whole block each frame.
+    params: Params,
     interval: u64,
     frame: u64,
     lca_on: bool,
+    // Whether temporal denoise ran on the previous frame, to seed the history
+    // (reset) when it (re)starts after being off.
+    temporal_was_on: bool,
     est: Option<Estimate>,
     chroma: Option<(f32, f32)>,
     grids_ls: Option<usize>,
@@ -414,14 +546,19 @@ struct GpuBuffers {
     acm: wgpu::Buffer,
     yuyv: wgpu::Buffer,
     staging: wgpu::Buffer,
+    ctmp: wgpu::Buffer,
+    prev_y: wgpu::Buffer,
 }
 
-/// The four compute pipelines, one per shader entry point.
+/// The compute pipelines, one per shader entry point.
 struct Pipelines {
     cfa: wgpu::ComputePipeline,
     pack: wgpu::ComputePipeline,
     planar: wgpu::ComputePipeline,
     pack_lca: wgpu::ComputePipeline,
+    chroma_h: wgpu::ComputePipeline,
+    chroma_v: wgpu::ComputePipeline,
+    temporal: wgpu::ComputePipeline,
 }
 
 impl GpuProcessor {
@@ -445,6 +582,9 @@ impl GpuProcessor {
             pack_pipeline: pipelines.pack,
             planar_pipeline: pipelines.planar,
             pack_lca_pipeline: pipelines.pack_lca,
+            chroma_h_pipeline: pipelines.chroma_h,
+            chroma_v_pipeline: pipelines.chroma_v,
+            temporal_pipeline: pipelines.temporal,
             bind_group,
             params_buf: bufs.params,
             raw_buf: bufs.raw,
@@ -452,9 +592,11 @@ impl GpuProcessor {
             acm_buf: bufs.acm,
             yuyv_buf: bufs.yuyv,
             staging_buf: bufs.staging,
+            params: Params::zeroed(),
             interval: awb_interval.max(1),
             frame: 0,
             lca_on: lca,
+            temporal_was_on: false,
             est: None,
             chroma: None,
             grids_ls: None,
@@ -585,6 +727,20 @@ impl GpuProcessor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Denoise scratch: horizontally-blurred chroma (one u32 per YUYV word)
+        // and the temporal luma history (one u32 per output pixel).
+        let ctmp = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ctmp"),
+            size: ((OUT_W / 2) * OUT_H * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let prev_y = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prev_y"),
+            size: (OUT_W * OUT_H * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
 
         GpuBuffers {
             params,
@@ -596,6 +752,8 @@ impl GpuProcessor {
             acm,
             yuyv,
             staging,
+            ctmp,
+            prev_y,
         }
     }
 
@@ -650,6 +808,8 @@ impl GpuProcessor {
                 storage_rw(8),
                 storage_ro(9),
                 storage_ro(10),
+                storage_rw(11),
+                storage_rw(12),
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -700,6 +860,14 @@ impl GpuProcessor {
                     binding: 10,
                     resource: bufs.acm.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: bufs.ctmp.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: bufs.prev_y.as_entire_binding(),
+                },
             ],
         });
 
@@ -723,6 +891,9 @@ impl GpuProcessor {
             pack: make_pipeline("render_pack"),
             planar: make_pipeline("mhc_planar"),
             pack_lca: make_pipeline("render_pack_lca"),
+            chroma_h: make_pipeline("chroma_h"),
+            chroma_v: make_pipeline("chroma_v"),
+            temporal: make_pipeline("temporal"),
         };
         (bind_group, pipelines)
     }
@@ -780,25 +951,23 @@ impl GpuProcessor {
         let g = est.gains;
         let c = est.ccm;
         let cct = est.cct;
-        let params = Params {
-            dims: [W as u32, H as u32, WW as u32, HH as u32],
-            out_dims: [
-                OUT_W as u32,
-                OUT_H as u32,
-                ((W - OUT_W) / 2) as u32,
-                ((H - OUT_H) / 2) as u32,
-            ],
-            misc: [STRIDE_SAMPLES as u32, (OUT_W / 2) as u32, 0, 0],
-            consts: [BLACK, 1.0 / MAXLIN, 0.0, 0.0],
-            gains: [g[0] as f32, g[1] as f32, g[2] as f32, 0.0],
-            ccm0: [c[0] as f32, c[1] as f32, c[2] as f32, 0.0],
-            ccm1: [c[3] as f32, c[4] as f32, c[5] as f32, 0.0],
-            ccm2: [c[6] as f32, c[7] as f32, c[8] as f32, 0.0],
-            lca: [LCA_GW as f32, LCA_GH as f32, LCA_CELL_X, LCA_CELL_Y],
-            acm_cfg: [ACM_HUE0, ACM_HUE_STEP, ACM_SAT_KNEE as f32, ACM_NSEC as f32],
-        };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        // Refresh the scene-derived fields; the per-frame denoise fields
+        // (`dn_i`/`dn_f`) are set and uploaded in `process`, so leave them.
+        self.params.dims = [W as u32, H as u32, WW as u32, HH as u32];
+        self.params.out_dims = [
+            OUT_W as u32,
+            OUT_H as u32,
+            ((W - OUT_W) / 2) as u32,
+            ((H - OUT_H) / 2) as u32,
+        ];
+        self.params.misc = [STRIDE_SAMPLES as u32, (OUT_W / 2) as u32, 0, 0];
+        self.params.consts = [BLACK, 1.0 / MAXLIN, 0.0, 0.0];
+        self.params.gains = [g[0] as f32, g[1] as f32, g[2] as f32, 0.0];
+        self.params.ccm0 = [c[0] as f32, c[1] as f32, c[2] as f32, 0.0];
+        self.params.ccm1 = [c[3] as f32, c[4] as f32, c[5] as f32, 0.0];
+        self.params.ccm2 = [c[6] as f32, c[7] as f32, c[8] as f32, 0.0];
+        self.params.lca = [LCA_GW as f32, LCA_GH as f32, LCA_CELL_X, LCA_CELL_Y];
+        self.params.acm_cfg = [ACM_HUE0, ACM_HUE_STEP, ACM_SAT_KNEE as f32, ACM_NSEC as f32];
 
         // Per-sector matrices for this CCT, flattened sector-major row-major into
         // the reused scratch buffer.
@@ -813,9 +982,13 @@ impl GpuProcessor {
             .write_buffer(&self.acm_buf, 0, bytemuck::cast_slice(&self.acm_flat));
     }
 
-    /// Process one raw SGRBG10 frame; returns the packed YUYV bytes (length
-    /// `OUT_W*OUT_H*2`), borrowing a reused host buffer (valid until the next call).
-    pub fn process(&mut self, bytes: &[u8]) -> io::Result<&[u8]> {
+    /// Process one raw SGRBG10 frame, applying gain-adaptive denoise on the GPU
+    /// (`dn`); returns the packed YUYV bytes (length `OUT_W*OUT_H*2`), borrowing a
+    /// reused host buffer (valid until the next call). The returned frame is
+    /// post-denoise, so the caller's AE luma metric is metered on the denoised
+    /// output (chroma denoise leaves luma untouched and temporal denoise barely
+    /// shifts the mean, so this matches the pre-denoise metric in practice).
+    pub fn process(&mut self, bytes: &[u8], dn: DenoiseParams) -> io::Result<&[u8]> {
         if bytes.len() < self.raw_needed {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -832,6 +1005,28 @@ impl GpuProcessor {
             self.reestimate(bytes)?;
             self.upload_params();
         }
+
+        // Resolve this frame's denoise state and refresh the uniform. Chroma
+        // needs a positive radius and strength; temporal needs a positive alpha.
+        // The history is reset (seeded, no blend) the frame temporal (re)starts.
+        let chroma_on = dn.chroma_radius > 0 && dn.chroma_strength > 0.0;
+        let temporal_on = dn.temporal_alpha > 0.0;
+        let reset = temporal_on && !self.temporal_was_on;
+        self.temporal_was_on = temporal_on;
+        self.params.dn_i = [
+            dn.chroma_radius,
+            chroma_on as u32,
+            temporal_on as u32,
+            reset as u32,
+        ];
+        self.params.dn_f = [
+            dn.chroma_strength,
+            dn.temporal_alpha,
+            dn.temporal_motion,
+            0.0,
+        ];
+        self.queue
+            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
 
         // Upload this frame's raw and dispatch the two passes.
         self.queue
@@ -882,6 +1077,36 @@ impl GpuProcessor {
             pass.set_bind_group(0, &self.bind_group, &[]);
             let groups = (((OUT_W / 2) * OUT_H) as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
+        }
+        // Gain-adaptive denoise on the packed YUYV (one word == one chroma
+        // sample == two luma pixels): separable chroma box blur, then temporal
+        // luma IIR. Each pass covers the (OUT_W/2)*OUT_H words.
+        let dn_groups = (((OUT_W / 2) * OUT_H) as u32).div_ceil(64);
+        if self.params.dn_i[1] == 1 {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("chroma_h"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.chroma_h_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(dn_groups, 1, 1);
+            drop(pass);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("chroma_v"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.chroma_v_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(dn_groups, 1, 1);
+        }
+        if self.params.dn_i[2] == 1 {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("temporal"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.temporal_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(dn_groups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
             &self.yuyv_buf,
