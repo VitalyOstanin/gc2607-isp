@@ -262,7 +262,7 @@ BLC, до применения LSC.
    mkdir gc2607-debs && cd gc2607-debs
    gh release download v1.0   -R VitalyOstanin/gc2607-driver
    gh release download v1.0   -R VitalyOstanin/gc2607-ipu-bridge
-   gh release download v0.1.0 -R VitalyOstanin/gc2607-isp
+   gh release download v0.2.0 -R VitalyOstanin/gc2607-isp
    ```
 
 2. Установите все три сразу, чтобы `apt` разрешил зависимости и рекомендованные
@@ -271,7 +271,7 @@ BLC, до применения LSC.
    ```sh
    sudo apt install ./gc2607-driver-dkms_1.0_all.deb \
                     ./gc2607-ipu-bridge-dkms_1.0_all.deb \
-                    ./gc2607-isp_0.1.0_amd64.deb
+                    ./gc2607-isp_0.2.0_amd64.deb
    ```
 
    Два DKMS-пакета собирают и подписывают свои модули ядра под работающее ядро
@@ -564,8 +564,8 @@ Pro 2024. Офлайн-CLI переносим (обрабатывает сохр
 # в корень репозитория, где его ожидает debian/install:
 cp target/release/gc2607-video ./gc2607-video
 sudo apt install -y debhelper dpkg-dev          # инструменты упаковки, один раз
-dpkg-buildpackage -us -uc -b                     # -> ../gc2607-isp_0.1.0_amd64.deb
-sudo apt install ../gc2607-isp_0.1.0_amd64.deb
+dpkg-buildpackage -us -uc -b                     # -> ../gc2607-isp_0.2.0_amd64.deb
+sudo apt install ../gc2607-isp_0.2.0_amd64.deb
 ```
 
 Пакет `Recommends` `mesa-vulkan-drivers`, `v4l2loopback-dkms`, `gc2607-driver-dkms`

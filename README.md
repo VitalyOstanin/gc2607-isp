@@ -250,7 +250,7 @@ Prerequisites:
    mkdir gc2607-debs && cd gc2607-debs
    gh release download v1.0   -R VitalyOstanin/gc2607-driver
    gh release download v1.0   -R VitalyOstanin/gc2607-ipu-bridge
-   gh release download v0.1.0 -R VitalyOstanin/gc2607-isp
+   gh release download v0.2.0 -R VitalyOstanin/gc2607-isp
    ```
 
 2. Install all three at once so `apt` resolves the dependencies and the
@@ -259,7 +259,7 @@ Prerequisites:
    ```sh
    sudo apt install ./gc2607-driver-dkms_1.0_all.deb \
                     ./gc2607-ipu-bridge-dkms_1.0_all.deb \
-                    ./gc2607-isp_0.1.0_amd64.deb
+                    ./gc2607-isp_0.2.0_amd64.deb
    ```
 
    The two DKMS packages build and sign their kernel modules for the running 7.x
@@ -547,8 +547,8 @@ Build it after the binary exists:
 # repository root where debian/install expects it:
 cp target/release/gc2607-video ./gc2607-video
 sudo apt install -y debhelper dpkg-dev          # packaging tools, once
-dpkg-buildpackage -us -uc -b                     # -> ../gc2607-isp_0.1.0_amd64.deb
-sudo apt install ../gc2607-isp_0.1.0_amd64.deb
+dpkg-buildpackage -us -uc -b                     # -> ../gc2607-isp_0.2.0_amd64.deb
+sudo apt install ../gc2607-isp_0.2.0_amd64.deb
 ```
 
 The package `Recommends` `mesa-vulkan-drivers`, `v4l2loopback-dkms`,

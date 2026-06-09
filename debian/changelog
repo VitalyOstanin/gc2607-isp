@@ -1,3 +1,14 @@
+gc2607-isp (0.2.0) unstable; urgency=medium
+
+  * A/V sync: drive the v4l2loopback output via the streaming API (QBUF) and
+    forward libcamera's capture timestamp, so a consumer can sync audio to the
+    true capture instant.
+  * Denoise (chroma box-blur + temporal luma IIR) now runs on the GPU as compute
+    passes, sustaining 30 fps even when high gain enables it.
+  * Add --min-fps to set the AE frame-rate floor; the service now defaults to 30.
+
+ -- Vitaly Ostanin <vitaly.ostanin@gmail.com>  Tue, 09 Jun 2026 21:00:00 +0300
+
 gc2607-isp (0.1.0) unstable; urgency=medium
 
   * Initial Debian packaging (prebuilt binary + on-demand systemd service).
