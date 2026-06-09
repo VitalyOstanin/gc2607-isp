@@ -82,32 +82,55 @@ pub fn bayer_planes(raw: &RawFrame) -> Planes {
 }
 
 /// numpy-compatible linear-interpolation percentile over a sorted slice.
-fn percentile_sorted(sorted: &[f32], q: f64) -> f64 {
-    let n = sorted.len();
+/// `q`-th percentile (numpy 'linear' interpolation) of `values`, computed with
+/// O(n) selection instead of a full O(n log n) sort. Reorders `values` in place.
+/// Bit-exact with sorting the slice and indexing the same ranks: `select_nth`
+/// places the `lo`-th order statistic at `lo`, and the `lo+1`-th (the `hi` rank
+/// when `frac != 0`) is the minimum of the resulting right partition.
+fn percentile_select(values: &mut [f32], q: f64) -> f64 {
+    let n = values.len();
     if n == 0 {
         return 0.0;
     }
     if n == 1 {
-        return sorted[0] as f64;
+        return values[0] as f64;
     }
     let rank = (n as f64 - 1.0) * q / 100.0;
     let lo = rank.floor() as usize;
     let hi = rank.ceil() as usize;
     let frac = rank - lo as f64;
-    let a = sorted[lo] as f64;
-    let b = sorted[hi] as f64;
+    // total_cmp orders NaN deterministically instead of panicking on partial_cmp.
+    let (_, &mut pivot, greater) = values.select_nth_unstable_by(lo, f32::total_cmp);
+    let a = pivot as f64;
+    let b = if hi == lo {
+        a
+    } else {
+        *greater
+            .iter()
+            .min_by(|x, y| x.total_cmp(y))
+            .expect("right partition non-empty when hi > lo") as f64
+    };
     a + (b - a) * frac
 }
 
-/// Median of a slice (numpy-compatible: average of the two middles when even).
+/// Median of a slice (numpy-compatible: average of the two middles when even),
+/// via O(n) selection. Reorders `values`. The lower middle of an even-length
+/// slice is the maximum of the left partition after selecting the upper middle.
 fn median(values: &mut [f32]) -> f64 {
     let n = values.len();
-    // total_cmp orders NaN deterministically instead of panicking on partial_cmp.
-    values.sort_by(f32::total_cmp);
+    if n == 0 {
+        return 0.0;
+    }
     if n % 2 == 1 {
-        values[n / 2] as f64
+        let (_, &mut m, _) = values.select_nth_unstable_by(n / 2, f32::total_cmp);
+        m as f64
     } else {
-        (values[n / 2 - 1] as f64 + values[n / 2] as f64) / 2.0
+        let (less, &mut hi, _) = values.select_nth_unstable_by(n / 2, f32::total_cmp);
+        let lo = *less
+            .iter()
+            .max_by(|x, y| x.total_cmp(y))
+            .expect("left partition non-empty for even n >= 2");
+        (lo as f64 + hi as f64) / 2.0
     }
 }
 
@@ -157,45 +180,101 @@ const AWB_CLIP_FRACTION: f32 = 0.95;
 /// trusted; below this the next, looser mask is tried.
 const AWB_MIN_SAMPLES: usize = 100;
 
+/// Reusable scratch buffers for [`robust_neutral_into`] so the live runtimes do
+/// not reallocate the per-estimate working vectors every AWB interval. Held by
+/// `Processor`/`GpuProcessor`; cleared and refilled each estimate.
+#[derive(Default)]
+pub(crate) struct AwbScratch {
+    green: Vec<f32>,
+    sel: Vec<f32>,
+    idx: Vec<usize>,
+    rg: Vec<f32>,
+    bg: Vec<f32>,
+}
+
+/// Try one AWB pixel mask: collect the kept indices, and if there are enough,
+/// return the median (r/green, b/green) over them. Generic over the predicate so
+/// each mask is monomorphised and inlined (no per-pixel dynamic dispatch).
+fn awb_try_mask<P: Fn(usize) -> bool>(
+    p: &Planes,
+    green: &[f32],
+    idx: &mut Vec<usize>,
+    rg: &mut Vec<f32>,
+    bg: &mut Vec<f32>,
+    n: usize,
+    keep: P,
+) -> Option<(f32, f32)> {
+    idx.clear();
+    idx.extend((0..n).filter(|&i| keep(i)));
+    if idx.len() < AWB_MIN_SAMPLES {
+        return None;
+    }
+    rg.clear();
+    rg.extend(idx.iter().map(|&i| p.r[i] / green[i]));
+    bg.clear();
+    bg.extend(idx.iter().map(|&i| p.b[i] / green[i]));
+    Some((median(rg) as f32, median(bg) as f32))
+}
+
 /// Robust-neutral AWB: median chroma over bright, non-clipped pixels, with
-/// graceful fallbacks so the selection never collapses to empty.
+/// graceful fallbacks so the selection never collapses to empty. Allocates a
+/// throwaway scratch; live callers should prefer [`robust_neutral_into`].
 pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
+    robust_neutral_into(p, &mut AwbScratch::default())
+}
+
+/// As [`robust_neutral`], but reuses caller-owned scratch buffers. Result is
+/// bit-identical to the previous sort-based implementation: the same predicates
+/// select the same index sets and the percentile/median order statistics match.
+pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) {
     let n = p.hh * p.ww;
-    let green: Vec<f32> = (0..n).map(|i| 0.5 * (p.gr[i] + p.gb[i])).collect();
     let clip = AWB_CLIP_FRACTION * MAXLIN;
 
-    let mut sorted = green.clone();
-    sorted.sort_by(f32::total_cmp);
-    let p60 = percentile_sorted(&sorted, 60.0) as f32;
+    let AwbScratch {
+        green,
+        sel,
+        idx,
+        rg,
+        bg,
+    } = s;
 
-    let not_clipped: Vec<bool> = (0..n)
-        .map(|i| p.r[i].max(green[i]).max(p.b[i]) < clip)
-        .collect();
-    let valid: Vec<bool> = green.iter().map(|&g| g > 1.0).collect();
+    green.clear();
+    green.extend((0..n).map(|i| 0.5 * (p.gr[i] + p.gb[i])));
+    let g: &[f32] = green.as_slice();
 
-    let masks: [Box<dyn Fn(usize) -> bool>; 4] = [
-        Box::new(|i| not_clipped[i] && green[i] >= p60 && valid[i]),
-        Box::new(|i| not_clipped[i] && valid[i]),
-        Box::new(|i| green[i] >= p60 && valid[i]),
-        Box::new(|i| valid[i]),
-    ];
+    // 60th percentile of the green channel, via O(n) selection on a scratch copy.
+    sel.clear();
+    sel.extend_from_slice(g);
+    let p60 = percentile_select(sel, 60.0) as f32;
 
-    for mask in masks.iter() {
-        let idx: Vec<usize> = (0..n).filter(|&i| mask(i)).collect();
-        if idx.len() >= AWB_MIN_SAMPLES {
-            let mut rg: Vec<f32> = idx.iter().map(|&i| p.r[i] / green[i]).collect();
-            let mut bg: Vec<f32> = idx.iter().map(|&i| p.b[i] / green[i]).collect();
-            return (median(&mut rg) as f32, median(&mut bg) as f32);
-        }
+    // Fallback masks, tried in order of decreasing strictness. Predicates are
+    // inlined (no `Box<dyn Fn>`); `valid := green > 1.0`, `not_clipped :=
+    // max(r, green, b) < clip`. Boolean order does not change the selected set.
+    if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
+        g[i] > 1.0 && p.r[i].max(g[i]).max(p.b[i]) < clip && g[i] >= p60
+    }) {
+        return r;
+    }
+    if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
+        g[i] > 1.0 && p.r[i].max(g[i]).max(p.b[i]) < clip
+    }) {
+        return r;
+    }
+    if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| g[i] > 1.0 && g[i] >= p60) {
+        return r;
+    }
+    if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| g[i] > 1.0) {
+        return r;
     }
 
     // last resort: mean over valid green
-    let idx: Vec<usize> = (0..n).filter(|&i| valid[i]).collect();
     let (mut sr, mut sg, mut sb) = (0f64, 0f64, 0f64);
-    for &i in &idx {
-        sr += p.r[i] as f64;
-        sg += green[i] as f64;
-        sb += p.b[i] as f64;
+    for (i, &gv) in g.iter().enumerate() {
+        if gv > 1.0 {
+            sr += p.r[i] as f64;
+            sg += gv as f64;
+            sb += p.b[i] as f64;
+        }
     }
     // Degenerate (near-black) frame with no valid green: assume neutral rather
     // than dividing by zero and propagating NaN through the gains.
@@ -1107,6 +1186,7 @@ pub struct Processor {
     chroma: Option<(f32, f32)>,
     planar: Vec<f32>,
     lca: Option<Lca>,
+    awb: AwbScratch,
 }
 
 #[cfg(feature = "video")]
@@ -1146,6 +1226,7 @@ impl Processor {
             chroma: None,
             planar,
             lca,
+            awb: AwbScratch::default(),
         }
     }
 
@@ -1161,7 +1242,7 @@ impl Processor {
     /// changes gradually instead of stepping every interval. The first frame has
     /// no history, so it reproduces the stateless [`estimate`] exactly.
     fn reestimate(&mut self) {
-        let (rg, bg) = robust_neutral(&self.planes);
+        let (rg, bg) = robust_neutral_into(&self.planes, &mut self.awb);
         let (srg, sbg) = smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
         let prev_ls = self.est.as_ref().map(|e| e.ls);

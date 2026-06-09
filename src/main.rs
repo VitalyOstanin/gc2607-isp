@@ -41,7 +41,8 @@ fn main() -> ExitCode {
     let (w, h, rgb, est) = pipeline::process_with(&frame, mode);
 
     let write_result = if output.ends_with(".png") {
-        write_png(output, w, h, &rgb)
+        // Hand ownership of the RGB buffer to the encoder (no extra full-frame copy).
+        write_png(output, w, h, rgb)
     } else {
         write_ppm(output, w, h, &rgb)
     };
@@ -66,8 +67,8 @@ fn write_ppm(path: &str, w: usize, h: usize, rgb: &[u8]) -> io::Result<()> {
     bw.flush()
 }
 
-fn write_png(path: &str, w: usize, h: usize, rgb: &[u8]) -> io::Result<()> {
-    let buf: image::RgbImage = image::ImageBuffer::from_raw(w as u32, h as u32, rgb.to_vec())
+fn write_png(path: &str, w: usize, h: usize, rgb: Vec<u8>) -> io::Result<()> {
+    let buf: image::RgbImage = image::ImageBuffer::from_raw(w as u32, h as u32, rgb)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "buffer size mismatch"))?;
     buf.save(path).map_err(|e| io::Error::other(e.to_string()))
 }

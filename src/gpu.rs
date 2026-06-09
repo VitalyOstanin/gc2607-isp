@@ -392,6 +392,13 @@ pub struct GpuProcessor {
     yuyv_host: Vec<u8>,
     raw_needed: usize,
     yuyv_bytes: usize,
+
+    // Reused CPU-side scratch: AWB working buffers, the flattened per-sector ACM
+    // upload buffer, and the f64->f32 grid conversion buffer. Kept here so the
+    // periodic re-estimate path does not reallocate them.
+    awb: pipeline::AwbScratch,
+    acm_flat: Vec<f32>,
+    grid_scratch: Vec<f32>,
 }
 
 /// All persistent GPU buffers, produced by `GpuProcessor::create_buffers`. `cfa`,
@@ -454,6 +461,9 @@ impl GpuProcessor {
             yuyv_host: vec![0u8; OUT_W * OUT_H * 2],
             raw_needed: H * STRIDE_SAMPLES * 2,
             yuyv_bytes: OUT_W * OUT_H * 2,
+            awb: pipeline::AwbScratch::default(),
+            acm_flat: Vec::with_capacity(ACM_NSEC * 9),
+            grid_scratch: Vec::with_capacity(HH * WW),
         })
     }
 
@@ -734,16 +744,21 @@ impl GpuProcessor {
         let planes = pipeline::bayer_planes(&frame);
         // Same temporal smoothing / LSC hysteresis as the CPU `Processor`: the
         // first frame (no history) reproduces the stateless estimate exactly.
-        let (rg, bg) = pipeline::robust_neutral(&planes);
+        let (rg, bg) = pipeline::robust_neutral_into(&planes, &mut self.awb);
         let (srg, sbg) = pipeline::smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
         let prev_ls = self.est.as_ref().map(|e| e.ls);
         let est = pipeline::estimate_from_chroma(srg, sbg, prev_ls);
         if self.grids_ls != Some(est.ls) {
             let grids = pipeline::build_grids(est.ls, HH, WW);
-            let upload = |buf: &wgpu::Buffer, g: &[f64]| {
-                let f: Vec<f32> = g.iter().map(|&v| v as f32).collect();
-                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&f));
+            // Reuse one f32 scratch buffer for the f64->f32 conversion of all
+            // four grids instead of allocating a fresh Vec per grid.
+            let queue = &self.queue;
+            let scratch = &mut self.grid_scratch;
+            let mut upload = |buf: &wgpu::Buffer, g: &[f64]| {
+                scratch.clear();
+                scratch.extend(g.iter().map(|&v| v as f32));
+                queue.write_buffer(buf, 0, bytemuck::cast_slice(scratch));
             };
             upload(&self.grid_bufs[0], &grids.g_gr);
             upload(&self.grid_bufs[1], &grids.g_r);
@@ -757,13 +772,14 @@ impl GpuProcessor {
 
     /// Pack the current estimate into the uniform block and upload it, along with
     /// this frame's per-sector ACM matrices (CCT-interpolated on the CPU).
-    fn upload_params(&self) {
+    fn upload_params(&mut self) {
         let est = self
             .est
             .as_ref()
             .expect("estimate present (upload_params runs right after reestimate)");
         let g = est.gains;
         let c = est.ccm;
+        let cct = est.cct;
         let params = Params {
             dims: [W as u32, H as u32, WW as u32, HH as u32],
             out_dims: [
@@ -784,16 +800,17 @@ impl GpuProcessor {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
-        // Per-sector matrices for this CCT, flattened sector-major row-major.
-        let acm = interp_acm(est.cct);
-        let mut flat = vec![0f32; ACM_NSEC * 9];
-        for (s, mat) in acm.mats.iter().enumerate() {
-            for k in 0..9 {
-                flat[s * 9 + k] = mat[k] as f32;
-            }
-        }
+        // Per-sector matrices for this CCT, flattened sector-major row-major into
+        // the reused scratch buffer.
+        let acm = interp_acm(cct);
+        self.acm_flat.clear();
+        self.acm_flat.extend(
+            acm.mats
+                .iter()
+                .flat_map(|mat| mat.iter().map(|&v| v as f32)),
+        );
         self.queue
-            .write_buffer(&self.acm_buf, 0, bytemuck::cast_slice(&flat));
+            .write_buffer(&self.acm_buf, 0, bytemuck::cast_slice(&self.acm_flat));
     }
 
     /// Process one raw SGRBG10 frame; returns the packed YUYV bytes (length
