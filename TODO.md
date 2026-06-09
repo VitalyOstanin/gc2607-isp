@@ -4,6 +4,7 @@
 
 - [Image quality](#image-quality)
 - [Performance](#performance)
+- [Tooling](#tooling)
 
 ## Image quality
 
@@ -31,3 +32,13 @@
       already met, so the benefit is latency/headroom, not throughput; (2) if
       worthwhile, implement a ring buffer with first-frame priming, re-tune the
       AE apply-delay, and add a multi-frame ordering test.
+
+## Tooling
+
+- [ ] Replace the hand-rolled CLI argument parsing with an established crate
+      (`clap`, derive API). Each binary (`src/bin/video.rs`, `src/bin/capture.rs`,
+      `src/bin/gpu_probe.rs`) currently parses `std::env::args()` by hand with a
+      `match` loop and silent `unwrap_or` fallbacks on bad values; there is no
+      shared parser, the flag set keeps growing, and `--help`/usage strings are
+      maintained manually. A derive-based parser would give validation, generated
+      help, and a single source of truth for the shared flags.

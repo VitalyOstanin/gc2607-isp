@@ -32,7 +32,8 @@
 //! Usage:
 //!   gc2607-video [--device /dev/videoN] [--device-label <name>] [--backend cpu|gpu]
 //!                [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>]
-//!                [--threads <n>] [--on-demand auto|on|off] [--measure-delay]
+//!                [--min-fps <fps>] [--threads <n>] [--on-demand auto|on|off]
+//!                [--measure-delay]
 
 use std::collections::VecDeque;
 use std::io;
@@ -150,6 +151,7 @@ struct Args {
     ae: bool,
     target: f64,
     max_gain: u8,
+    min_fps: f64,
     threads: usize,
     lca: bool,
     measure: bool,
@@ -172,6 +174,11 @@ fn parse_args() -> Args {
     let mut ae = true;
     let mut target = AE_TARGET_LINEAR;
     let mut max_gain = AeConfig::default().max_gain_index;
+    // Frame-rate floor for AE: exposure lengthens (lowering fps) only down to
+    // this rate before gain is used instead. Lower = brighter/cleaner but laggier
+    // and more motion blur in dim light; raising it toward 30 keeps the frame
+    // rate (and latency) steady at the cost of earlier gain (more noise).
+    let mut min_fps = AeConfig::default().min_fps;
     let mut threads = 8usize;
     // Lateral chromatic aberration correction (full-res MHC only); on by default.
     let mut lca = true;
@@ -247,6 +254,17 @@ fn parse_args() -> Args {
             },
             "--target" => target = it.next().and_then(|s| s.parse().ok()).unwrap_or(target),
             "--max-gain" => max_gain = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_gain),
+            "--min-fps" => {
+                // Clamp to the sensor's usable range; 30 fps is the fastest and
+                // forcing it above that just pins the rate (no exposure
+                // extension). `vblank_for_fps` clamps the resulting frame length,
+                // so any positive value is safe.
+                min_fps = it
+                    .next()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(min_fps)
+                    .clamp(1.0, 30.0)
+            }
             "--threads" => {
                 threads = it
                     .next()
@@ -260,8 +278,8 @@ fn parse_args() -> Args {
                      [--backend auto|cpu|gpu] \
                      [--debayer half|mhc] [--no-ae] [--no-lca] [--no-denoise] \
                      [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
-                     [--target <0..1>] [--max-gain <idx>] [--threads <n>] \
-                     [--on-demand auto|on|off] [--measure-delay]"
+                     [--target <0..1>] [--max-gain <idx>] [--min-fps <fps>] \
+                     [--threads <n>] [--on-demand auto|on|off] [--measure-delay]"
                 );
                 std::process::exit(0);
             }
@@ -289,6 +307,7 @@ fn parse_args() -> Args {
         ae,
         target,
         max_gain,
+        min_fps,
         threads,
         lca,
         measure,
@@ -951,6 +970,7 @@ fn run_live(
     let ae_cfg = AeConfig {
         target: args.target,
         max_gain_index: args.max_gain,
+        min_fps: args.min_fps,
         ..AeConfig::default()
     };
 
