@@ -516,6 +516,19 @@ fn frame_bytes<'a>(req: &'a Request, stream: &Stream) -> Option<&'a [u8]> {
     Some(&plane[..bytes_used.min(plane.len())])
 }
 
+/// Capture timestamp of a completed request's buffer, as a `CLOCK_MONOTONIC`
+/// nanosecond count from libcamera's frame metadata. Returns 0 if unavailable;
+/// the loopback then stamps the frame with the current time instead. Forwarding
+/// the true capture instant lets a consumer (a browser's WebRTC stack) align
+/// audio to video instead of treating the post-ISP frame as "captured now".
+fn frame_timestamp(req: &Request, stream: &Stream) -> u64 {
+    let Some(fb) = req.buffer(stream) else {
+        return 0;
+    };
+    let fb: &MemoryMappedFrameBuffer<FrameBuffer> = fb;
+    fb.metadata().map(|m| m.timestamp()).unwrap_or(0)
+}
+
 /// Read the next completed request in strict capture order (no frame dropping)
 /// and return its raw-mean brightness metric, requeuing the buffer. Returns
 /// `None` only on capture timeout. `--measure-delay` must observe every sensor
@@ -908,6 +921,7 @@ fn process_and_write(
     dst_w: usize,
     dst_h: usize,
     gain_index: u8,
+    timestamp_ns: u64,
     args: &Args,
     denoise_buf: &mut Vec<u8>,
     prev_y: &mut Vec<u8>,
@@ -921,7 +935,7 @@ fn process_and_write(
         let (chroma_radius, temporal_alpha, used) =
             apply_denoise(yuyv, dst_w, dst_h, gain_index, args, denoise_buf, prev_y);
         let frame: &[u8] = if used { denoise_buf.as_slice() } else { yuyv };
-        match out.write_frame(frame) {
+        match out.write_frame(frame, timestamp_ns) {
             Ok(()) => FrameOutcome::Written {
                 luma,
                 chroma_radius,
@@ -1060,6 +1074,7 @@ fn run_live(
             dropped += 1;
         }
 
+        let ts = frame_timestamp(&req, stream);
         let buf = match frame_bytes(&req, stream) {
             Some(b) => b,
             None => {
@@ -1094,6 +1109,7 @@ fn run_live(
             dst_w,
             dst_h,
             frame_gain,
+            ts,
             args,
             &mut denoise_buf,
             &mut prev_y,
@@ -1232,7 +1248,9 @@ fn run_on_demand(
             if active == Some(true) {
                 break;
             }
-            if let Err(e) = out.write_frame(&standby) {
+            // Standby frames carry no capture time; pass 0 so v4l2loopback
+            // stamps them with the current time.
+            if let Err(e) = out.write_frame(&standby, 0) {
                 eprintln!("standby write failed: {e}; stopping");
                 return;
             }

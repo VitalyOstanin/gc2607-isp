@@ -12,11 +12,15 @@
 //! is laid out to the 64-bit kernel ABI (total 208 bytes, the `fmt` union at
 //! offset 8) and this is asserted at construction.
 
+use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
+use std::num::NonZeroUsize;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
+use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use rayon::prelude::*;
 
 /// `V4L2_PIX_FMT_YUYV` four-character code.
@@ -62,6 +66,94 @@ struct V4l2Format {
 
 // VIDIOC_S_FMT = _IOWR('V', 5, struct v4l2_format)
 nix::ioctl_readwrite!(vidioc_s_fmt, b'V', 5, V4l2Format);
+
+// --- streaming output (MMAP) ---
+//
+// v4l2loopback only forwards a producer-set frame timestamp when the producer
+// uses the streaming API (VIDIOC_QBUF); the plain `write()` path always stamps
+// the frame with the write time (verified in v4l2loopback's `vidioc_qbuf` /
+// `v4l2l_get_timestamp`). To let a consumer (a browser's WebRTC stack) sync
+// audio against the true capture instant, we drive the loopback as an MMAP
+// output device and set `v4l2_buffer.timestamp` to libcamera's capture time.
+// v4l2loopback supports only V4L2_MEMORY_MMAP for buffers (USERPTR is rejected).
+
+/// `V4L2_MEMORY_MMAP`.
+const V4L2_MEMORY_MMAP: u32 = 1;
+
+/// `struct v4l2_requestbuffers` (uapi videodev2.h), 20 bytes on 64-bit.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct V4l2RequestBuffers {
+    count: u32,
+    type_: u32,
+    memory: u32,
+    capabilities: u32,
+    flags: u8,
+    reserved: [u8; 3],
+}
+
+/// `struct timeval` as embedded in `v4l2_buffer` (64-bit kernel ABI: both fields
+/// are `__kernel_long_t`/`__kernel_suseconds_t`, 8 bytes each).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct V4l2Timeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+/// `struct v4l2_timecode` (uapi videodev2.h), 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct V4l2Timecode {
+    type_: u32,
+    flags: u32,
+    frames: u8,
+    seconds: u8,
+    minutes: u8,
+    hours: u8,
+    userbits: [u8; 4],
+}
+
+/// `struct v4l2_buffer` (uapi videodev2.h), 88 bytes on 64-bit. `m` is the union
+/// (we only use `offset` for MMAP query and never read it back as a pointer).
+/// `repr(C)` inserts the 4-byte pad before `timestamp` (8-aligned) and the
+/// trailing pad; the offsets are asserted below against the kernel layout.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct V4l2Buffer {
+    index: u32,
+    type_: u32,
+    bytesused: u32,
+    flags: u32,
+    field: u32,
+    timestamp: V4l2Timeval,
+    timecode: V4l2Timecode,
+    sequence: u32,
+    memory: u32,
+    m: u64,
+    length: u32,
+    reserved2: u32,
+    request_fd: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<V4l2RequestBuffers>() == 20);
+const _: () = assert!(core::mem::size_of::<V4l2Buffer>() == 88);
+const _: () = assert!(core::mem::offset_of!(V4l2Buffer, timestamp) == 24);
+const _: () = assert!(core::mem::offset_of!(V4l2Buffer, m) == 64);
+const _: () = assert!(core::mem::offset_of!(V4l2Buffer, length) == 72);
+
+// VIDIOC_REQBUFS  = _IOWR('V',  8, struct v4l2_requestbuffers)
+nix::ioctl_readwrite!(vidioc_reqbufs, b'V', 8, V4l2RequestBuffers);
+// VIDIOC_QUERYBUF = _IOWR('V',  9, struct v4l2_buffer)
+nix::ioctl_readwrite!(vidioc_querybuf, b'V', 9, V4l2Buffer);
+// VIDIOC_QBUF     = _IOWR('V', 15, struct v4l2_buffer)
+nix::ioctl_readwrite!(vidioc_qbuf, b'V', 15, V4l2Buffer);
+// VIDIOC_DQBUF    = _IOWR('V', 17, struct v4l2_buffer)
+nix::ioctl_readwrite!(vidioc_dqbuf, b'V', 17, V4l2Buffer);
+// VIDIOC_STREAMON  = _IOW('V', 18, int)
+nix::ioctl_write_ptr!(vidioc_streamon, b'V', 18, i32);
+// VIDIOC_STREAMOFF = _IOW('V', 19, int)
+nix::ioctl_write_ptr!(vidioc_streamoff, b'V', 19, i32);
 
 // --- v4l2loopback client-usage event (on-demand camera gating) ---
 //
@@ -159,15 +251,31 @@ pub fn find_loopback_by_label(label: &str) -> io::Result<PathBuf> {
     ))
 }
 
-/// A loopback output node configured for YUYV frames of a fixed size.
+/// One MMAP-ed output buffer shared with the kernel/v4l2loopback.
+struct MappedBuffer {
+    ptr: NonNull<c_void>,
+    len: usize,
+}
+
+/// A loopback output node configured for YUYV frames of a fixed size, driven as
+/// an MMAP streaming device so each frame carries the capture timestamp.
 pub struct LoopbackOutput {
     file: File,
     width: u32,
     height: u32,
+    buffers: Vec<MappedBuffer>,
+    /// Buffer indices we currently own (dequeued / not yet queued). When empty,
+    /// every buffer is in flight and the next write reclaims one via `DQBUF`.
+    free: Vec<u32>,
 }
 
 impl LoopbackOutput {
-    /// Open `path` and set its output format to YUYV `width`x`height`.
+    /// Number of output buffers to request. v4l2loopback clamps this to its
+    /// `max_buffers` module option (2 by default); the returned count is used.
+    const REQUEST_BUFFERS: u32 = 4;
+
+    /// Open `path`, set its output format to YUYV `width`x`height`, allocate and
+    /// map the MMAP output buffers, and start streaming.
     pub fn open<P: AsRef<Path>>(path: P, width: u32, height: u32) -> io::Result<LoopbackOutput> {
         // Guard the hand-laid ABI: a wrong size would make the kernel reject
         // (or mis-copy) the ioctl.
@@ -197,10 +305,68 @@ impl LoopbackOutput {
         unsafe { vidioc_s_fmt(file.as_raw_fd(), &mut fmt) }
             .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
 
+        // Allocate MMAP output buffers.
+        let mut req = V4l2RequestBuffers {
+            count: Self::REQUEST_BUFFERS,
+            type_: V4L2_BUF_TYPE_VIDEO_OUTPUT,
+            memory: V4L2_MEMORY_MMAP,
+            ..Default::default()
+        };
+        // SAFETY: `req` is a correctly-sized v4l2_requestbuffers; fd is open RW.
+        unsafe { vidioc_reqbufs(file.as_raw_fd(), &mut req) }
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        if req.count == 0 {
+            return Err(io::Error::other("v4l2loopback allocated 0 output buffers"));
+        }
+
+        // Query and map each buffer.
+        let mut buffers = Vec::with_capacity(req.count as usize);
+        let mut free = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let mut qb = V4l2Buffer {
+                index: i,
+                type_: V4L2_BUF_TYPE_VIDEO_OUTPUT,
+                memory: V4L2_MEMORY_MMAP,
+                ..Default::default()
+            };
+            // SAFETY: correctly-sized v4l2_buffer; fd open RW.
+            unsafe { vidioc_querybuf(file.as_raw_fd(), &mut qb) }
+                .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+            let len = NonZeroUsize::new(qb.length as usize)
+                .ok_or_else(|| io::Error::other("v4l2loopback buffer has zero length"))?;
+            // SAFETY: map the driver buffer at its reported `m.offset`; `file`
+            // stays open for the lifetime of `LoopbackOutput`, keeping the
+            // mapping valid. Unmapped in `Drop`.
+            let ptr = unsafe {
+                mmap(
+                    None,
+                    len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_SHARED,
+                    &file,
+                    qb.m as i64,
+                )
+            }
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+            buffers.push(MappedBuffer {
+                ptr,
+                len: len.get(),
+            });
+            free.push(i);
+        }
+
+        // Start streaming.
+        let type_ = V4L2_BUF_TYPE_VIDEO_OUTPUT as i32;
+        // SAFETY: `type_` is a valid buffer-type int; fd open RW.
+        unsafe { vidioc_streamon(file.as_raw_fd(), &type_) }
+            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+
         Ok(LoopbackOutput {
             file,
             width,
             height,
+            buffers,
+            free,
         })
     }
 
@@ -209,8 +375,16 @@ impl LoopbackOutput {
         self.width as usize * self.height as usize * 2
     }
 
-    /// Write one YUYV frame. The buffer must be exactly [`Self::frame_size`].
-    pub fn write_frame(&mut self, yuyv: &[u8]) -> io::Result<()> {
+    /// Queue one YUYV frame for output, stamped with `timestamp_ns` (a
+    /// `CLOCK_MONOTONIC` nanosecond count — libcamera's capture time). A zero
+    /// `timestamp_ns` leaves the timestamp unset, so v4l2loopback stamps the
+    /// frame with the current time (used for standby frames). The buffer must be
+    /// exactly [`Self::frame_size`].
+    ///
+    /// Reclaims a previously queued buffer (blocking `DQBUF`) when all buffers
+    /// are in flight; with >= 2 buffers one is always available right after a
+    /// queue, so this does not stall a steadily producing loop.
+    pub fn write_frame(&mut self, yuyv: &[u8], timestamp_ns: u64) -> io::Result<()> {
         if yuyv.len() != self.frame_size() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -223,7 +397,72 @@ impl LoopbackOutput {
                 ),
             ));
         }
-        self.file.write_all(yuyv)
+
+        // Reclaim a buffer if none are free.
+        if self.free.is_empty() {
+            let mut dq = V4l2Buffer {
+                type_: V4L2_BUF_TYPE_VIDEO_OUTPUT,
+                memory: V4L2_MEMORY_MMAP,
+                ..Default::default()
+            };
+            // SAFETY: correctly-sized v4l2_buffer; fd open RW.
+            match unsafe { vidioc_dqbuf(self.file.as_raw_fd(), &mut dq) } {
+                Ok(_) => self.free.push(dq.index),
+                // v4l2loopback returns EFAULT from DQBUF(OUTPUT) when its output
+                // queue is empty. That queue is cleared whenever a consumer
+                // attaches: the consumer's VIDIOC_REQBUFS runs
+                // prepare_buffer_queue(), which drops every buffer from the
+                // output queue and resets their flags (see vidioc_reqbufs ->
+                // prepare_buffer_queue and the DQBUF OUTPUT branch in
+                // v4l2loopback.c). Our buffers are no longer in flight and the
+                // producer keeps its format token and buffer_count, so reclaim
+                // them all and carry on; the next QBUF re-enqueues a buffer.
+                Err(nix::errno::Errno::EFAULT) => {
+                    self.free.clear();
+                    self.free.extend(0..self.buffers.len() as u32);
+                }
+                Err(e) => return Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+
+        let idx = self.free.pop().expect("a free buffer after reclaim");
+        let mb = &self.buffers[idx as usize];
+        if yuyv.len() > mb.len {
+            // Re-add the index so state stays consistent on this error path.
+            self.free.push(idx);
+            return Err(io::Error::other(format!(
+                "frame {} bytes exceeds mapped buffer {}",
+                yuyv.len(),
+                mb.len
+            )));
+        }
+        // SAFETY: `mb.ptr` maps `mb.len` writable bytes; we copy at most that many.
+        unsafe {
+            std::slice::from_raw_parts_mut(mb.ptr.as_ptr() as *mut u8, mb.len)[..yuyv.len()]
+                .copy_from_slice(yuyv);
+        }
+
+        let mut qb = V4l2Buffer {
+            index: idx,
+            type_: V4L2_BUF_TYPE_VIDEO_OUTPUT,
+            memory: V4L2_MEMORY_MMAP,
+            bytesused: yuyv.len() as u32,
+            field: V4L2_FIELD_NONE,
+            length: mb.len as u32,
+            ..Default::default()
+        };
+        if timestamp_ns != 0 {
+            qb.timestamp = V4l2Timeval {
+                tv_sec: (timestamp_ns / 1_000_000_000) as i64,
+                tv_usec: ((timestamp_ns % 1_000_000_000) / 1_000) as i64,
+            };
+        }
+        // SAFETY: correctly-sized v4l2_buffer; fd open RW.
+        unsafe { vidioc_qbuf(self.file.as_raw_fd(), &mut qb) }.map_err(|e| {
+            self.free.push(idx);
+            io::Error::from_raw_os_error(e as i32)
+        })?;
+        Ok(())
     }
 
     /// Subscribe to the v4l2loopback client-usage event so the producer can run
@@ -288,6 +527,22 @@ impl LoopbackOutput {
             // Raced away between poll and dequeue: treat as no event.
             Err(nix::errno::Errno::ENOENT) => Ok(None),
             Err(e) => Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+impl Drop for LoopbackOutput {
+    fn drop(&mut self) {
+        // Stop streaming, then unmap every buffer. Errors are ignored: there is
+        // nothing to recover to in a destructor, and the fd close that follows
+        // releases the kernel-side resources regardless.
+        let type_ = V4L2_BUF_TYPE_VIDEO_OUTPUT as i32;
+        // SAFETY: valid buffer-type int; fd still open.
+        let _ = unsafe { vidioc_streamoff(self.file.as_raw_fd(), &type_) };
+        for b in &self.buffers {
+            // SAFETY: `b.ptr`/`b.len` came from `mmap` in `open` and are unmapped
+            // exactly once here.
+            let _ = unsafe { munmap(b.ptr, b.len) };
         }
     }
 }
