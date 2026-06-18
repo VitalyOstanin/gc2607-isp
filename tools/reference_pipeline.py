@@ -44,15 +44,52 @@ def planes_to_rgb(gr, r, b, gb):
     return np.stack([r, 0.5 * (gr + gb), b], axis=-1)
 
 
-def m_robust_neutral(rgb):
-    """Median chroma over bright, non-clipped pixels, with graceful fallbacks."""
+# Maximum distance, in raw (r/g, b/g) chroma space, from a pixel's chroma to the
+# white locus for it to be trusted as a near-neutral AWB sample. Saturated
+# colour objects sit well off the locus; gating them out of the gray-world
+# median removes the colour cast a large saturated object imposes on neutral
+# whites. Mirrors AWB_LOCUS_MAX_DIST in the Rust pipeline.
+AWB_LOCUS_MAX_DIST = 0.12
+
+
+def locus_distance(rg, bg, locus):
+    """Min distance from each (rg, bg) to the white-locus polyline (vectorized,
+    clamped per-segment projection), matching project_to_locus' geometry."""
+    rg = np.asarray(rg, dtype=np.float64)
+    bg = np.asarray(bg, dtype=np.float64)
+    best = np.full(rg.shape, np.inf)
+    for i in range(len(locus) - 1):
+        ax, ay = locus[i]
+        bx, by = locus[i + 1]
+        abx, aby = bx - ax, by - ay
+        denom = abx * abx + aby * aby
+        t = np.clip(((rg - ax) * abx + (bg - ay) * aby) / denom, 0.0, 1.0)
+        best = np.minimum(best, np.hypot(rg - (ax + t * abx), bg - (ay + t * aby)))
+    return best
+
+
+def m_robust_neutral(rgb, locus):
+    """Median chroma over bright, non-clipped pixels, with graceful fallbacks.
+
+    The two strictest masks additionally require the pixel chroma to sit within
+    AWB_LOCUS_MAX_DIST of the white locus, so a large saturated object does not
+    bias the gray-world median; the looser masks reproduce the ungated
+    behaviour when too few near-locus pixels exist.
+    """
     flat = rgb.reshape(-1, 3)
     g = flat[:, 1]
     not_clipped = flat.max(axis=1) < 0.95 * MAXLIN
     valid_g = g > 1.0
-    for mask in (not_clipped & (g >= np.percentile(g, 60.0)) & valid_g,
+    bright = g >= np.percentile(g, 60.0)
+    # Per-pixel chroma; non-positive green is excluded by valid_g in every mask,
+    # so its (irrelevant) distance is computed against a guarded denominator.
+    gsafe = np.where(g > 0.0, g, 1.0)
+    near_locus = locus_distance(flat[:, 0] / gsafe, flat[:, 2] / gsafe, locus) <= AWB_LOCUS_MAX_DIST
+    for mask in (not_clipped & bright & valid_g & near_locus,
+                 not_clipped & valid_g & near_locus,
+                 not_clipped & bright & valid_g,
                  not_clipped & valid_g,
-                 (g >= np.percentile(g, 60.0)) & valid_g,
+                 bright & valid_g,
                  valid_g):
         if int(mask.sum()) >= 100:
             sel = flat[mask]
@@ -241,7 +278,7 @@ def process(raw_path):
     hh, ww = gr.shape
 
     rgb_lin = planes_to_rgb(gr, r, b, gb)               # pre-LSC, for estimation
-    rg, bg = m_robust_neutral(rgb_lin)
+    rg, bg = m_robust_neutral(rgb_lin, locus)
     gains = gains_from_chroma(rg, bg)
     cct = estimate_cct(rg, bg, ccts, locus)
     ccm = interp_ccm(cct, ccts, ccms)

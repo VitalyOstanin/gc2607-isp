@@ -1,3 +1,12 @@
+gc2607-isp (0.2.1) unstable; urgency=medium
+
+  * AWB: gate the gray-world estimator on proximity to the calibrated white
+    locus, so a large saturated object (e.g. a brightly coloured shirt) no
+    longer biases the white balance and tints neutral whites with a colour cast.
+    Falls back to the previous masks when too few near-locus pixels are present.
+
+ -- Vitaly Ostanin <vitaly.ostanin@gmail.com>  Thu, 18 Jun 2026 20:10:00 +0300
+
 gc2607-isp (0.2.0) unstable; urgency=medium
 
   * A/V sync: drive the v4l2loopback output via the streaming API (QBUF) and

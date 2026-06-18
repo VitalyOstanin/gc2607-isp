@@ -180,6 +180,19 @@ const AWB_CLIP_FRACTION: f32 = 0.95;
 /// trusted; below this the next, looser mask is tried.
 const AWB_MIN_SAMPLES: usize = 100;
 
+/// Maximum distance, in raw `(r/g, b/g)` chroma space, from a pixel's chroma to
+/// the calibrated white locus ([`CCM_LOCUS`]) for it to be trusted as a
+/// near-neutral AWB sample. Saturated colour objects (a yellow shirt, a green
+/// plant) sit well off the locus; without this gate they bias the gray-world
+/// median and impose a colour cast on genuinely neutral whites. The locus spans
+/// r/g 0.41..0.72 and b/g 0.37..0.69, so 0.12 admits real neutrals (plus sensor
+/// noise and a modest off-locus illuminant) while rejecting saturated colours,
+/// which land 0.3+ away. The gate is applied only in the two strictest masks;
+/// when too few near-locus pixels exist (an unusual illuminant) the ungated
+/// masks below reproduce the previous behaviour, so the selection never
+/// collapses to fewer samples than before.
+const AWB_LOCUS_MAX_DIST: f64 = 0.12;
+
 /// Reusable scratch buffers for [`robust_neutral_into`] so the live runtimes do
 /// not reallocate the per-estimate working vectors every AWB interval. Held by
 /// `Processor`/`GpuProcessor`; cleared and refilled each estimate.
@@ -250,6 +263,26 @@ pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) 
     // Fallback masks, tried in order of decreasing strictness. Predicates are
     // inlined (no `Box<dyn Fn>`); `valid := green > 1.0`, `not_clipped :=
     // max(r, green, b) < clip`. Boolean order does not change the selected set.
+    //
+    // The two strictest masks additionally require the pixel's chroma to sit
+    // near the calibrated white locus (see [`AWB_LOCUS_MAX_DIST`]); the
+    // `g[i] > 1.0` guard short-circuits before the chroma division. This rejects
+    // large saturated objects that would otherwise drag the gray-world median.
+    if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
+        g[i] > 1.0
+            && p.r[i].max(g[i]).max(p.b[i]) < clip
+            && g[i] >= p60
+            && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= AWB_LOCUS_MAX_DIST
+    }) {
+        return r;
+    }
+    if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
+        g[i] > 1.0
+            && p.r[i].max(g[i]).max(p.b[i]) < clip
+            && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= AWB_LOCUS_MAX_DIST
+    }) {
+        return r;
+    }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
         g[i] > 1.0 && p.r[i].max(g[i]).max(p.b[i]) < clip && g[i] >= p60
     }) {
@@ -309,6 +342,27 @@ fn project_to_locus(rg: f64, bg: f64) -> (usize, f64) {
 fn estimate_cct(rg: f64, bg: f64) -> f64 {
     let (i, t) = project_to_locus(rg, bg);
     CCM_CT[i] as f64 * (1.0 - t) + CCM_CT[i + 1] as f64 * t
+}
+
+/// Minimum Euclidean distance from chromaticity `(rg, bg)` to the white-locus
+/// polyline ([`CCM_LOCUS`]), in raw `(r/g, b/g)` space. Mirrors the per-segment
+/// clamped projection of [`project_to_locus`] but returns the distance itself,
+/// used by the AWB near-neutral gate ([`AWB_LOCUS_MAX_DIST`]).
+fn locus_distance(rg: f64, bg: f64) -> f64 {
+    (0..NUM_CCM - 1)
+        .map(|i| {
+            let ax = CCM_LOCUS[i][0] as f64;
+            let ay = CCM_LOCUS[i][1] as f64;
+            let bx = CCM_LOCUS[i + 1][0] as f64;
+            let by = CCM_LOCUS[i + 1][1] as f64;
+            let abx = bx - ax;
+            let aby = by - ay;
+            let denom = abx * abx + aby * aby;
+            let t = (((rg - ax) * abx + (bg - ay) * aby) / denom).clamp(0.0, 1.0);
+            (rg - (ax + t * abx)).hypot(bg - (ay + t * aby))
+        })
+        .min_by(|a, b| a.total_cmp(b))
+        .unwrap_or(f64::INFINITY)
 }
 
 fn interp_ccm(cct: f64) -> [f64; 9] {
