@@ -476,6 +476,17 @@ const LUMA_B: f64 = 0.0722;
 /// yellow / orange-yellow hues toward their luminance gray by [`YELLOW_DESAT_K`],
 /// preserving luma and hue and leaving every other hue (and neutrals) untouched.
 /// Constants mirror reference_pipeline.py and the WGSL shader (`gpu.rs`).
+/// Axis 1 white-balance cooling. The calibrated AWB renders neutrals warmer
+/// than an external USB reference on the same scene (blue deficit ΔB/G ≈ −0.23).
+/// This multiplies the blue WB gain so the output white point shifts toward the
+/// reference. Applied to the gain only — CCT estimation and CCM/ACM selection
+/// run on the untouched scene chroma, so matrix choice (the colour-correction
+/// physics) is unchanged; only the emitted white point cools. One value for all
+/// CCTs (a deliberate simplification; cross-CCT safety is the sample-raw sanity
+/// check). Mirrors reference_pipeline.py::gains_from_chroma. Final value set by
+/// offline tuning (see docs/superpowers/plans).
+pub(crate) const WB_BLUE_TRIM: f64 = 1.17;
+
 pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
 const YELLOW_HUE_LO: f64 = 35.0;
 const YELLOW_HUE_HI: f64 = 80.0;
@@ -627,7 +638,9 @@ pub(crate) fn estimate_from_chroma(rg: f32, bg: f32, prev_ls: Option<usize>) -> 
     // to neutral so the gains stay finite instead of becoming inf/NaN.
     let rg = if rg.is_finite() && rg > 0.0 { rg } else { 1.0 };
     let bg = if bg.is_finite() && bg > 0.0 { bg } else { 1.0 };
-    let gains = [1.0 / rg as f64, 1.0, 1.0 / bg as f64];
+    // Blue gain carries the Axis-1 cooling trim; CCT below still uses the raw
+    // chroma, so matrix selection is unaffected.
+    let gains = [1.0 / rg as f64, 1.0, (1.0 / bg as f64) * WB_BLUE_TRIM];
     let cct = estimate_cct(rg as f64, bg as f64);
     let ls = select_ls_hyst(rg as f64, bg as f64, prev_ls);
     let ccm = interp_ccm(cct);
@@ -1536,5 +1549,21 @@ mod tests {
                 "({r},{g},{b}) must be untouched, got ({r2},{g2},{b2})"
             );
         }
+    }
+
+    /// Axis 1: the blue WB gain is the neutral inverse times WB_BLUE_TRIM, and
+    /// the red/green gains stay the plain neutral inverse. A trim > 1 cools the
+    /// white point (more blue) without touching CCT selection.
+    #[test]
+    fn blue_gain_carries_wb_blue_trim() {
+        let (rg, bg) = (0.638_f32, 0.447_f32); // a real on-locus scene chroma
+        let est = estimate_from_chroma(rg, bg, None);
+        assert!((est.gains[0] - 1.0 / rg as f64).abs() < 1e-12, "red gain unchanged");
+        assert!((est.gains[1] - 1.0).abs() < 1e-12, "green gain is 1");
+        assert!(
+            (est.gains[2] - (1.0 / bg as f64) * WB_BLUE_TRIM).abs() < 1e-12,
+            "blue gain = (1/bg) * WB_BLUE_TRIM"
+        );
+        assert!(WB_BLUE_TRIM > 1.0, "trim must cool, not warm");
     }
 }
