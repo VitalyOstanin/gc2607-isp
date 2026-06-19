@@ -176,7 +176,15 @@ const YELLOW_HUE_LO: f32 = 35.0;
 const YELLOW_HUE_HI: f32 = 80.0;
 const YELLOW_HUE_SOFT: f32 = 12.0;
 
-fn desaturate_yellow(c: vec3<f32>) -> vec3<f32> {
+// Axis 2 skin-red desaturation band (mirrors pipeline.rs SKIN_* constants).
+const SKIN_DESAT_K: f32 = 0.80;
+const SKIN_HUE_LO: f32 = 0.0;
+const SKIN_HUE_HI: f32 = 28.0;
+const SKIN_HUE_SOFT: f32 = 10.0;
+
+// Trapezoidal-band chroma desaturation toward luma (mirrors
+// pipeline::desaturate_band). Pixels outside [lo,hi] and neutrals pass through.
+fn desaturate_band(c: vec3<f32>, lo: f32, hi: f32, soft: f32, k: f32) -> vec3<f32> {
     let lr = max(c.x, 0.0);
     let lg = max(c.y, 0.0);
     let lb = max(c.z, 0.0);
@@ -190,13 +198,17 @@ fn desaturate_yellow(c: vec3<f32>) -> vec3<f32> {
     else { h = 4.0 + (lr - lg) / d; }
     h = h * 60.0;
     if (h < 0.0) { h = h + 360.0; }
-    let rise = clamp((h - YELLOW_HUE_LO) / YELLOW_HUE_SOFT, 0.0, 1.0);
-    let fall = clamp((YELLOW_HUE_HI - h) / YELLOW_HUE_SOFT, 0.0, 1.0);
+    let rise = clamp((h - lo) / soft, 0.0, 1.0);
+    let fall = clamp((hi - h) / soft, 0.0, 1.0);
     let win = min(rise, fall);
     if (win <= 0.0) { return c; }
-    let keff = 1.0 - win * (1.0 - YELLOW_DESAT_K);
+    let keff = 1.0 - win * (1.0 - k);
     let y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
     return vec3<f32>(y) + keff * (c - vec3<f32>(y));
+}
+
+fn desaturate_yellow(c: vec3<f32>) -> vec3<f32> {
+    return desaturate_band(c, YELLOW_HUE_LO, YELLOW_HUE_HI, YELLOW_HUE_SOFT, YELLOW_DESAT_K);
 }
 
 // Hue-sectored colour correction (mirrors pipeline::acm_color). `s` is the
@@ -245,11 +257,13 @@ fn acm_apply(s: vec3<f32>) -> vec3<f32> {
         let ms = acm[ba + k] * (1.0 - frac) + acm[bb + k] * frac;
         m[k] = cc[k] * (1.0 - w) + ms * w;
     }
-    return desaturate_yellow(vec3<f32>(
+    let corrected = vec3<f32>(
         m[0] * s.x + m[1] * s.y + m[2] * s.z,
         m[3] * s.x + m[4] * s.y + m[5] * s.z,
         m[6] * s.x + m[7] * s.y + m[8] * s.z,
-    ));
+    );
+    let skin = desaturate_band(corrected, SKIN_HUE_LO, SKIN_HUE_HI, SKIN_HUE_SOFT, SKIN_DESAT_K);
+    return desaturate_yellow(skin);
 }
 
 // Linear CFA-scale RGB -> hue-sectored CCM -> sRGB gamma -> 0..255 (rounded).
