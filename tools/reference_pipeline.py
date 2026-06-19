@@ -121,6 +121,44 @@ def load_lsc():
 # tuning_data.rs; ACM_HUE0/STEP are derived from the sector edges in the npz.
 ACM_SAT_KNEE = 0.10
 
+# Yellow-desaturation operator (applied to the ACM output). The calibrated
+# CCM/ACM carry a high saturation gain whose blue row removes almost all blue
+# from a saturated yellow, rendering it far purer than ground truth. This scales
+# yellow / orange-yellow chroma toward luminance gray by YELLOW_DESAT_K,
+# preserving luma and hue. Mirrors pipeline::desaturate_yellow (Rust / WGSL).
+YELLOW_DESAT_K = 0.70
+YELLOW_HUE_LO = 35.0
+YELLOW_HUE_HI = 80.0
+YELLOW_HUE_SOFT = 12.0
+LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
+
+
+def desaturate_yellow(rgb):
+    """Scale yellow-band chroma toward luminance gray (mirrors
+    pipeline::desaturate_yellow). `rgb` is corrected linear RGB (..,3); other
+    hues and neutrals pass through unchanged."""
+    flat = rgb.reshape(-1, 3)
+    lr = np.maximum(flat[:, 0], 0.0)
+    lg = np.maximum(flat[:, 1], 0.0)
+    lb = np.maximum(flat[:, 2], 0.0)
+    mx = np.maximum(np.maximum(lr, lg), lb)
+    mn = np.minimum(np.minimum(lr, lg), lb)
+    d = mx - mn
+    safe = (mx > 0.0) & (d > 0.0)
+    dd = np.where(d > 0.0, d, 1.0)
+    is_r = (lr >= lg) & (lr >= lb)
+    is_g = (~is_r) & (lg >= lb)
+    h = np.where(is_r, (lg - lb) / dd,
+                 np.where(is_g, 2.0 + (lb - lr) / dd, 4.0 + (lr - lg) / dd)) * 60.0
+    h = np.where(h < 0.0, h + 360.0, h)
+    rise = np.clip((h - YELLOW_HUE_LO) / YELLOW_HUE_SOFT, 0.0, 1.0)
+    fall = np.clip((YELLOW_HUE_HI - h) / YELLOW_HUE_SOFT, 0.0, 1.0)
+    win = np.where(safe, np.minimum(rise, fall), 0.0)
+    keff = 1.0 - win * (1.0 - YELLOW_DESAT_K)
+    y = (flat * LUMA_WEIGHTS).sum(1)
+    out = y[:, None] + keff[:, None] * (flat - y[:, None])
+    return out.reshape(rgb.shape)
+
 
 def load_acm():
     """Per-sector matrices sorted by CCT (to align with the CCMs), plus the
@@ -192,7 +230,7 @@ def apply_acm(rgb01, ccm, sectors, hue0, hue_step):
     meff = ccmf[None, :] * (1.0 - w)[:, None] + ms * w[:, None]          # (P,9)
     m = meff.reshape(-1, 3, 3)
     out = np.einsum("pij,pj->pi", m, flat)
-    return out.reshape(rgb01.shape)
+    return desaturate_yellow(out).reshape(rgb01.shape)
 
 
 def project_to_locus(chroma, locus):

@@ -1,6 +1,6 @@
 [package]
 name = "gc2607-isp"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Software ISP for the GalaxyCore GC2607 colour camera (MateBook X Pro 2024)."
 license = "MIT"

@@ -168,10 +168,42 @@ fn mhc(y: u32, x: u32) -> vec3<f32> {
     else { return vec3<f32>(at_g_vcol, c, at_g_hrow); }                            // Gb
 }
 
+// Yellow-desaturation operator (mirrors pipeline::desaturate_yellow). Scales the
+// chroma of yellow / orange-yellow hues toward their luminance gray by
+// YELLOW_DESAT_K, preserving luma and hue; other hues and neutrals pass through.
+const YELLOW_DESAT_K: f32 = 0.70;
+const YELLOW_HUE_LO: f32 = 35.0;
+const YELLOW_HUE_HI: f32 = 80.0;
+const YELLOW_HUE_SOFT: f32 = 12.0;
+
+fn desaturate_yellow(c: vec3<f32>) -> vec3<f32> {
+    let lr = max(c.x, 0.0);
+    let lg = max(c.y, 0.0);
+    let lb = max(c.z, 0.0);
+    let mx = max(lr, max(lg, lb));
+    let mn = min(lr, min(lg, lb));
+    let d = mx - mn;
+    if (mx <= 0.0 || d <= 0.0) { return c; }
+    var h: f32;
+    if (lr >= lg && lr >= lb) { h = (lg - lb) / d; }
+    else if (lg >= lb) { h = 2.0 + (lb - lr) / d; }
+    else { h = 4.0 + (lr - lg) / d; }
+    h = h * 60.0;
+    if (h < 0.0) { h = h + 360.0; }
+    let rise = clamp((h - YELLOW_HUE_LO) / YELLOW_HUE_SOFT, 0.0, 1.0);
+    let fall = clamp((YELLOW_HUE_HI - h) / YELLOW_HUE_SOFT, 0.0, 1.0);
+    let win = min(rise, fall);
+    if (win <= 0.0) { return c; }
+    let keff = 1.0 - win * (1.0 - YELLOW_DESAT_K);
+    let y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    return vec3<f32>(y) + keff * (c - vec3<f32>(y));
+}
+
 // Hue-sectored colour correction (mirrors pipeline::acm_color). `s` is the
 // white-balanced linear pixel (0..1). The hue/saturation that select the sector
 // come from the globally-corrected colour `ccm * s`; the result fades between the
-// global CCM (low saturation) and the per-sector matrix (high saturation).
+// global CCM (low saturation) and the per-sector matrix (high saturation), then
+// the yellow-desaturation operator is applied.
 fn acm_apply(s: vec3<f32>) -> vec3<f32> {
     let g0 = P.ccm0.x * s.x + P.ccm0.y * s.y + P.ccm0.z * s.z;
     let g1 = P.ccm1.x * s.x + P.ccm1.y * s.y + P.ccm1.z * s.z;
@@ -213,11 +245,11 @@ fn acm_apply(s: vec3<f32>) -> vec3<f32> {
         let ms = acm[ba + k] * (1.0 - frac) + acm[bb + k] * frac;
         m[k] = cc[k] * (1.0 - w) + ms * w;
     }
-    return vec3<f32>(
+    return desaturate_yellow(vec3<f32>(
         m[0] * s.x + m[1] * s.y + m[2] * s.z,
         m[3] * s.x + m[4] * s.y + m[5] * s.z,
         m[6] * s.x + m[7] * s.y + m[8] * s.z,
-    );
+    ));
 }
 
 // Linear CFA-scale RGB -> hue-sectored CCM -> sRGB gamma -> 0..255 (rounded).

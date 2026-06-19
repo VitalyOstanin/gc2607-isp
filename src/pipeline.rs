@@ -463,11 +463,69 @@ pub fn interp_acm(cct: f64) -> AcmFrame {
     AcmFrame { mats }
 }
 
+/// Rec. 709 luma weights for the luminance-preserving yellow desaturation.
+const LUMA_R: f64 = 0.2126;
+const LUMA_G: f64 = 0.7152;
+const LUMA_B: f64 = 0.0722;
+
+/// Yellow-desaturation operator (applied to the ACM output). The calibrated
+/// CCM/ACM carry a high saturation gain; for a saturated yellow the blue row's
+/// large `-G` term removes almost all blue (input blue ~0.21 -> ~0.03), pushing
+/// saturation from ~0.53 to ~0.94 — far purer than ground truth (an external
+/// reference camera renders the same shirt near 0.37). This scales the chroma of
+/// yellow / orange-yellow hues toward their luminance gray by [`YELLOW_DESAT_K`],
+/// preserving luma and hue and leaving every other hue (and neutrals) untouched.
+/// Constants mirror reference_pipeline.py and the WGSL shader (`gpu.rs`).
+pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
+const YELLOW_HUE_LO: f64 = 35.0;
+const YELLOW_HUE_HI: f64 = 80.0;
+const YELLOW_HUE_SOFT: f64 = 12.0;
+
+/// Scale the chroma of yellow-band pixels toward luminance gray. `(r, g, b)` is
+/// corrected linear RGB (the ACM output); returns the same outside the band.
+#[inline(always)]
+pub(crate) fn desaturate_yellow(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    // Hue from clamped channels (a slightly out-of-gamut negative must not flip
+    // the dominant hue), matching acm_color's hue convention.
+    let lr = r.max(0.0);
+    let lg = g.max(0.0);
+    let lb = b.max(0.0);
+    let mx = lr.max(lg).max(lb);
+    let mn = lr.min(lg).min(lb);
+    let d = mx - mn;
+    if mx <= 0.0 || d <= 0.0 {
+        return (r, g, b); // achromatic
+    }
+    let mut h = if lr >= lg && lr >= lb {
+        (lg - lb) / d
+    } else if lg >= lb {
+        2.0 + (lb - lr) / d
+    } else {
+        4.0 + (lr - lg) / d
+    };
+    h *= 60.0;
+    if h < 0.0 {
+        h += 360.0;
+    }
+    // Trapezoidal window over the yellow / orange-yellow band: full strength on
+    // the flat top, linear ramps of width YELLOW_HUE_SOFT at each edge.
+    let rise = ((h - YELLOW_HUE_LO) / YELLOW_HUE_SOFT).clamp(0.0, 1.0);
+    let fall = ((YELLOW_HUE_HI - h) / YELLOW_HUE_SOFT).clamp(0.0, 1.0);
+    let win = rise.min(fall);
+    if win <= 0.0 {
+        return (r, g, b);
+    }
+    let keff = 1.0 - win * (1.0 - YELLOW_DESAT_K);
+    let y = LUMA_R * r + LUMA_G * g + LUMA_B * b;
+    (y + keff * (r - y), y + keff * (g - y), y + keff * (b - y))
+}
+
 /// Apply the hue-sectored colour correction to one white-balanced linear pixel
 /// `(rl, gl, bl)` (0..1 scale, post-highlight-desaturation). `ccm` is the global
 /// matrix; `acm` the per-sector matrices for this frame's CCT. Returns the
-/// corrected linear RGB (before sRGB gamma). The hue/saturation that select the
-/// sector are taken from the globally-corrected colour `ccm * rgb`.
+/// corrected linear RGB (before sRGB gamma), with the yellow-desaturation
+/// operator applied. The hue/saturation that select the sector are taken from
+/// the globally-corrected colour `ccm * rgb`.
 #[inline(always)]
 pub(crate) fn acm_color(
     rl: f64,
@@ -523,7 +581,7 @@ pub(crate) fn acm_color(
         let ms = ma[k] * (1.0 - frac) + mb[k] * frac;
         m[k] = ccm[k] * (1.0 - w) + ms * w;
     }
-    (
+    desaturate_yellow(
         m[0] * rl + m[1] * gl + m[2] * bl,
         m[3] * rl + m[4] * gl + m[5] * bl,
         m[6] * rl + m[7] * gl + m[8] * bl,
@@ -1419,5 +1477,61 @@ impl Processor {
             DebayerMode::Mhc => (W, H),
         };
         Ok((w, h, &self.out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sat(r: f64, g: f64, b: f64) -> f64 {
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        if mx > 0.0 {
+            (mx - mn) / mx
+        } else {
+            0.0
+        }
+    }
+
+    fn luma(r: f64, g: f64, b: f64) -> f64 {
+        LUMA_R * r + LUMA_G * g + LUMA_B * b
+    }
+
+    /// A saturated yellow (high R≈G, crushed B — the shape the calibrated CCM/ACM
+    /// produces) must be pulled toward its luminance gray by exactly
+    /// `YELLOW_DESAT_K`, lifting blue and lowering saturation while leaving luma
+    /// unchanged.
+    #[test]
+    fn yellow_desaturated_toward_luma_by_k() {
+        let (r, g, b) = (0.50, 0.50, 0.03);
+        let (r2, g2, b2) = desaturate_yellow(r, g, b);
+        assert!(sat(r2, g2, b2) < sat(r, g, b), "saturation must drop");
+        assert!(b2 > b, "blue must be lifted");
+        assert!((luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12, "luma preserved");
+        let y = luma(r, g, b);
+        // Hue 60 deg sits in the flat top of the window -> full strength K.
+        assert!((r2 - (y + YELLOW_DESAT_K * (r - y))).abs() < 1e-12);
+        assert!((g2 - (y + YELLOW_DESAT_K * (g - y))).abs() < 1e-12);
+        assert!((b2 - (y + YELLOW_DESAT_K * (b - y))).abs() < 1e-12);
+    }
+
+    /// Achromatic and out-of-band hues (red, blue, cyan, skin-orange) are left
+    /// untouched: the operator targets yellow only.
+    #[test]
+    fn non_yellow_unchanged() {
+        for (r, g, b) in [
+            (0.40, 0.40, 0.40), // neutral gray
+            (0.60, 0.05, 0.05), // red, hue 0
+            (0.05, 0.05, 0.60), // blue, hue 240
+            (0.05, 0.50, 0.50), // cyan, hue 180
+            (0.60, 0.30, 0.05), // skin-orange, hue ~27 (below the band)
+        ] {
+            let (r2, g2, b2) = desaturate_yellow(r, g, b);
+            assert!(
+                (r2 - r).abs() < 1e-12 && (g2 - g).abs() < 1e-12 && (b2 - b).abs() < 1e-12,
+                "({r},{g},{b}) must be untouched, got ({r2},{g2},{b2})"
+            );
+        }
     }
 }
