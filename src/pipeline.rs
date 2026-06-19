@@ -1508,7 +1508,10 @@ mod tests {
         let (r2, g2, b2) = desaturate_yellow(r, g, b);
         assert!(sat(r2, g2, b2) < sat(r, g, b), "saturation must drop");
         assert!(b2 > b, "blue must be lifted");
-        assert!((luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12, "luma preserved");
+        assert!(
+            (luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12,
+            "luma preserved"
+        );
         let y = luma(r, g, b);
         // Hue 60 deg sits in the flat top of the window -> full strength K.
         assert!((r2 - (y + YELLOW_DESAT_K * (r - y))).abs() < 1e-12);
