@@ -99,8 +99,15 @@ def m_robust_neutral(rgb, locus):
     return m[0] / m[1], m[2] / m[1]
 
 
+# Axis 1 white-balance cooling: the blue WB gain is scaled by WB_BLUE_TRIM so
+# the emitted white point matches the external USB reference more closely.
+# CCT estimation runs on the untouched chroma, so CCM/ACM selection is
+# unaffected. Mirrors pipeline::WB_BLUE_TRIM (must stay identical).
+WB_BLUE_TRIM = 1.17
+
+
 def gains_from_chroma(rg, bg):
-    return np.array([1.0 / rg, 1.0, 1.0 / bg], dtype=np.float64)
+    return np.array([1.0 / rg, 1.0, (1.0 / bg) * WB_BLUE_TRIM], dtype=np.float64)
 
 
 def load_ccm_tuning():
