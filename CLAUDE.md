@@ -10,6 +10,7 @@ Guidance for AI agents working in this repository.
 - [Architecture](#architecture)
 - [Tuning data](#tuning-data)
 - [Build, run, test](#build-run-test)
+- [Before committing (CI gates)](#before-committing-ci-gates)
 - [Golden test](#golden-test)
 - [Dependency policy](#dependency-policy)
 - [Conventions](#conventions)
@@ -85,6 +86,27 @@ python3 tools/gen_golden.py      # regenerate golden artifacts (needs local raw)
 
 Builds are currently hermetic (std-only, no network). Keep stage-1 core
 dependency-free; add crates only per the dependency policy below.
+
+## Before committing (CI gates)
+
+The release CI (`.github/workflows/build-deb.yml`, triggered on tag `v*`) gates
+the deb build on the checks below, in this order. Run them locally before every
+commit: a failure here — including a formatting-only diff — aborts the run
+**before** the deb is built, so a release tag pointing at an unchecked commit
+produces no artifact and has to be re-pointed.
+
+```sh
+cargo fmt --all -- --check                                       # formatting
+cargo clippy --all-targets --features capture,gpu -- -D warnings # lints: warnings are errors
+cargo test --features capture                                    # unit + golden
+```
+
+- Formatting is the easiest gate to miss. If `--check` reports a diff, run
+  `cargo fmt --all`, re-stage, and re-run. Do this before committing, not after
+  the tag is pushed.
+- The GPU-parity test (`tests/gpu.rs`) is gated on `gpu,video` and is **not** run
+  by CI; when you touch `gpu.rs` (the WGSL shader), run it locally on a machine
+  with a Vulkan device: `cargo test --features gpu,video --test gpu`.
 
 ## Golden test
 
