@@ -103,7 +103,7 @@ def m_robust_neutral(rgb, locus):
 # the emitted white point matches the external USB reference more closely.
 # CCT estimation runs on the untouched chroma, so CCM/ACM selection is
 # unaffected. Mirrors pipeline::WB_BLUE_TRIM (must stay identical).
-WB_BLUE_TRIM = 1.17
+WB_BLUE_TRIM = 1.05
 
 
 def gains_from_chroma(rg, bg):
@@ -144,7 +144,7 @@ LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
 SKIN_HUE_LO = 0.0
 SKIN_HUE_HI = 28.0
 SKIN_HUE_SOFT = 10.0
-SKIN_DESAT_K = 0.80
+SKIN_DESAT_K = 0.10
 
 
 def desaturate_band(rgb, lo, hi, soft, k):

@@ -60,9 +60,12 @@ fn awb_ignores_dominant_saturated_object() {
     let est = pipeline::estimate(&planes);
 
     // Correct white balance neutralises the neutral surface: its raw chroma is
-    // (NEUTRAL_RG, NEUTRAL_BG), so the gains must be the reciprocals.
+    // (NEUTRAL_RG, NEUTRAL_BG), so the gains are the reciprocals — except the
+    // blue gain also carries the Axis-1 cooling trim (WB_BLUE_TRIM), applied on
+    // top of the neutral inverse. The test's point is robustness to the yellow
+    // object, so the expected blue includes the trim.
     let want_r = 1.0 / NEUTRAL_RG as f64; // ~1.394
-    let want_b = 1.0 / NEUTRAL_BG as f64; // ~2.690
+    let want_b = (1.0 / NEUTRAL_BG as f64) * pipeline::WB_BLUE_TRIM; // ~2.690 * 1.05
 
     assert!(
         (est.gains[0] - want_r).abs() < 0.05,

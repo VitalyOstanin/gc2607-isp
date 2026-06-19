@@ -485,7 +485,7 @@ const LUMA_B: f64 = 0.0722;
 /// CCTs (a deliberate simplification; cross-CCT safety is the sample-raw sanity
 /// check). Mirrors reference_pipeline.py::gains_from_chroma. Final value set by
 /// offline tuning (see docs/superpowers/plans).
-pub(crate) const WB_BLUE_TRIM: f64 = 1.17;
+pub const WB_BLUE_TRIM: f64 = 1.05;
 
 pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
 const YELLOW_HUE_LO: f64 = 35.0;
@@ -501,7 +501,7 @@ const YELLOW_HUE_SOFT: f64 = 12.0;
 const SKIN_HUE_LO: f64 = 0.0;
 const SKIN_HUE_HI: f64 = 28.0;
 const SKIN_HUE_SOFT: f64 = 10.0;
-pub(crate) const SKIN_DESAT_K: f64 = 0.80;
+pub(crate) const SKIN_DESAT_K: f64 = 0.10;
 
 /// Scale the chroma of pixels whose hue falls in the trapezoidal window
 /// `[lo, hi]` (linear ramps of width `soft` at each edge) toward their luminance

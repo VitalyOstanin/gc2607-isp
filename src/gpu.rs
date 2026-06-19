@@ -177,7 +177,7 @@ const YELLOW_HUE_HI: f32 = 80.0;
 const YELLOW_HUE_SOFT: f32 = 12.0;
 
 // Axis 2 skin-red desaturation band (mirrors pipeline.rs SKIN_* constants).
-const SKIN_DESAT_K: f32 = 0.80;
+const SKIN_DESAT_K: f32 = 0.10;
 const SKIN_HUE_LO: f32 = 0.0;
 const SKIN_HUE_HI: f32 = 28.0;
 const SKIN_HUE_SOFT: f32 = 10.0;
