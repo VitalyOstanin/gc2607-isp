@@ -492,10 +492,31 @@ const YELLOW_HUE_LO: f64 = 35.0;
 const YELLOW_HUE_HI: f64 = 80.0;
 const YELLOW_HUE_SOFT: f64 = 12.0;
 
-/// Scale the chroma of yellow-band pixels toward luminance gray. `(r, g, b)` is
-/// corrected linear RGB (the ACM output); returns the same outside the band.
+/// Skin-red desaturation band (Axis 2). The calibrated CCM/ACM oversaturate the
+/// red-orange skin sector (hue ~0..28 deg), which the yellow band (35..80 deg)
+/// does not cover, rendering skin redder than the USB reference (ΔR/G ≈ +0.62 on
+/// skin, ~0 on neutrals). This compresses the chroma of that band toward luma.
+/// Constants mirror reference_pipeline.py and the WGSL shader (gpu.rs). Final
+/// SKIN_DESAT_K set by offline tuning (see docs/superpowers/plans).
+const SKIN_HUE_LO: f64 = 0.0;
+const SKIN_HUE_HI: f64 = 28.0;
+const SKIN_HUE_SOFT: f64 = 10.0;
+pub(crate) const SKIN_DESAT_K: f64 = 0.80;
+
+/// Scale the chroma of pixels whose hue falls in the trapezoidal window
+/// `[lo, hi]` (linear ramps of width `soft` at each edge) toward their luminance
+/// gray by `k`, preserving luma and hue. `(r, g, b)` is corrected linear RGB;
+/// pixels outside the window (and achromatic ones) pass through unchanged.
 #[inline(always)]
-pub(crate) fn desaturate_yellow(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+pub(crate) fn desaturate_band(
+    r: f64,
+    g: f64,
+    b: f64,
+    lo: f64,
+    hi: f64,
+    soft: f64,
+    k: f64,
+) -> (f64, f64, f64) {
     // Hue from clamped channels (a slightly out-of-gamut negative must not flip
     // the dominant hue), matching acm_color's hue convention.
     let lr = r.max(0.0);
@@ -518,17 +539,24 @@ pub(crate) fn desaturate_yellow(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     if h < 0.0 {
         h += 360.0;
     }
-    // Trapezoidal window over the yellow / orange-yellow band: full strength on
-    // the flat top, linear ramps of width YELLOW_HUE_SOFT at each edge.
-    let rise = ((h - YELLOW_HUE_LO) / YELLOW_HUE_SOFT).clamp(0.0, 1.0);
-    let fall = ((YELLOW_HUE_HI - h) / YELLOW_HUE_SOFT).clamp(0.0, 1.0);
+    // Trapezoidal window: full strength on the flat top, linear ramps of width
+    // `soft` at each edge.
+    let rise = ((h - lo) / soft).clamp(0.0, 1.0);
+    let fall = ((hi - h) / soft).clamp(0.0, 1.0);
     let win = rise.min(fall);
     if win <= 0.0 {
         return (r, g, b);
     }
-    let keff = 1.0 - win * (1.0 - YELLOW_DESAT_K);
+    let keff = 1.0 - win * (1.0 - k);
     let y = LUMA_R * r + LUMA_G * g + LUMA_B * b;
     (y + keff * (r - y), y + keff * (g - y), y + keff * (b - y))
+}
+
+/// Yellow-desaturation operator: [`desaturate_band`] over the yellow / orange-
+/// yellow band. Preserved as a named wrapper for the existing callers/tests.
+#[inline(always)]
+pub(crate) fn desaturate_yellow(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    desaturate_band(r, g, b, YELLOW_HUE_LO, YELLOW_HUE_HI, YELLOW_HUE_SOFT, YELLOW_DESAT_K)
 }
 
 /// Apply the hue-sectored colour correction to one white-balanced linear pixel
@@ -592,11 +620,16 @@ pub(crate) fn acm_color(
         let ms = ma[k] * (1.0 - frac) + mb[k] * frac;
         m[k] = ccm[k] * (1.0 - w) + ms * w;
     }
-    desaturate_yellow(
+    let (cr, cg, cb) = desaturate_band(
         m[0] * rl + m[1] * gl + m[2] * bl,
         m[3] * rl + m[4] * gl + m[5] * bl,
         m[6] * rl + m[7] * gl + m[8] * bl,
-    )
+        SKIN_HUE_LO,
+        SKIN_HUE_HI,
+        SKIN_HUE_SOFT,
+        SKIN_DESAT_K,
+    );
+    desaturate_yellow(cr, cg, cb)
 }
 
 /// Chroma distance from scene `(rg, bg)` to LSC light source `k`.
@@ -1547,6 +1580,41 @@ mod tests {
             assert!(
                 (r2 - r).abs() < 1e-12 && (g2 - g).abs() < 1e-12 && (b2 - b).abs() < 1e-12,
                 "({r},{g},{b}) must be untouched, got ({r2},{g2},{b2})"
+            );
+        }
+    }
+
+    /// desaturate_band reproduces the old yellow operator when called with the
+    /// yellow constants: a saturated yellow is pulled toward luma by K, blue
+    /// lifts, luma is preserved.
+    #[test]
+    fn band_matches_legacy_yellow() {
+        let (r, g, b) = (0.50, 0.50, 0.03);
+        let (rb, gb, bb) = desaturate_band(r, g, b, 35.0, 80.0, 12.0, 0.70);
+        let (ry, gy, by) = desaturate_yellow(r, g, b);
+        assert!((rb - ry).abs() < 1e-12 && (gb - gy).abs() < 1e-12 && (bb - by).abs() < 1e-12);
+    }
+
+    /// A saturated skin-red (hue ~12, inside the skin band) is desaturated:
+    /// saturation drops, luma is preserved, hue stays (no channel crossing).
+    #[test]
+    fn skin_band_desaturates_red() {
+        let (r, g, b) = (0.60, 0.30, 0.15); // hue ~20 deg, inside 0..28 band
+        let (r2, g2, b2) = desaturate_band(r, g, b, 0.0, 28.0, 10.0, 0.80);
+        assert!(sat(r2, g2, b2) < sat(r, g, b), "skin saturation must drop");
+        assert!((luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12, "luma preserved");
+        assert!(r2 > g2 && g2 > b2, "channel order (hue) preserved");
+    }
+
+    /// Neutral gray and a hue outside the skin band (cyan) pass through the skin
+    /// band untouched.
+    #[test]
+    fn skin_band_leaves_neutral_and_outside_untouched() {
+        for (r, g, b) in [(0.40, 0.40, 0.40), (0.05, 0.50, 0.50)] {
+            let (r2, g2, b2) = desaturate_band(r, g, b, 0.0, 28.0, 10.0, 0.80);
+            assert!(
+                (r2 - r).abs() < 1e-12 && (g2 - g).abs() < 1e-12 && (b2 - b).abs() < 1e-12,
+                "({r},{g},{b}) must be untouched by the skin band"
             );
         }
     }
