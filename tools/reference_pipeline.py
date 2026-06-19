@@ -139,11 +139,19 @@ YELLOW_HUE_HI = 80.0
 YELLOW_HUE_SOFT = 12.0
 LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
 
+# Axis 2 skin-red desaturation band. Mirrors pipeline.rs SKIN_* constants
+# (must stay identical).
+SKIN_HUE_LO = 0.0
+SKIN_HUE_HI = 28.0
+SKIN_HUE_SOFT = 10.0
+SKIN_DESAT_K = 0.80
 
-def desaturate_yellow(rgb):
-    """Scale yellow-band chroma toward luminance gray (mirrors
-    pipeline::desaturate_yellow). `rgb` is corrected linear RGB (..,3); other
-    hues and neutrals pass through unchanged."""
+
+def desaturate_band(rgb, lo, hi, soft, k):
+    """Scale chroma of pixels whose hue falls in the trapezoidal window
+    [lo, hi] (ramps of width `soft`) toward luminance gray by `k`, preserving
+    luma and hue (mirrors pipeline::desaturate_band). `rgb` is corrected linear
+    RGB (..,3); pixels outside the window and neutrals pass through."""
     flat = rgb.reshape(-1, 3)
     lr = np.maximum(flat[:, 0], 0.0)
     lg = np.maximum(flat[:, 1], 0.0)
@@ -158,13 +166,19 @@ def desaturate_yellow(rgb):
     h = np.where(is_r, (lg - lb) / dd,
                  np.where(is_g, 2.0 + (lb - lr) / dd, 4.0 + (lr - lg) / dd)) * 60.0
     h = np.where(h < 0.0, h + 360.0, h)
-    rise = np.clip((h - YELLOW_HUE_LO) / YELLOW_HUE_SOFT, 0.0, 1.0)
-    fall = np.clip((YELLOW_HUE_HI - h) / YELLOW_HUE_SOFT, 0.0, 1.0)
+    rise = np.clip((h - lo) / soft, 0.0, 1.0)
+    fall = np.clip((hi - h) / soft, 0.0, 1.0)
     win = np.where(safe, np.minimum(rise, fall), 0.0)
-    keff = 1.0 - win * (1.0 - YELLOW_DESAT_K)
+    keff = 1.0 - win * (1.0 - k)
     y = (flat * LUMA_WEIGHTS).sum(1)
     out = y[:, None] + keff[:, None] * (flat - y[:, None])
     return out.reshape(rgb.shape)
+
+
+def desaturate_yellow(rgb):
+    """Yellow band over desaturate_band (mirrors pipeline::desaturate_yellow)."""
+    return desaturate_band(rgb, YELLOW_HUE_LO, YELLOW_HUE_HI, YELLOW_HUE_SOFT,
+                           YELLOW_DESAT_K)
 
 
 def load_acm():
@@ -237,6 +251,7 @@ def apply_acm(rgb01, ccm, sectors, hue0, hue_step):
     meff = ccmf[None, :] * (1.0 - w)[:, None] + ms * w[:, None]          # (P,9)
     m = meff.reshape(-1, 3, 3)
     out = np.einsum("pij,pj->pi", m, flat)
+    out = desaturate_band(out, SKIN_HUE_LO, SKIN_HUE_HI, SKIN_HUE_SOFT, SKIN_DESAT_K)
     return desaturate_yellow(out).reshape(rgb01.shape)
 
 
