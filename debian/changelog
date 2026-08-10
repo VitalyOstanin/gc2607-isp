@@ -1,3 +1,26 @@
+gc2607-isp (0.2.3) unstable; urgency=medium
+
+  * Video: reopen a stalled camera session instead of ending the daemon. A
+    capture stall (no completed request within the receive timeout, the state a
+    session spanning a system suspend is left in) used to exit with status 0,
+    which Restart=on-failure reads as a clean stop, leaving the loopback without
+    a producer until a manual restart. Such a session is now reopened in place
+    under a bounded doubling backoff, with standby frames written meanwhile;
+    only after five consecutive attempts without a frame does the daemon exit
+    non-zero for the service manager to restart it.
+  * Output: stamp standby frames with CLOCK_MONOTONIC. v4l2loopback copies the
+    producer's buffer timestamp to consumers rather than filling it in, so the
+    previously unset (zero) timestamp on standby frames made the first camera
+    frame look tens of thousands of seconds later; consumers that derive timing
+    from the stream ended the capture on the second frame.
+  * Colour: cool the white balance by a fixed blue trim and desaturate skin red
+    toward the reference, tuned offline and synced across the CPU pipeline, the
+    Python reference and the WGSL shader.
+  * Build: install rustfmt and clippy in the container image so the local gates
+    match CI, and restore the formatting/lint state the gates require.
+
+ -- Vitaly Ostanin <vitaly.ostanin@gmail.com>  Tue, 11 Aug 2026 00:15:00 +0300
+
 gc2607-isp (0.2.2) unstable; urgency=medium
 
   * Colour: desaturate the over-saturated yellow toward ground truth. The
