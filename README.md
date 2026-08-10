@@ -289,6 +289,12 @@ Prerequisites:
    "MateBook Camera (GC2607)" as a regular webcam. The sensor powers up only
    while an application is capturing and suspends again when it stops.
 
+   A camera session that stops delivering frames — what a system suspend/resume
+   cycle leaves behind — is reopened in place: the loopback stays open, so the
+   application keeps its device and sees a pause rather than a disappearing
+   webcam. Reopening is retried with a doubling backoff; if the camera stays
+   unavailable the daemon exits non-zero and the service manager restarts it.
+
 To remove the webcam service and loopback configuration, see
 [`packaging/README.md`](packaging/README.md#uninstall); the two DKMS packages are
 removed with `sudo apt remove gc2607-driver-dkms gc2607-ipu-bridge-dkms`.

@@ -56,6 +56,7 @@ use gc2607_isp::output::{
     LoopbackOutput,
 };
 use gc2607_isp::pipeline::{DebayerMode, Processor};
+use gc2607_isp::recovery;
 use gc2607_isp::sensor::Sensor;
 
 #[cfg(feature = "gpu")]
@@ -873,33 +874,62 @@ fn main() {
     };
 
     if on_demand {
-        run_on_demand(&mgr, &mut out, &mut engine, &sensor, &mut state, &args);
-    } else {
-        // Always-on: open and start the camera once, stream until a fatal error.
-        let mut session = cam_setup::open_raw(&mgr, WIDTH, HEIGHT)
-            .unwrap_or_else(|e| panic!("open raw camera: {e}"));
-        session.cam.start(None).expect("start");
-        if let Some(s) = &sensor {
-            let _ = s.apply(state);
+        if !run_on_demand(&mgr, &mut out, &mut engine, &sensor, &mut state, &args) {
+            // Exit non-zero so the failure is recorded and a service manager
+            // restarts the daemon rather than treating this as a clean stop.
+            std::process::exit(1);
         }
-        queue_initial(&mut session);
-        run_live(
-            &mut engine,
-            &mut out,
-            &mut session.cam,
-            &session.stream,
-            &session.rx,
-            &sensor,
-            &mut state,
-            &args,
-            false,
-        );
+    } else {
+        // Always-on: stream until a fatal error, reopening a lost session under
+        // the same policy as the on-demand path (there is no consumer to keep
+        // fed here, so the backoff is a plain sleep).
+        let mut attempt = 0u32;
+        loop {
+            match run_session(
+                &mgr,
+                &mut out,
+                &mut engine,
+                &sensor,
+                &mut state,
+                &args,
+                false,
+            ) {
+                LiveExit::Idle | LiveExit::Stop => break,
+                LiveExit::Lost { reason, frames } => {
+                    if frames > 0 {
+                        attempt = 0;
+                    }
+                    attempt += 1;
+                    match recovery::action(attempt) {
+                        recovery::Action::Retry(delay) => {
+                            eprintln!(
+                                "camera session lost ({reason}) after {frames} frames; \
+                                 reopening in {:.0}s (attempt {attempt}/{})",
+                                delay.as_secs_f64(),
+                                recovery::MAX_ATTEMPTS,
+                            );
+                            std::thread::sleep(delay);
+                        }
+                        recovery::Action::GiveUp => {
+                            eprintln!(
+                                "camera session lost ({reason}); {} recovery attempts \
+                                 produced no frame; stopping the daemon",
+                                recovery::MAX_ATTEMPTS,
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 /// Queue a freshly started session's initial requests, panicking on the first
 /// failure (a new session must accept its own buffers; a failure here means a
-/// broken setup, not a transient runtime condition).
+/// broken setup, not a transient runtime condition). Used by the one-off
+/// `--measure-delay` calibration; the live paths open sessions through
+/// [`run_session`], which reports such a failure as a recoverable loss instead.
 fn queue_initial(session: &mut cam_setup::Session<'_>) {
     for req in std::mem::take(&mut session.requests) {
         session
@@ -968,9 +998,67 @@ enum LiveExit {
     /// On-demand: the last consumer disconnected. The caller should stop the
     /// camera and wait for the next consumer.
     Idle,
-    /// A fatal condition (camera timeout or loopback write failure). The caller
-    /// should stop the daemon.
+    /// The camera session stopped delivering frames: either it stalled (no
+    /// completed request within `cam_setup::RECV_TIMEOUT`, which is what a
+    /// suspend/resume cycle leaves behind) or a buffer could not be requeued.
+    /// The session is unusable but the daemon is healthy, so the caller drops it
+    /// and opens a fresh one under the policy in [`recovery`].
+    ///
+    /// Carries the reason for the log and how many frames the session produced:
+    /// a session that did deliver frames was working, so its loss starts the
+    /// consecutive-failure count over rather than continuing it.
+    Lost { reason: &'static str, frames: u64 },
+    /// A fatal condition (the loopback output failed): reopening the camera
+    /// cannot help, so the caller should stop the daemon.
     Stop,
+}
+
+/// Drain the pending v4l2loopback client-usage events and return the last state
+/// observed (`None` when none were pending): true while at least one consumer is
+/// capturing.
+///
+/// The events are folded to the *last* one rather than accumulated: a
+/// disconnect immediately followed by a reconnect within the same drain pass (a
+/// fast consumer restart) leaves the camera running instead of triggering a
+/// needless stop/start cycle. Events queue up on the loopback fd, so a state
+/// change is never missed while the caller is busy elsewhere.
+fn drain_client_usage(out: &LoopbackOutput) -> Option<bool> {
+    let mut last = None;
+    loop {
+        match out.poll_client_usage() {
+            Ok(Some(active)) => last = Some(active),
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("client-usage event poll failed: {e}");
+                break;
+            }
+        }
+    }
+    last
+}
+
+/// Feed the loopback standby frames for `dwell` while a camera session is being
+/// reopened, so a consumer sees a paused stream instead of a device that
+/// stopped producing. Returns false if the consumer disconnected (or the
+/// loopback write failed) meanwhile, in which case there is nothing left to
+/// reopen the camera for.
+fn standby_dwell(out: &mut LoopbackOutput, standby: &[u8], dwell: Duration) -> bool {
+    let deadline = Instant::now() + dwell;
+    loop {
+        if drain_client_usage(out) == Some(false) {
+            println!("on-demand: consumer disconnected");
+            return false;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        if let Err(e) = out.write_frame(standby, 0) {
+            eprintln!("standby write failed: {e}");
+            return false;
+        }
+        std::thread::sleep(STANDBY_PERIOD.min(left));
+    }
 }
 
 /// Live path: run the capture/process/AE loop on an already-started `cam`,
@@ -1044,27 +1132,9 @@ fn run_live(
         // On-demand: stop as soon as the last consumer disconnects. The event
         // queue is drained non-blocking each iteration (~per frame), so the
         // shutdown latency is at most one frame.
-        if watch_consumer {
-            // Fold the drained events to the *last* observed state, matching the
-            // idle loop in `run_on_demand`. Accumulating `left |= !active` would
-            // trip Idle even when a disconnect is immediately followed by a
-            // reconnect within the same drain pass (a fast consumer restart),
-            // causing an unnecessary camera stop/start cycle.
-            let mut last_active: Option<bool> = None;
-            loop {
-                match out.poll_client_usage() {
-                    Ok(Some(active)) => last_active = Some(active),
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("client-usage event poll failed: {e}");
-                        break;
-                    }
-                }
-            }
-            if last_active == Some(false) {
-                println!("on-demand: consumer disconnected");
-                break LiveExit::Idle;
-            }
+        if watch_consumer && drain_client_usage(out) == Some(false) {
+            println!("on-demand: consumer disconnected");
+            break LiveExit::Idle;
         }
 
         // Block for one completed request, then drain any extra ready ones,
@@ -1072,8 +1142,12 @@ fn run_live(
         let mut req = match rx.recv_timeout(cam_setup::RECV_TIMEOUT) {
             Ok(r) => r,
             Err(_) => {
-                eprintln!("camera timed out, stopping");
-                break LiveExit::Stop;
+                // The caller logs this and reopens the session; a stall is the
+                // normal state of a session that spanned a system suspend.
+                break LiveExit::Lost {
+                    reason: "capture stalled",
+                    frames,
+                };
             }
         };
         while let Ok(newer) = rx.try_recv() {
@@ -1093,8 +1167,11 @@ fn run_live(
                 errors += 1;
                 req.reuse(ReuseFlag::REUSE_BUFFERS);
                 if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
-                    eprintln!("requeue after malformed frame failed: {e}; stopping");
-                    break LiveExit::Stop;
+                    eprintln!("requeue after malformed frame failed: {e}");
+                    break LiveExit::Lost {
+                        reason: "requeue after malformed frame failed",
+                        frames,
+                    };
                 }
                 continue;
             }
@@ -1168,8 +1245,11 @@ fn run_live(
 
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
-            eprintln!("requeue failed: {e}; stopping");
-            break LiveExit::Stop;
+            eprintln!("requeue failed: {e}");
+            break LiveExit::Lost {
+                reason: "requeue failed",
+                frames,
+            };
         }
 
         // Periodic throughput report.
@@ -1191,12 +1271,83 @@ fn run_live(
     exit
 }
 
+/// Open a camera session, stream it through [`run_live`], then stop and release
+/// it (libcamera's `Drop` calls stop + release, powering the sensor down via
+/// runtime PM).
+///
+/// Failing to open, start or prime the session is reported as
+/// [`LiveExit::Lost`] with no frames, so the caller applies to it the same retry
+/// policy it applies to a session that stalled mid-stream.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    mgr: &CameraManager,
+    out: &mut LoopbackOutput,
+    engine: &mut Engine,
+    sensor: &Option<Sensor>,
+    state: &mut AeState,
+    args: &Args,
+    watch_consumer: bool,
+) -> LiveExit {
+    let mut session = match cam_setup::open_raw(mgr, WIDTH, HEIGHT) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("open raw camera failed: {e}");
+            return LiveExit::Lost {
+                reason: "open failed",
+                frames: 0,
+            };
+        }
+    };
+    if let Err(e) = session.cam.start(None) {
+        eprintln!("camera start failed: {e}");
+        return LiveExit::Lost {
+            reason: "start failed",
+            frames: 0,
+        };
+    }
+    if let Some(s) = sensor {
+        let _ = s.apply(*state);
+    }
+    for req in std::mem::take(&mut session.requests) {
+        if let Err(e) = session.cam.queue_request(req).map_err(|(_, e)| e) {
+            eprintln!("queue initial request failed: {e}");
+            return LiveExit::Lost {
+                reason: "initial queue failed",
+                frames: 0,
+            };
+        }
+    }
+
+    let exit = run_live(
+        engine,
+        out,
+        &mut session.cam,
+        &session.stream,
+        &session.rx,
+        sensor,
+        state,
+        args,
+        watch_consumer,
+    );
+    drop(session);
+    if watch_consumer {
+        println!("on-demand: camera stopped");
+    }
+    exit
+}
+
 /// On-demand path: keep the loopback open so the virtual webcam stays visible,
 /// and open/start the GC2607 only while a consumer is capturing. Blocks on the
-/// client-usage event when idle; on connect, opens and starts the camera and
-/// runs [`run_live`] until the consumer disconnects ([`LiveExit::Idle`], back to
-/// idle) or a fatal error ([`LiveExit::Stop`], stop the daemon). Dropping the
-/// session stops and releases the camera, so the sensor powers down between uses.
+/// client-usage event when idle; on connect, runs sessions through
+/// [`run_session`] until the consumer disconnects ([`LiveExit::Idle`], back to
+/// idle) or the daemon must stop. Returns false when it must stop, so the caller
+/// can exit non-zero and have the service manager restart it.
+///
+/// A session lost mid-stream ([`LiveExit::Lost`] — a stall after suspend/resume
+/// being the typical case) is reopened here instead of ending the daemon: the
+/// loopback stays open, so the consumer keeps its negotiated device and sees only
+/// a pause in frames. The bounded backoff in [`recovery`] keeps a genuinely
+/// unavailable camera from spinning.
 ///
 /// The engine and AE `state` persist across activations: the GPU device is built
 /// once, and exposure/gain resume near their last values rather than re-converging
@@ -1208,7 +1359,7 @@ fn run_on_demand(
     sensor: &Option<Sensor>,
     state: &mut AeState,
     args: &Args,
-) {
+) -> bool {
     // Standby frame (black YUYV: Y=0, Cb/Cr=128) written while idle. Under
     // exclusive_caps=1 the loopback only presents a usable CAPTURE stream while a
     // producer is actively streaming, so a consumer cannot negotiate (let alone
@@ -1231,77 +1382,61 @@ fn run_on_demand(
         // polling the client-usage event between frames. The hardware camera and
         // ISP stay off; this is a plain memset+write, no per-pixel work.
         loop {
-            let mut active = None;
-            loop {
-                match out.poll_client_usage() {
-                    Ok(Some(a)) => active = Some(a),
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("client-usage event poll failed: {e}");
-                        break;
-                    }
-                }
-            }
-            if active == Some(true) {
+            if drain_client_usage(out) == Some(true) {
                 break;
             }
             // Standby frames carry no capture time; pass 0 so v4l2loopback
             // stamps them with the current time.
             if let Err(e) = out.write_frame(&standby, 0) {
                 eprintln!("standby write failed: {e}; stopping");
-                return;
+                return false;
             }
             std::thread::sleep(STANDBY_PERIOD);
         }
 
         println!("on-demand: consumer connected, starting camera");
-        let mut session = match cam_setup::open_raw(mgr, WIDTH, HEIGHT) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("open raw camera failed: {e}; back to idle");
-                continue;
+
+        // Keep a live session going for as long as this consumer stays. Only a
+        // session that produced no frames counts toward the failure bound, so a
+        // camera that works for a while and stalls again later gets the full
+        // budget of attempts each time.
+        let mut attempt = 0u32;
+        let keep_running = loop {
+            match run_session(mgr, out, engine, sensor, state, args, true) {
+                LiveExit::Idle => break true,
+                LiveExit::Stop => break false,
+                LiveExit::Lost { reason, frames } => {
+                    if frames > 0 {
+                        attempt = 0;
+                    }
+                    attempt += 1;
+                    match recovery::action(attempt) {
+                        recovery::Action::Retry(delay) => {
+                            eprintln!(
+                                "camera session lost ({reason}) after {frames} frames; \
+                                 reopening in {:.0}s (attempt {attempt}/{})",
+                                delay.as_secs_f64(),
+                                recovery::MAX_ATTEMPTS,
+                            );
+                            if !standby_dwell(out, &standby, delay) {
+                                break true;
+                            }
+                        }
+                        recovery::Action::GiveUp => {
+                            eprintln!(
+                                "camera session lost ({reason}); {} recovery attempts \
+                                 produced no frame; stopping the daemon",
+                                recovery::MAX_ATTEMPTS,
+                            );
+                            break false;
+                        }
+                    }
+                }
             }
         };
-        if let Err(e) = session.cam.start(None) {
-            eprintln!("camera start failed: {e}; back to idle");
-            continue;
-        }
-        if let Some(s) = sensor {
-            let _ = s.apply(*state);
-        }
-        let mut queued = true;
-        for req in std::mem::take(&mut session.requests) {
-            if let Err(e) = session.cam.queue_request(req).map_err(|(_, e)| e) {
-                eprintln!("queue initial request failed: {e}; back to idle");
-                queued = false;
-                break;
-            }
-        }
 
-        let exit = if queued {
-            run_live(
-                engine,
-                out,
-                &mut session.cam,
-                &session.stream,
-                &session.rx,
-                sensor,
-                state,
-                args,
-                true,
-            )
-        } else {
-            LiveExit::Idle
-        };
-
-        // Dropping the session stops and releases the camera (libcamera's Drop
-        // calls stop + release), powering the sensor down via runtime PM.
-        drop(session);
-        println!("on-demand: camera stopped");
-
-        match exit {
-            LiveExit::Idle => continue,
-            LiveExit::Stop => return,
+        if !keep_running {
+            return false;
         }
     }
 }

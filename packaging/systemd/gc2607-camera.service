@@ -16,6 +16,10 @@ Type=simple
 # --min-fps 30 keeps the frame rate steady (AE stops lowering fps below this and
 # uses gain instead); the GPU denoise sustains it even when high gain enables it.
 ExecStart=/usr/bin/gc2607-video --device-label "MateBook Camera (GC2607)" --on-demand auto --min-fps 30
+# A camera session that stalls (as one spanning a system suspend does) is
+# reopened by the daemon itself, so a restart here is the last resort rather
+# than the recovery path: the daemon exits non-zero only once reopening has
+# failed repeatedly, or when the loopback output itself fails.
 Restart=on-failure
 RestartSec=2
 

@@ -8,6 +8,7 @@
 pub mod ae;
 pub mod pipeline;
 pub mod raw;
+pub mod recovery;
 pub mod tuning;
 pub mod tuning_data;
 
