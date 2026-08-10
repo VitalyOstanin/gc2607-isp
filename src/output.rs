@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
+use nix::time::{clock_gettime, ClockId};
 use rayon::prelude::*;
 
 /// `V4L2_PIX_FMT_YUYV` four-character code.
@@ -251,6 +252,17 @@ pub fn find_loopback_by_label(label: &str) -> io::Result<PathBuf> {
     ))
 }
 
+/// Current `CLOCK_MONOTONIC` reading in nanoseconds — the clock libcamera stamps
+/// captured frames with, so frames of both origins (camera and standby) share one
+/// time base. Falls back to 1 ns on the (not observable in practice) failure of
+/// `clock_gettime`, which is still a valid non-zero timestamp.
+fn monotonic_ns() -> u64 {
+    match clock_gettime(ClockId::CLOCK_MONOTONIC) {
+        Ok(ts) => ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64,
+        Err(_) => 1,
+    }
+}
+
 /// One MMAP-ed output buffer shared with the kernel/v4l2loopback.
 struct MappedBuffer {
     ptr: NonNull<c_void>,
@@ -377,9 +389,13 @@ impl LoopbackOutput {
 
     /// Queue one YUYV frame for output, stamped with `timestamp_ns` (a
     /// `CLOCK_MONOTONIC` nanosecond count — libcamera's capture time). A zero
-    /// `timestamp_ns` leaves the timestamp unset, so v4l2loopback stamps the
-    /// frame with the current time (used for standby frames). The buffer must be
-    /// exactly [`Self::frame_size`].
+    /// `timestamp_ns` means "no capture time of its own" (standby frames) and is
+    /// replaced by the current `CLOCK_MONOTONIC` reading: v4l2loopback reports
+    /// `V4L2_BUF_FLAG_TIMESTAMP_COPY` and hands the producer's timestamp to
+    /// consumers verbatim, so an unset one reaches them as zero and makes the
+    /// first real frame look seconds-to-hours in the future (ffmpeg's `-t` then
+    /// ends the capture on the second frame). The buffer must be exactly
+    /// [`Self::frame_size`].
     ///
     /// Reclaims a previously queued buffer (blocking `DQBUF`) when all buffers
     /// are in flight; with >= 2 buffers one is always available right after a
@@ -451,12 +467,15 @@ impl LoopbackOutput {
             length: mb.len as u32,
             ..Default::default()
         };
-        if timestamp_ns != 0 {
-            qb.timestamp = V4l2Timeval {
-                tv_sec: (timestamp_ns / 1_000_000_000) as i64,
-                tv_usec: ((timestamp_ns % 1_000_000_000) / 1_000) as i64,
-            };
-        }
+        let ts = if timestamp_ns != 0 {
+            timestamp_ns
+        } else {
+            monotonic_ns()
+        };
+        qb.timestamp = V4l2Timeval {
+            tv_sec: (ts / 1_000_000_000) as i64,
+            tv_usec: ((ts % 1_000_000_000) / 1_000) as i64,
+        };
         // SAFETY: correctly-sized v4l2_buffer; fd open RW.
         unsafe { vidioc_qbuf(self.file.as_raw_fd(), &mut qb) }.map_err(|e| {
             self.free.push(idx);

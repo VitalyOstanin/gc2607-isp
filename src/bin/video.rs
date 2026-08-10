@@ -1385,8 +1385,10 @@ fn run_on_demand(
             if drain_client_usage(out) == Some(true) {
                 break;
             }
-            // Standby frames carry no capture time; pass 0 so v4l2loopback
-            // stamps them with the current time.
+            // Standby frames carry no capture time of their own; 0 asks the
+            // output to stamp them with the current CLOCK_MONOTONIC reading, the
+            // same time base the camera frames use (v4l2loopback copies the
+            // producer's timestamp to consumers, so it cannot fill it in).
             if let Err(e) = out.write_frame(&standby, 0) {
                 eprintln!("standby write failed: {e}; stopping");
                 return false;

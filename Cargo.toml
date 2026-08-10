@@ -16,7 +16,7 @@ libcamera = { version = "0.7", optional = true }
 # Own minimal V4L2 layer (sensor subdev control for AE, v4l2loopback output)
 # via raw ioctls. Optional: only the live video runtime needs it; the offline
 # ISP stays std-only. The `v4l` crate is avoided (stale, no output API).
-nix = { version = "0.31", optional = true, default-features = false, features = ["ioctl", "poll", "mman"] }
+nix = { version = "0.31", optional = true, default-features = false, features = ["ioctl", "poll", "mman", "time"] }
 # Data-parallel ISP for the live runtime. Optional: the offline ISP stays
 # single-threaded and std-only. Thread count is set at runtime (--threads).
 rayon = { version = "1.12", optional = true }
