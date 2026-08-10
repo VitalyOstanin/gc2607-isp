@@ -28,13 +28,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcamera-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust toolchain (pinned to match the host: 1.88.0). HOME/CARGO_HOME/RUSTUP_HOME
-# are set explicitly: `podman build` does not set HOME, so rustup would
-# otherwise install outside /root and cargo would be missing from PATH.
+# Rust toolchain (pinned to 1.88.0). HOME/CARGO_HOME/RUSTUP_HOME are set
+# explicitly: `podman build` does not set HOME, so rustup would otherwise
+# install outside /root and cargo would be missing from PATH.
+#
+# rustfmt and clippy are installed so the release CI gates (`cargo fmt --all --
+# --check`, `cargo clippy --all-targets --features capture,gpu -- -D warnings`)
+# can be run here, against the same toolchain the CI pins. A newer host rustfmt
+# formats some constructs differently, so checking on the host reports diffs the
+# CI would not: run the gates in this image.
 ENV HOME=/root CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain 1.88.0 \
-    && cargo --version
+              --component rustfmt,clippy \
+    && cargo --version && cargo fmt --version && cargo clippy --version
 
 WORKDIR /work

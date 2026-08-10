@@ -487,6 +487,11 @@ const LUMA_B: f64 = 0.0722;
 /// offline tuning (see docs/superpowers/plans).
 pub const WB_BLUE_TRIM: f64 = 1.05;
 
+/// The trim must cool, not warm: a value at or below 1.0 would shift the white
+/// point the wrong way. Checked at compile time so a mistuned constant fails the
+/// build rather than a test.
+const _: () = assert!(WB_BLUE_TRIM > 1.0);
+
 pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
 const YELLOW_HUE_LO: f64 = 35.0;
 const YELLOW_HUE_HI: f64 = 80.0;
@@ -556,7 +561,15 @@ pub(crate) fn desaturate_band(
 /// yellow band. Preserved as a named wrapper for the existing callers/tests.
 #[inline(always)]
 pub(crate) fn desaturate_yellow(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
-    desaturate_band(r, g, b, YELLOW_HUE_LO, YELLOW_HUE_HI, YELLOW_HUE_SOFT, YELLOW_DESAT_K)
+    desaturate_band(
+        r,
+        g,
+        b,
+        YELLOW_HUE_LO,
+        YELLOW_HUE_HI,
+        YELLOW_HUE_SOFT,
+        YELLOW_DESAT_K,
+    )
 }
 
 /// Apply the hue-sectored colour correction to one white-balanced linear pixel
@@ -1602,7 +1615,10 @@ mod tests {
         let (r, g, b) = (0.60, 0.30, 0.15); // hue ~20 deg, inside 0..28 band
         let (r2, g2, b2) = desaturate_band(r, g, b, 0.0, 28.0, 10.0, 0.80);
         assert!(sat(r2, g2, b2) < sat(r, g, b), "skin saturation must drop");
-        assert!((luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12, "luma preserved");
+        assert!(
+            (luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12,
+            "luma preserved"
+        );
         assert!(r2 > g2 && g2 > b2, "channel order (hue) preserved");
     }
 
@@ -1626,12 +1642,16 @@ mod tests {
     fn blue_gain_carries_wb_blue_trim() {
         let (rg, bg) = (0.638_f32, 0.447_f32); // a real on-locus scene chroma
         let est = estimate_from_chroma(rg, bg, None);
-        assert!((est.gains[0] - 1.0 / rg as f64).abs() < 1e-12, "red gain unchanged");
+        assert!(
+            (est.gains[0] - 1.0 / rg as f64).abs() < 1e-12,
+            "red gain unchanged"
+        );
         assert!((est.gains[1] - 1.0).abs() < 1e-12, "green gain is 1");
         assert!(
             (est.gains[2] - (1.0 / bg as f64) * WB_BLUE_TRIM).abs() < 1e-12,
             "blue gain = (1/bg) * WB_BLUE_TRIM"
         );
-        assert!(WB_BLUE_TRIM > 1.0, "trim must cool, not warm");
+        // That the trim cools rather than warms is asserted at compile time
+        // where the constant is defined.
     }
 }
