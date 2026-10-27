@@ -7,10 +7,7 @@ fn main() {
 }
 
 async fn run() {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
+    let instance = gc2607_isp::gpu::compute_instance().expect("Vulkan instance");
 
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {

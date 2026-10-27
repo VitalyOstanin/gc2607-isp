@@ -38,6 +38,49 @@ pub const OUT_H: usize = 1080;
 const WW: usize = W / 2; // 964
 const HH: usize = H / 2; // 544
 
+/// Vulkan instance extensions that make a driver open the DRM primary node
+/// (`/dev/dri/cardN`). wgpu-hal enables them unconditionally on Linux for DRM
+/// surfaces, which compute never uses. With them, Mesa ANV opens the primary
+/// node, and a process that opens it while no DRM master exists becomes the
+/// master. At boot that races the display manager: if the daemon wins, GNOME
+/// Shell fails to take the GPU (EBUSY, "No GPUs found") and no login screen
+/// appears. Without them, only the render node (`renderD128`) is opened.
+const DISPLAY_EXTENSIONS: [&std::ffi::CStr; 4] = [
+    c"VK_KHR_display",
+    c"VK_EXT_direct_mode_display",
+    c"VK_EXT_acquire_drm_display",
+    c"VK_KHR_get_display_properties2",
+];
+
+/// Create a compute-only Vulkan instance that never opens the DRM primary node.
+pub fn compute_instance() -> Result<wgpu::Instance, String> {
+    use wgpu::hal::vulkan;
+
+    let desc = wgpu::hal::InstanceDescriptor {
+        name: "gc2607-isp",
+        flags: Default::default(),
+        memory_budget_thresholds: Default::default(),
+        backend_options: Default::default(),
+        telemetry: None,
+        display: None,
+    };
+    // SAFETY: the callback only drops display extensions from the requested
+    // list. wgpu-hal uses them solely to create DRM surfaces, and that path
+    // checks the instance's actual extension list before use, so the instance
+    // stays valid for compute. `from_hal` takes ownership of a valid instance.
+    unsafe {
+        let hal = vulkan::Instance::init_with_callback(
+            &desc,
+            Some(Box::new(|args: vulkan::CreateInstanceCallbackArgs| {
+                args.extensions
+                    .retain(|ext| !DISPLAY_EXTENSIONS.contains(ext));
+            })),
+        )
+        .map_err(|e| format!("Vulkan instance: {e}"))?;
+        Ok(wgpu::Instance::from_hal::<wgpu::hal::api::Vulkan>(hal))
+    }
+}
+
 /// Uniform block shared by both compute passes. Laid out as `vec4`-aligned
 /// groups to match the WGSL `Params` struct (std140 / 16-byte alignment).
 #[repr(C)]
@@ -659,10 +702,7 @@ impl GpuProcessor {
     /// the pipeline binds 7 storage buffers in one compute stage and wgpu's
     /// downlevel defaults cap storage buffers at 4 (too few on ANV).
     async fn init_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        let instance = compute_instance()?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
