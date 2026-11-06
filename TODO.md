@@ -3,8 +3,10 @@
 ## Contents
 
 - [Image quality](#image-quality)
+- [Configuration](#configuration)
 - [Performance](#performance)
 - [Tooling](#tooling)
+- [CI](#ci)
 
 ## Image quality
 
@@ -15,6 +17,16 @@
       (`chroma_denoise_for_gain`, `temporal_luma_for_gain` in
       `src/bin/video.rs`) if needed. Pair this with the chroma box-blur
       running-sum optimization.
+
+## Configuration
+
+- [ ] Let the chroma-denoise radius be reachable at run time, as a key of
+      the run-time tuning file (`src/colour.rs`). `--denoise <scale>`
+      multiplies only the blend strength; the box-blur radius comes from the
+      gain-index table in `chroma_denoise_for_gain` (`src/bin/video.rs`), and at
+      gain indices 0..3 the radius is 0, so in good light chroma speckle cannot
+      be attenuated at all without a rebuild. Either let the scaler also raise
+      the radius, or expose radius and the gain thresholds as tuning keys.
 
 ## Performance
 
@@ -42,3 +54,13 @@
       shared parser, the flag set keeps growing, and `--help`/usage strings are
       maintained manually. A derive-based parser would give validation, generated
       help, and a single source of truth for the shared flags.
+
+## CI
+
+- [ ] Pin the CI runner host to the current Ubuntu LTS instead of `ubuntu-latest`.
+      GitHub keeps `ubuntu-latest` on the previous LTS for months after a new LTS
+      ships (until its runner image leaves preview), so `ubuntu-latest` is not the
+      latest LTS. `build-deb.yml` already builds the package inside an
+      `ubuntu:26.04` container (for libcamera 0.7), but the runner host
+      (`runs-on: ubuntu-latest`) still trails; pin it to the matching LTS runner
+      image (`ubuntu-26.04`, preview as of 2026-06) and bump when a newer LTS ships.

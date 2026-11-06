@@ -141,10 +141,10 @@ LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
 
 # Axis 2 skin-red desaturation band. Mirrors pipeline.rs SKIN_* constants
 # (must stay identical).
-SKIN_HUE_LO = 0.0
-SKIN_HUE_HI = 28.0
+SKIN_HUE_LO = -20.0
+SKIN_HUE_HI = 45.0
 SKIN_HUE_SOFT = 10.0
-SKIN_DESAT_K = 0.10
+SKIN_DESAT_K = 0.35
 
 
 def desaturate_band(rgb, lo, hi, soft, k):
@@ -165,7 +165,8 @@ def desaturate_band(rgb, lo, hi, soft, k):
     is_g = (~is_r) & (lg >= lb)
     h = np.where(is_r, (lg - lb) / dd,
                  np.where(is_g, 2.0 + (lb - lr) / dd, 4.0 + (lr - lg) / dd)) * 60.0
-    h = np.where(h < 0.0, h + 360.0, h)
+    # Signed hue in (-180, 180] so a band may straddle 0 deg.
+    h = np.where(h > 180.0, h - 360.0, h)
     rise = np.clip((h - lo) / soft, 0.0, 1.0)
     fall = np.clip((hi - h) / soft, 0.0, 1.0)
     win = np.where(safe, np.minimum(rise, fall), 0.0)

@@ -37,6 +37,8 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use libcamera::{
@@ -51,13 +53,15 @@ use libcamera::{
 
 use gc2607_isp::ae::{self, AeConfig, AeState};
 use gc2607_isp::camera as cam_setup;
+use gc2607_isp::colour::{self, Poll, TuningWatcher};
 use gc2607_isp::output::{
     denoise_chroma_yuyv, find_loopback_by_label, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv,
-    LoopbackOutput,
+    tint_selection_yuyv, LoopbackOutput, PlaneMapping,
 };
-use gc2607_isp::pipeline::{DebayerMode, Processor};
+use gc2607_isp::pipeline::{AwbStats, DebayerMode, Estimate, Processor};
 use gc2607_isp::recovery;
 use gc2607_isp::sensor::Sensor;
+use gc2607_isp::snapshot::{self, Snapshot};
 
 #[cfg(feature = "gpu")]
 use gc2607_isp::gpu::GpuProcessor;
@@ -151,6 +155,182 @@ impl Engine {
             ),
         }
     }
+
+    /// The most recent scene estimate (white balance, CCT, light source), for
+    /// the telemetry line. `None` until the first frame has been estimated.
+    fn estimate(&self) -> Option<&Estimate> {
+        match self {
+            Engine::Cpu { proc, .. } => proc.estimate(),
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => p.estimate(),
+        }
+    }
+
+    /// AWB diagnostics from the last estimate.
+    fn awb_stats(&self) -> AwbStats {
+        match self {
+            Engine::Cpu { proc, .. } => proc.awb_stats(),
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => p.awb_stats(),
+        }
+    }
+
+    /// Half-res plane indices the last AWB estimate measured on.
+    fn awb_selection(&self) -> &[usize] {
+        match self {
+            Engine::Cpu { proc, .. } => proc.awb_selection(),
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => p.awb_selection(),
+        }
+    }
+
+    /// Output frame size and where it sits on the AWB planes.
+    fn geometry(&self) -> (usize, usize, PlaneMapping) {
+        let (w, h) = (WIDTH as usize, HEIGHT as usize);
+        let full = PlaneMapping {
+            src_w: w,
+            src_h: h,
+            scale: 2,
+            plane_w: w / 2,
+        };
+        match self {
+            Engine::Cpu {
+                proc, dst_w, dst_h, ..
+            } => match proc.mode() {
+                DebayerMode::Mhc => (*dst_w, *dst_h, full),
+                DebayerMode::HalfRes => (
+                    *dst_w,
+                    *dst_h,
+                    PlaneMapping {
+                        src_w: w / 2,
+                        src_h: h / 2,
+                        scale: 1,
+                        plane_w: w / 2,
+                    },
+                ),
+            },
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => {
+                let (ow, oh) = p.out_dims();
+                (ow, oh, full)
+            }
+        }
+    }
+
+    /// Apply a run-time colour tuning from the next frame on.
+    fn set_tuning(&mut self, tuning: colour::ColourTuning) {
+        match self {
+            Engine::Cpu { proc, .. } => proc.set_tuning(tuning),
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => p.set_tuning(tuning),
+        }
+    }
+}
+
+/// How often the run-time colour tuning file is checked for changes.
+const TUNING_POLL: Duration = Duration::from_secs(1);
+
+/// Set by SIGUSR1: take a snapshot of the next frame.
+static SNAPSHOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigusr1(_: nix::libc::c_int) {
+    SNAPSHOT_SIGNAL.store(true, Ordering::Relaxed);
+}
+
+/// Route SIGUSR1 to a snapshot request (see [`LiveDebug`]).
+fn install_snapshot_signal() {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    let action = SigAction::new(
+        SigHandler::Handler(on_sigusr1),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    if let Err(e) = unsafe { sigaction(Signal::SIGUSR1, &action) } {
+        eprintln!("warning: SIGUSR1 snapshots unavailable: {e}");
+    }
+}
+
+/// Run-time debugging state of one live session: the tuning in effect (its
+/// `debug` switches and snapshot counter) and the scratch the diagnostics use.
+struct LiveDebug {
+    tuning: colour::ColourTuning,
+    // Snapshot counter seen at the last reload; `None` until the first load, so
+    // a counter left in the file does not fire at every session start.
+    snapshot_seen: Option<u64>,
+    snapshot_pending: bool,
+    snapshot_dir: PathBuf,
+    // Copy of the output frame, needed when it is tinted or snapshotted.
+    frame: Vec<u8>,
+    mask: Vec<bool>,
+}
+
+impl LiveDebug {
+    fn new(args: &Args) -> Self {
+        LiveDebug {
+            tuning: colour::ColourTuning::default(),
+            snapshot_seen: None,
+            snapshot_pending: false,
+            snapshot_dir: PathBuf::from(&args.snapshot_dir),
+            frame: Vec::new(),
+            mask: Vec::new(),
+        }
+    }
+}
+
+/// Check the colour tuning file and, if it changed, apply it to the engine and
+/// the AE configuration (`ae_target` falls back to the command-line value).
+fn poll_tuning(
+    watcher: &mut TuningWatcher,
+    engine: &mut Engine,
+    ae_cfg: &mut AeConfig,
+    live: &mut LiveDebug,
+    args: &Args,
+) {
+    match watcher.poll() {
+        Poll::Unchanged => {}
+        Poll::Changed(t, source) => {
+            println!("colour tuning ({source}): {t}");
+            ae_cfg.target = t.ae_target.unwrap_or(args.target);
+            if live.snapshot_seen.is_some_and(|s| s != t.snapshot) && t.snapshot != 0 {
+                live.snapshot_pending = true;
+            }
+            live.snapshot_seen = Some(t.snapshot);
+            live.tuning = t;
+            engine.set_tuning(t);
+        }
+        Poll::Rejected(e) => eprintln!("colour tuning rejected, keeping the previous one: {e}"),
+    }
+}
+
+/// One line of AWB diagnostics for the log (`debug_awb = 1`).
+fn awb_line(a: &AwbStats) -> String {
+    let ls: Vec<String> = a.ls_dist.iter().map(|d| format!("{d:.3}")).collect();
+    format!(
+        "awb: mask={} samples={}/{} ({:.1}%) raw rg={:.3} bg={:.3} locus_d={:.3} ls_d=[{}]",
+        a.level,
+        a.samples,
+        a.total,
+        100.0 * a.samples as f64 / a.total.max(1) as f64,
+        a.raw.0,
+        a.raw.1,
+        a.locus_dist,
+        ls.join(" ")
+    )
+}
+
+/// Hand a snapshot of this frame to a writer thread, so the PNG encoding does
+/// not stall the frame loop.
+fn spawn_snapshot(dir: PathBuf, snap: Snapshot) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!("snap-{secs}");
+    std::thread::spawn(move || match snapshot::write(&dir, &name, &snap) {
+        Ok(stem) => println!("snapshot: {}.{{raw,png,txt}}", stem.display()),
+        Err(e) => eprintln!("snapshot to {} failed: {e}", dir.display()),
+    });
 }
 
 // Native sensor geometry (single source of truth in `raw`).
@@ -191,6 +371,8 @@ struct Args {
     denoise: f64,
     temporal: f64,
     on_demand: OnDemandMode,
+    colour_config: String,
+    snapshot_dir: String,
 }
 
 fn parse_args() -> Args {
@@ -226,6 +408,10 @@ fn parse_args() -> Args {
     // On-demand camera gating: open the camera only while a consumer captures.
     // Auto by default (uses the v4l2loopback client-usage event when available).
     let mut on_demand = OnDemandMode::Auto;
+    // Run-time colour tuning file, re-read whenever it changes.
+    let mut colour_config = colour::DEFAULT_PATH.to_string();
+    // Where debug snapshots go (see `snapshot` in the tuning file, SIGUSR1).
+    let mut snapshot_dir = "/var/lib/gc2607-isp/snapshots".to_string();
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -233,6 +419,16 @@ fn parse_args() -> Args {
             "--device" => {
                 if let Some(v) = it.next() {
                     device = v;
+                }
+            }
+            "--snapshot-dir" => {
+                if let Some(v) = it.next() {
+                    snapshot_dir = v;
+                }
+            }
+            "--colour-config" => {
+                if let Some(v) = it.next() {
+                    colour_config = v;
                 }
             }
             "--device-label" => {
@@ -312,7 +508,8 @@ fn parse_args() -> Args {
                      [--debayer half|mhc] [--no-ae] [--no-lca] [--no-denoise] \
                      [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
                      [--target <0..1>] [--max-gain <idx>] [--min-fps <fps>] \
-                     [--threads <n>] [--on-demand auto|on|off] [--measure-delay]"
+                     [--threads <n>] [--on-demand auto|on|off] [--measure-delay] \
+                     [--colour-config <path>] [--snapshot-dir <dir>]"
                 );
                 std::process::exit(0);
             }
@@ -347,6 +544,8 @@ fn parse_args() -> Args {
         denoise,
         temporal,
         on_demand,
+        colour_config,
+        snapshot_dir,
     }
 }
 
@@ -820,6 +1019,7 @@ fn main() {
         .build_global()
         .expect("build rayon pool");
 
+    install_snapshot_signal();
     let (sensor, mut state) = init_sensor();
     let mgr = CameraManager::new().expect("CameraManager");
 
@@ -963,22 +1163,93 @@ enum FrameOutcome {
 /// one frame instead of killing the long-running daemon; the panic message is
 /// still printed by the default hook. ISP errors and write failures are returned
 /// as variants, not panics.
+/// Per-frame capture facts for [`process_and_write`].
+#[derive(Clone, Copy)]
+struct FrameMeta {
+    /// Analogue gain the frame was exposed with (selects the denoise strength).
+    gain_index: u8,
+    /// Capture timestamp, passed to the loopback.
+    timestamp_ns: u64,
+}
+
 fn process_and_write(
     engine: &mut Engine,
     out: &mut LoopbackOutput,
     buf: &[u8],
-    gain_index: u8,
-    timestamp_ns: u64,
+    meta: FrameMeta,
     args: &Args,
+    live: &mut LiveDebug,
+    state: &AeState,
 ) -> FrameOutcome {
+    let FrameMeta {
+        gain_index,
+        timestamp_ns,
+    } = meta;
     // Denoise strength for the gain this frame was exposed with; the engine
     // applies it (CPU in place, GPU as compute passes), so `yuyv` is the
     // denoised frame and the AE luma metric is metered on it (post-denoise).
-    let dn = DenoiseSpec::from_gain(gain_index, args);
+    // `debug_denoise = 0` bypasses it.
+    let dn = if live.tuning.debug.denoise {
+        DenoiseSpec::from_gain(gain_index, args)
+    } else {
+        DenoiseSpec {
+            chroma_radius: 0,
+            chroma_strength: 0.0,
+            temporal_alpha: 0.0,
+            temporal_motion: 0.0,
+        }
+    };
+    if SNAPSHOT_SIGNAL.swap(false, Ordering::Relaxed) {
+        live.snapshot_pending = true;
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let yuyv = match engine.process(buf, &dn) {
-            Ok(y) => y,
-            Err(e) => return FrameOutcome::Skipped(e.to_string()),
+        let tint = live.tuning.debug.awb_map;
+        let yuyv: &[u8] = if tint || live.snapshot_pending {
+            // Work on a copy: the engine's buffer is borrowed until the next
+            // frame, and the diagnostics need the engine again.
+            match engine.process(buf, &dn) {
+                Ok(y) => {
+                    live.frame.clear();
+                    live.frame.extend_from_slice(y);
+                }
+                Err(e) => return FrameOutcome::Skipped(e.to_string()),
+            }
+            let (w, h, map) = engine.geometry();
+            if live.snapshot_pending {
+                live.snapshot_pending = false;
+                let info = format!(
+                    "tuning: {}\nestimate: {:?}\n{}\nexposure={} gain_idx={} vblank={}\n\
+                     denoise_r={} temporal_a={:.2}\n",
+                    live.tuning,
+                    engine.estimate(),
+                    awb_line(&engine.awb_stats()),
+                    state.exposure,
+                    state.gain_index,
+                    state.vblank,
+                    dn.chroma_radius,
+                    dn.temporal_alpha,
+                );
+                spawn_snapshot(
+                    live.snapshot_dir.clone(),
+                    Snapshot {
+                        raw: buf.to_vec(),
+                        yuyv: live.frame.clone(),
+                        w,
+                        h,
+                        info,
+                    },
+                );
+            }
+            if tint {
+                let LiveDebug { frame, mask, .. } = live;
+                tint_selection_yuyv(frame, w, h, map, engine.awb_selection(), mask);
+            }
+            &live.frame
+        } else {
+            match engine.process(buf, &dn) {
+                Ok(y) => y,
+                Err(e) => return FrameOutcome::Skipped(e.to_string()),
+            }
         };
         let luma = mean_linear_luma(yuyv);
         match out.write_frame(yuyv, timestamp_ns) {
@@ -1083,12 +1354,18 @@ fn run_live(
     args: &Args,
     watch_consumer: bool,
 ) -> LiveExit {
-    let ae_cfg = AeConfig {
+    let mut ae_cfg = AeConfig {
         target: args.target,
         max_gain_index: args.max_gain,
         min_fps: args.min_fps,
         ..AeConfig::default()
     };
+    // Run-time colour tuning: applied before the first frame, then re-checked
+    // every TUNING_POLL so an edited file takes effect during a call.
+    let mut tuning = TuningWatcher::new(&args.colour_config);
+    let mut live = LiveDebug::new(args);
+    poll_tuning(&mut tuning, engine, &mut ae_cfg, &mut live, args);
+    let mut last_tuning_poll = Instant::now();
 
     let mut frames = 0u64;
     let mut dropped = 0u64;
@@ -1190,7 +1467,18 @@ fn run_live(
         // (see `process_and_write`). The output luma is metered inside as the AE
         // control variable; denoise is a no-op at low gain (the common case).
         let mut luma = None;
-        let processed = match process_and_write(engine, out, buf, frame_gain, ts, args) {
+        let processed = match process_and_write(
+            engine,
+            out,
+            buf,
+            FrameMeta {
+                gain_index: frame_gain,
+                timestamp_ns: ts,
+            },
+            args,
+            &mut live,
+            state,
+        ) {
             FrameOutcome::Written {
                 luma: m,
                 chroma_radius,
@@ -1252,16 +1540,33 @@ fn run_live(
             };
         }
 
+        if last_tuning_poll.elapsed() >= TUNING_POLL {
+            poll_tuning(&mut tuning, engine, &mut ae_cfg, &mut live, args);
+            last_tuning_poll = Instant::now();
+        }
+
         // Periodic throughput report.
         if last_report.elapsed() >= Duration::from_secs(2) {
             let fps = report_frames as f64 / last_report.elapsed().as_secs_f64();
+            // Scene colour: CCT, AWB gains (R, B; G is 1), the chosen LSC light
+            // source and the neutral chroma (r/g, b/g) the AWB settled on.
+            let colour = match engine.estimate() {
+                Some(e) => format!(
+                    "cct={:.0} wb_r={:.3} wb_b={:.3} ls={} rg={:.3} bg={:.3}",
+                    e.cct, e.gains[0], e.gains[2], e.ls, e.chroma.0, e.chroma.1
+                ),
+                None => "cct=- (no estimate yet)".to_string(),
+            };
             println!(
                 "{frames} frames, {fps:.1} fps processed, {dropped} dropped, {errors} errors, \
-                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}",
+                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}, {colour}",
                 state.exposure,
                 state.gain_index,
                 ae::frame_rate(state.vblank),
             );
+            if live.tuning.debug.awb {
+                println!("{}", awb_line(&engine.awb_stats()));
+            }
             last_report = Instant::now();
             report_frames = 0;
         }

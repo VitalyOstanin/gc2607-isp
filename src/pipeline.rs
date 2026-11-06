@@ -1,6 +1,7 @@
 //! ISP processing core (CPU). Mirrors the validated Python reference
 //! (`tools/reference_pipeline.py`) closely enough to pass the golden test.
 
+use crate::colour::ColourTuning;
 use crate::raw::{RawFrame, H, MAXLIN, W};
 use crate::tuning;
 use crate::tuning_data::{
@@ -203,6 +204,55 @@ pub(crate) struct AwbScratch {
     idx: Vec<usize>,
     rg: Vec<f32>,
     bg: Vec<f32>,
+    // Outcome of the last estimate, for the debug telemetry and the AWB map:
+    // which mask was used (1 = strictest .. 6, 7 = mean fallback), the measured
+    // chroma, and the plane size. After a mask succeeds `idx` holds exactly the
+    // pixels it measured on; after the fallback it is cleared.
+    level: u8,
+    raw: (f32, f32),
+    total: usize,
+}
+
+/// AWB diagnostics from the last estimate (see `debug_awb` in the tuning file).
+#[derive(Debug, Clone)]
+pub struct AwbStats {
+    /// Mask used: 1 = bright + near the white locus (strictest), 2 = near the
+    /// locus, 3 = bright, 4 = not clipped, 5 = bright incl. clipped, 6 = any
+    /// valid pixel, 7 = mean fallback.
+    pub level: u8,
+    /// Pixels the median was taken over, and pixels in the plane.
+    pub samples: usize,
+    pub total: usize,
+    /// Measured scene chroma `(r/g, b/g)` before temporal smoothing.
+    pub raw: (f32, f32),
+    /// Distance of the measured chroma to the calibrated white locus.
+    pub locus_dist: f64,
+    /// Distance of the measured chroma to each LSC light source.
+    pub ls_dist: Vec<f64>,
+}
+
+impl AwbScratch {
+    pub(crate) fn stats(&self) -> AwbStats {
+        let (rg, bg) = (self.raw.0 as f64, self.raw.1 as f64);
+        AwbStats {
+            level: self.level,
+            samples: if self.level < 7 { self.idx.len() } else { 0 },
+            total: self.total,
+            raw: self.raw,
+            locus_dist: locus_distance(rg, bg),
+            ls_dist: (0..LSC_CHROMA.len()).map(|k| ls_dist(k, rg, bg)).collect(),
+        }
+    }
+
+    /// Plane indices (`y * ww + x` on the half-res planes) the last estimate
+    /// measured on; empty after the mean fallback.
+    pub(crate) fn selection(&self) -> &[usize] {
+        if self.level < 7 {
+            &self.idx
+        } else {
+            &[]
+        }
+    }
 }
 
 /// Try one AWB pixel mask: collect the kept indices, and if there are enough,
@@ -240,6 +290,19 @@ pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
 /// bit-identical to the previous sort-based implementation: the same predicates
 /// select the same index sets and the percentile/median order statistics match.
 pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) {
+    let (raw, level) = robust_neutral_select(p, s);
+    s.level = level;
+    s.raw = raw;
+    s.total = p.hh * p.ww;
+    if level == 7 {
+        s.idx.clear();
+    }
+    raw
+}
+
+/// The mask cascade of [`robust_neutral_into`]; returns the chroma and the
+/// 1-based number of the mask that produced it (7 = mean fallback).
+fn robust_neutral_select(p: &Planes, s: &mut AwbScratch) -> ((f32, f32), u8) {
     let n = p.hh * p.ww;
     let clip = AWB_CLIP_FRACTION * MAXLIN;
 
@@ -249,6 +312,7 @@ pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) 
         idx,
         rg,
         bg,
+        ..
     } = s;
 
     green.clear();
@@ -274,30 +338,30 @@ pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) 
             && g[i] >= p60
             && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= AWB_LOCUS_MAX_DIST
     }) {
-        return r;
+        return (r, 1);
     }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
         g[i] > 1.0
             && p.r[i].max(g[i]).max(p.b[i]) < clip
             && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= AWB_LOCUS_MAX_DIST
     }) {
-        return r;
+        return (r, 2);
     }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
         g[i] > 1.0 && p.r[i].max(g[i]).max(p.b[i]) < clip && g[i] >= p60
     }) {
-        return r;
+        return (r, 3);
     }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
         g[i] > 1.0 && p.r[i].max(g[i]).max(p.b[i]) < clip
     }) {
-        return r;
+        return (r, 4);
     }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| g[i] > 1.0 && g[i] >= p60) {
-        return r;
+        return (r, 5);
     }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| g[i] > 1.0) {
-        return r;
+        return (r, 6);
     }
 
     // last resort: mean over valid green
@@ -312,9 +376,9 @@ pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) 
     // Degenerate (near-black) frame with no valid green: assume neutral rather
     // than dividing by zero and propagating NaN through the gains.
     if sg <= 0.0 {
-        return (1.0, 1.0);
+        return ((1.0, 1.0), 7);
     }
-    ((sr / sg) as f32, (sb / sg) as f32)
+    (((sr / sg) as f32, (sb / sg) as f32), 7)
 }
 
 /// Project chromaticity onto the locus polyline; return (segment index, t).
@@ -422,14 +486,30 @@ fn f9(m: &[f32; 9]) -> [f64; 9] {
 pub(crate) const ACM_SAT_KNEE: f64 = 0.10;
 
 /// The 24 per-sector colour matrices interpolated to one scene CCT, ready to
-/// apply per pixel. Built once per frame by [`interp_acm`].
+/// apply per pixel. Built once per frame by [`interp_acm`]. Carries the
+/// run-time colour tuning too, so every render path that applies the matrices
+/// also applies the tuned hue bands without a separate argument.
 pub struct AcmFrame {
     pub mats: [[f64; 9]; ACM_NSEC],
+    pub tuning: ColourTuning,
 }
 
 /// Interpolate the per-sector matrices by CCT, identically to [`interp_ccm`]
-/// (same calibration CCTs, same `searchsorted` bracket and linear blend).
+/// (same calibration CCTs, same `searchsorted` bracket and linear blend), with
+/// the built-in colour tuning.
 pub fn interp_acm(cct: f64) -> AcmFrame {
+    interp_acm_tuned(cct, &ColourTuning::default())
+}
+
+/// [`interp_acm`] with an explicit run-time colour tuning.
+pub fn interp_acm_tuned(cct: f64, tuning: &ColourTuning) -> AcmFrame {
+    let tuning = *tuning;
+    if !tuning.debug.ccm {
+        return AcmFrame {
+            mats: [IDENTITY3; ACM_NSEC],
+            tuning,
+        };
+    }
     let lo = CCM_CT[0] as f64;
     let hi = CCM_CT[NUM_CCM - 1] as f64;
     let c = cct.clamp(lo, hi);
@@ -445,13 +525,13 @@ pub fn interp_acm(cct: f64) -> AcmFrame {
         for (s, m) in mats.iter_mut().enumerate() {
             *m = f9(&ACM[0][s]);
         }
-        return AcmFrame { mats };
+        return AcmFrame { mats, tuning };
     }
     if j >= NUM_CCM {
         for (s, m) in mats.iter_mut().enumerate() {
             *m = f9(&ACM[NUM_CCM - 1][s]);
         }
-        return AcmFrame { mats };
+        return AcmFrame { mats, tuning };
     }
     let t = (c - CCM_CT[j - 1] as f64) / (CCM_CT[j] as f64 - CCM_CT[j - 1] as f64);
     for (s, m) in mats.iter_mut().enumerate() {
@@ -460,8 +540,11 @@ pub fn interp_acm(cct: f64) -> AcmFrame {
             m[k] = a[k] as f64 * (1.0 - t) + b[k] as f64 * t;
         }
     }
-    AcmFrame { mats }
+    AcmFrame { mats, tuning }
 }
+
+/// 3x3 identity, row-major: the colour matrices with `debug_ccm = 0`.
+const IDENTITY3: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
 /// Rec. 709 luma weights for the luminance-preserving yellow desaturation.
 const LUMA_R: f64 = 0.2126;
@@ -493,9 +576,9 @@ pub const WB_BLUE_TRIM: f64 = 1.05;
 const _: () = assert!(WB_BLUE_TRIM > 1.0);
 
 pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
-const YELLOW_HUE_LO: f64 = 35.0;
-const YELLOW_HUE_HI: f64 = 80.0;
-const YELLOW_HUE_SOFT: f64 = 12.0;
+pub(crate) const YELLOW_HUE_LO: f64 = 35.0;
+pub(crate) const YELLOW_HUE_HI: f64 = 80.0;
+pub(crate) const YELLOW_HUE_SOFT: f64 = 12.0;
 
 /// Skin-red desaturation band (Axis 2). The calibrated CCM/ACM oversaturate the
 /// red-orange skin sector (hue ~0..28 deg), which the yellow band (35..80 deg)
@@ -503,10 +586,68 @@ const YELLOW_HUE_SOFT: f64 = 12.0;
 /// skin, ~0 on neutrals). This compresses the chroma of that band toward luma.
 /// Constants mirror reference_pipeline.py and the WGSL shader (gpu.rs). Final
 /// SKIN_DESAT_K set by offline tuning (see docs/superpowers/plans).
-const SKIN_HUE_LO: f64 = 0.0;
-const SKIN_HUE_HI: f64 = 28.0;
-const SKIN_HUE_SOFT: f64 = 10.0;
-pub(crate) const SKIN_DESAT_K: f64 = 0.10;
+pub(crate) const SKIN_HUE_LO: f64 = -20.0;
+pub(crate) const SKIN_HUE_HI: f64 = 45.0;
+pub(crate) const SKIN_HUE_SOFT: f64 = 10.0;
+pub(crate) const SKIN_DESAT_K: f64 = 0.35;
+
+/// Weight of the trapezoidal hue window `[lo, hi]` (linear ramps of width
+/// `soft` at each edge) at the hue of corrected linear `(r, g, b)`: 1 on the
+/// flat top, 0 outside and for achromatic pixels. The hue is signed, in
+/// (-180, 180], so a band may straddle 0 deg.
+#[inline(always)]
+fn band_window(r: f64, g: f64, b: f64, lo: f64, hi: f64, soft: f64) -> f64 {
+    // Hue from clamped channels (a slightly out-of-gamut negative must not flip
+    // the dominant hue), matching acm_color's hue convention.
+    let lr = r.max(0.0);
+    let lg = g.max(0.0);
+    let lb = b.max(0.0);
+    let mx = lr.max(lg).max(lb);
+    let mn = lr.min(lg).min(lb);
+    let d = mx - mn;
+    if mx <= 0.0 || d <= 0.0 {
+        return 0.0; // achromatic
+    }
+    let mut h = if lr >= lg && lr >= lb {
+        (lg - lb) / d
+    } else if lg >= lb {
+        2.0 + (lb - lr) / d
+    } else {
+        4.0 + (lr - lg) / d
+    };
+    h *= 60.0;
+    // Signed hue in (-180, 180]: a band may straddle 0 deg (skin reds run from
+    // pinkish ~340 deg through 0 to orange), which a 0..360 hue would split.
+    if h > 180.0 {
+        h -= 360.0;
+    }
+    let rise = ((h - lo) / soft).clamp(0.0, 1.0);
+    let fall = ((hi - h) / soft).clamp(0.0, 1.0);
+    rise.min(fall)
+}
+
+/// Scale the chroma of `(r, g, b)` toward its luminance gray by `k`, preserving
+/// luma and hue.
+#[inline(always)]
+fn scale_chroma(r: f64, g: f64, b: f64, k: f64) -> (f64, f64, f64) {
+    let y = LUMA_R * r + LUMA_G * g + LUMA_B * b;
+    (y + k * (r - y), y + k * (g - y), y + k * (b - y))
+}
+
+/// Rotate the hue of `(r, g, b)` by `deg` degrees around the gray axis
+/// (positive: red toward yellow), then restore the original luma.
+#[inline(always)]
+fn rotate_hue(r: f64, g: f64, b: f64, deg: f64) -> (f64, f64, f64) {
+    // Rodrigues rotation about (1,1,1)/sqrt(3).
+    let (s, c) = deg.to_radians().sin_cos();
+    let a = (1.0 - c) / 3.0;
+    let q = s / 3f64.sqrt();
+    let r2 = (c + a) * r + (a - q) * g + (a + q) * b;
+    let g2 = (a + q) * r + (c + a) * g + (a - q) * b;
+    let b2 = (a - q) * r + (a + q) * g + (c + a) * b;
+    let dy = (LUMA_R * r + LUMA_G * g + LUMA_B * b) - (LUMA_R * r2 + LUMA_G * g2 + LUMA_B * b2);
+    (r2 + dy, g2 + dy, b2 + dy)
+}
 
 /// Scale the chroma of pixels whose hue falls in the trapezoidal window
 /// `[lo, hi]` (linear ramps of width `soft` at each edge) toward their luminance
@@ -522,43 +663,34 @@ pub(crate) fn desaturate_band(
     soft: f64,
     k: f64,
 ) -> (f64, f64, f64) {
-    // Hue from clamped channels (a slightly out-of-gamut negative must not flip
-    // the dominant hue), matching acm_color's hue convention.
-    let lr = r.max(0.0);
-    let lg = g.max(0.0);
-    let lb = b.max(0.0);
-    let mx = lr.max(lg).max(lb);
-    let mn = lr.min(lg).min(lb);
-    let d = mx - mn;
-    if mx <= 0.0 || d <= 0.0 {
-        return (r, g, b); // achromatic
-    }
-    let mut h = if lr >= lg && lr >= lb {
-        (lg - lb) / d
-    } else if lg >= lb {
-        2.0 + (lb - lr) / d
-    } else {
-        4.0 + (lr - lg) / d
-    };
-    h *= 60.0;
-    if h < 0.0 {
-        h += 360.0;
-    }
-    // Trapezoidal window: full strength on the flat top, linear ramps of width
-    // `soft` at each edge.
-    let rise = ((h - lo) / soft).clamp(0.0, 1.0);
-    let fall = ((hi - h) / soft).clamp(0.0, 1.0);
-    let win = rise.min(fall);
+    let win = band_window(r, g, b, lo, hi, soft);
     if win <= 0.0 {
         return (r, g, b);
     }
-    let keff = 1.0 - win * (1.0 - k);
-    let y = LUMA_R * r + LUMA_G * g + LUMA_B * b;
-    (y + keff * (r - y), y + keff * (g - y), y + keff * (b - y))
+    scale_chroma(r, g, b, 1.0 - win * (1.0 - k))
+}
+
+/// Skin band: rotate the hue by `shift` degrees and scale the chroma by `k`,
+/// both weighted by the band window. With `shift == 0` this is exactly
+/// [`desaturate_band`].
+#[inline(always)]
+fn adjust_skin(r: f64, g: f64, b: f64, t: &ColourTuning) -> (f64, f64, f64) {
+    let band = &t.skin;
+    let win = band_window(r, g, b, band.lo, band.hi, band.soft);
+    if win <= 0.0 {
+        return (r, g, b);
+    }
+    let (r, g, b) = if t.skin_hue_shift != 0.0 {
+        rotate_hue(r, g, b, t.skin_hue_shift * win)
+    } else {
+        (r, g, b)
+    };
+    scale_chroma(r, g, b, 1.0 - win * (1.0 - band.k))
 }
 
 /// Yellow-desaturation operator: [`desaturate_band`] over the yellow / orange-
 /// yellow band. Preserved as a named wrapper for the existing callers/tests.
+#[cfg(test)]
 #[inline(always)]
 pub(crate) fn desaturate_yellow(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     desaturate_band(
@@ -614,7 +746,8 @@ pub(crate) fn acm_color(
         h += 360.0;
     }
     let sat = d / mx;
-    let w = (sat / ACM_SAT_KNEE).clamp(0.0, 1.0);
+    let t = &acm.tuning;
+    let w = (sat / ACM_SAT_KNEE).clamp(0.0, 1.0) * t.acm_strength;
 
     // Sector bracket (centres evenly spaced; circular). `pos` is the fractional
     // sector position; the floor's modulo gives the lower neighbour, wrapping
@@ -633,16 +766,22 @@ pub(crate) fn acm_color(
         let ms = ma[k] * (1.0 - frac) + mb[k] * frac;
         m[k] = ccm[k] * (1.0 - w) + ms * w;
     }
-    let (cr, cg, cb) = desaturate_band(
+    let (cr, cg, cb) = (
         m[0] * rl + m[1] * gl + m[2] * bl,
         m[3] * rl + m[4] * gl + m[5] * bl,
         m[6] * rl + m[7] * gl + m[8] * bl,
-        SKIN_HUE_LO,
-        SKIN_HUE_HI,
-        SKIN_HUE_SOFT,
-        SKIN_DESAT_K,
     );
-    desaturate_yellow(cr, cg, cb)
+    if !t.debug.bands {
+        return (cr, cg, cb);
+    }
+    let (cr, cg, cb) = adjust_skin(cr, cg, cb, t);
+    let y = &t.yellow;
+    let (cr, cg, cb) = desaturate_band(cr, cg, cb, y.lo, y.hi, y.soft, y.k);
+    if t.saturation != 1.0 {
+        scale_chroma(cr, cg, cb, t.saturation)
+    } else {
+        (cr, cg, cb)
+    }
 }
 
 /// Chroma distance from scene `(rg, bg)` to LSC light source `k`.
@@ -680,16 +819,39 @@ pub(crate) fn smooth_chroma(prev: Option<(f32, f32)>, rg: f32, bg: f32) -> (f32,
 /// chosen scene chroma. `prev_ls` enables LSC switch hysteresis for the live
 /// runtimes; stateless callers pass `None`.
 pub(crate) fn estimate_from_chroma(rg: f32, bg: f32, prev_ls: Option<usize>) -> Estimate {
+    estimate_from_chroma_tuned(rg, bg, prev_ls, &ColourTuning::default())
+}
+
+/// [`estimate_from_chroma`] with the run-time tuning: a fixed scene chroma
+/// replaces the measured one, and the red/blue trims scale the gains.
+pub(crate) fn estimate_from_chroma_tuned(
+    rg: f32,
+    bg: f32,
+    prev_ls: Option<usize>,
+    t: &ColourTuning,
+) -> Estimate {
+    let (rg, bg) = match t.wb_fixed {
+        Some((frg, fbg)) => (frg as f32, fbg as f32),
+        None => (rg, bg),
+    };
     // Guard against a degenerate chroma (zero/NaN from a black frame): fall back
     // to neutral so the gains stay finite instead of becoming inf/NaN.
     let rg = if rg.is_finite() && rg > 0.0 { rg } else { 1.0 };
     let bg = if bg.is_finite() && bg > 0.0 { bg } else { 1.0 };
     // Blue gain carries the Axis-1 cooling trim; CCT below still uses the raw
     // chroma, so matrix selection is unaffected.
-    let gains = [1.0 / rg as f64, 1.0, (1.0 / bg as f64) * WB_BLUE_TRIM];
+    let gains = [
+        (1.0 / rg as f64) * t.wb_red_trim,
+        1.0,
+        (1.0 / bg as f64) * t.wb_blue_trim,
+    ];
     let cct = estimate_cct(rg as f64, bg as f64);
     let ls = select_ls_hyst(rg as f64, bg as f64, prev_ls);
-    let ccm = interp_ccm(cct);
+    let ccm = if t.debug.ccm {
+        interp_ccm(cct)
+    } else {
+        IDENTITY3
+    };
     Estimate {
         chroma: (rg, bg),
         gains,
@@ -781,6 +943,8 @@ pub fn srgb_to_linear(y: f64) -> f64 {
 /// when the selected source changes.
 pub struct Grids {
     pub ls: usize,
+    /// False for the flat unit grids of `debug_lsc = 0`.
+    pub lsc: bool,
     pub hh: usize,
     pub ww: usize,
     pub g_gr: Vec<f64>,
@@ -793,12 +957,32 @@ pub struct Grids {
 pub fn build_grids(ls: usize, hh: usize, ww: usize) -> Grids {
     Grids {
         ls,
+        lsc: true,
         hh,
         ww,
         g_gr: resize_grid(&tuning::lsc_grid(ls, 0), LSC_GH, LSC_GW, hh, ww),
         g_r: resize_grid(&tuning::lsc_grid(ls, 1), LSC_GH, LSC_GW, hh, ww),
         g_b: resize_grid(&tuning::lsc_grid(ls, 2), LSC_GH, LSC_GW, hh, ww),
         g_gb: resize_grid(&tuning::lsc_grid(ls, 3), LSC_GH, LSC_GW, hh, ww),
+    }
+}
+
+/// [`build_grids`], or flat unit grids (no lens-shading correction) when `lsc`
+/// is false.
+pub fn build_grids_tuned(ls: usize, hh: usize, ww: usize, lsc: bool) -> Grids {
+    if lsc {
+        return build_grids(ls, hh, ww);
+    }
+    let one = vec![1.0; hh * ww];
+    Grids {
+        ls,
+        lsc,
+        hh,
+        ww,
+        g_gr: one.clone(),
+        g_r: one.clone(),
+        g_b: one.clone(),
+        g_gb: one,
     }
 }
 
@@ -1358,6 +1542,10 @@ pub struct Processor {
     planar: Vec<f32>,
     lca: Option<Lca>,
     awb: AwbScratch,
+    tuning: ColourTuning,
+    // Re-estimate on the next frame regardless of the interval (a new tuning
+    // changes the gains and the matrices).
+    force_estimate: bool,
 }
 
 #[cfg(feature = "video")]
@@ -1398,7 +1586,30 @@ impl Processor {
             planar,
             lca,
             awb: AwbScratch::default(),
+            tuning: ColourTuning::default(),
+            force_estimate: false,
         }
+    }
+
+    /// Apply a new run-time colour tuning from the next frame on.
+    pub fn set_tuning(&mut self, tuning: ColourTuning) {
+        self.tuning = tuning;
+        self.force_estimate = true;
+    }
+
+    /// The debayer mode this processor renders in.
+    pub fn mode(&self) -> DebayerMode {
+        self.mode
+    }
+
+    /// AWB diagnostics from the last estimate.
+    pub fn awb_stats(&self) -> AwbStats {
+        self.awb.stats()
+    }
+
+    /// Half-res plane indices the last AWB estimate measured on.
+    pub fn awb_selection(&self) -> &[usize] {
+        self.awb.selection()
     }
 
     /// The most recent scene estimate, if any frame has been processed.
@@ -1417,13 +1628,19 @@ impl Processor {
         let (srg, sbg) = smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
         let prev_ls = self.est.as_ref().map(|e| e.ls);
-        let est = estimate_from_chroma(srg, sbg, prev_ls);
-        if self.grids.as_ref().map(|g| g.ls) != Some(est.ls) {
-            self.grids = Some(build_grids(est.ls, self.planes.hh, self.planes.ww));
+        let est = estimate_from_chroma_tuned(srg, sbg, prev_ls, &self.tuning);
+        let lsc = self.tuning.debug.lsc;
+        if self.grids.as_ref().map(|g| (g.ls, g.lsc)) != Some((est.ls, lsc)) {
+            self.grids = Some(build_grids_tuned(
+                est.ls,
+                self.planes.hh,
+                self.planes.ww,
+                lsc,
+            ));
         }
         // The per-sector matrices depend only on CCT; rebuilding them every
         // estimate is cheap (24 matrices x 9 lerps) and keeps them in step.
-        self.acm = Some(interp_acm(est.cct));
+        self.acm = Some(interp_acm_tuned(est.cct, &self.tuning));
         self.est = Some(est);
     }
 
@@ -1437,7 +1654,9 @@ impl Processor {
                 format!("raw too small: {} bytes, need >= {needed}", bytes.len()),
             ));
         }
-        let estimating = self.est.is_none() || self.frame % self.interval == 0;
+        let estimating =
+            self.est.is_none() || self.frame % self.interval == 0 || self.force_estimate;
+        self.force_estimate = false;
 
         match self.mode {
             DebayerMode::HalfRes => {
@@ -1495,7 +1714,7 @@ impl Processor {
                         gains,
                     );
                 }
-                if self.lca.is_some() {
+                if self.lca.is_some() && self.tuning.debug.lca {
                     {
                         let Self { planar, cfa, .. } = &mut *self;
                         mhc_to_planar_into(planar, cfa, W, H);
@@ -1620,6 +1839,113 @@ mod tests {
             "luma preserved"
         );
         assert!(r2 > g2 && g2 > b2, "channel order (hue) preserved");
+    }
+
+    /// A pinkish red just below 0 deg (hue ~350, flushed cheeks) is inside a
+    /// band that straddles 0 deg. With a 0..360 hue it fell outside the window
+    /// and kept full chroma while the surrounding skin was desaturated.
+    /// Hue (degrees, signed) of a linear RGB triple.
+    fn hue(r: f64, g: f64, b: f64) -> f64 {
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        let d = mx - mn;
+        let mut h = if mx == r {
+            (g - b) / d
+        } else if mx == g {
+            2.0 + (b - r) / d
+        } else {
+            4.0 + (r - g) / d
+        } * 60.0;
+        if h > 180.0 {
+            h -= 360.0;
+        }
+        h
+    }
+
+    /// With the colour matrices and the bands switched off, the colour stage
+    /// passes the white-balanced pixel through unchanged.
+    #[test]
+    fn debug_switches_bypass_colour_stage() {
+        let mut t = ColourTuning::default();
+        t.debug.ccm = false;
+        t.debug.bands = false;
+        let acm = interp_acm_tuned(4000.0, &t);
+        let est = estimate_from_chroma_tuned(0.6, 0.5, None, &t);
+        for &(r, g, b) in &[(0.60, 0.15, 0.22), (0.2, 0.4, 0.6), (0.3, 0.3, 0.3)] {
+            assert_eq!(acm_color(r, g, b, &est.ccm, &acm), (r, g, b));
+        }
+    }
+
+    /// The AWB statistics name the mask used and expose exactly its pixels.
+    #[test]
+    fn awb_stats_report_the_selection() {
+        // A uniform near-neutral grey on the white locus: the strictest mask
+        // (bright + near the locus) takes it.
+        let (hh, ww) = (20, 30);
+        let n = hh * ww;
+        let (rg, bg) = (CCM_LOCUS[2][0], CCM_LOCUS[2][1]);
+        let g = 400.0f32;
+        let p = Planes {
+            hh,
+            ww,
+            gr: vec![g; n],
+            gb: vec![g; n],
+            r: vec![g * rg; n],
+            b: vec![g * bg; n],
+        };
+        let mut s = AwbScratch::default();
+        robust_neutral_into(&p, &mut s);
+        let st = s.stats();
+        assert_eq!(st.level, 1);
+        assert_eq!((st.samples, st.total), (n, n));
+        assert!(st.locus_dist < 1e-3);
+        assert_eq!(st.ls_dist.len(), LSC_CHROMA.len());
+        assert_eq!(s.selection().len(), n);
+    }
+
+    /// A positive rotation turns a pinkish red toward orange and keeps luma.
+    #[test]
+    fn rotate_hue_turns_pink_toward_orange() {
+        let (r, g, b) = (0.60, 0.15, 0.22); // hue ~ -9 deg
+        let (r2, g2, b2) = rotate_hue(r, g, b, 15.0);
+        assert!(hue(r2, g2, b2) > hue(r, g, b) + 5.0, "hue must rise");
+        assert!(
+            (luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12,
+            "luma preserved"
+        );
+        let (r3, g3, b3) = rotate_hue(r, g, b, 0.0);
+        assert!((r3 - r).abs() < 1e-12 && (g3 - g).abs() < 1e-12 && (b3 - b).abs() < 1e-12);
+    }
+
+    /// With no hue shift the skin adjustment is exactly the band desaturation,
+    /// so the default tuning reproduces the reference render.
+    #[test]
+    fn adjust_skin_without_shift_is_desaturate_band() {
+        let t = ColourTuning::default();
+        for &(r, g, b) in &[
+            (0.60, 0.15, 0.22),
+            (0.5, 0.3, 0.2),
+            (0.2, 0.4, 0.6),
+            (0.3, 0.3, 0.3),
+        ] {
+            let a = adjust_skin(r, g, b, &t);
+            let s = &t.skin;
+            let d = desaturate_band(r, g, b, s.lo, s.hi, s.soft, s.k);
+            assert_eq!(a, d);
+        }
+    }
+
+    #[test]
+    fn skin_band_straddles_zero_hue() {
+        let (r, g, b) = (0.60, 0.15, 0.22); // hue ~350 deg
+        let (r2, g2, b2) = desaturate_band(r, g, b, -20.0, 28.0, 10.0, 0.35);
+        assert!(
+            sat(r2, g2, b2) < sat(r, g, b),
+            "pinkish-red saturation must drop"
+        );
+        assert!(
+            (luma(r2, g2, b2) - luma(r, g, b)).abs() < 1e-12,
+            "luma preserved"
+        );
     }
 
     /// Neutral gray and a hue outside the skin band (cyan) pass through the skin

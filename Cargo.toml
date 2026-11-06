@@ -16,7 +16,7 @@ libcamera = { version = "0.7", optional = true }
 # Own minimal V4L2 layer (sensor subdev control for AE, v4l2loopback output)
 # via raw ioctls. Optional: only the live video runtime needs it; the offline
 # ISP stays std-only. The `v4l` crate is avoided (stale, no output API).
-nix = { version = "0.31", optional = true, default-features = false, features = ["ioctl", "poll", "mman", "time"] }
+nix = { version = "0.31", optional = true, default-features = false, features = ["ioctl", "poll", "mman", "time", "signal"] }
 # Data-parallel ISP for the live runtime. Optional: the offline ISP stays
 # single-threaded and std-only. Thread count is set at runtime (--threads).
 rayon = { version = "1.12", optional = true }
@@ -42,6 +42,10 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 # that checks our own row-parallel MHC (pipeline::mhc_debayer) matches a known
 # implementation; not linked into any binary.
 demosaic = "0.3"
+# Parses and validates the WGSL shader in a unit test, so a shader error fails
+# `cargo test` instead of surfacing only when a GPU device builds the pipeline.
+# Same major version as the naga that wgpu pulls in.
+naga = { version = "29", features = ["wgsl-in"] }
 
 [lib]
 name = "gc2607_isp"

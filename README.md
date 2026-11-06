@@ -430,6 +430,8 @@ ffplay -f v4l2 /dev/video0
 | `--target <0..1>` | `0.15` | AE target mean brightness, in linear light (the output luma is metered with the sRGB gamma inverted). `0.15` linear ≈ gamma-encoded mid-grey `0.43`. |
 | `--max-gain <idx>` | `16` | AE max analogue-gain LUT index |
 | `--on-demand auto\|on\|off` | `auto` | open the camera and run the ISP only while an application is capturing (see [Roadmap](#roadmap)). `auto` self-gates when v4l2loopback exposes the client-usage event and otherwise streams always-on; `on` requires the event (warns and falls back if absent); `off` forces always-on. While idle the camera sensor stays runtime-suspended; the producer only writes cheap black keepalive frames so consumers can still negotiate the format. |
+| `--colour-config <path>` | `/etc/gc2607-isp/colour.conf` | run-time colour tuning file, re-read on every change (see [Run-time colour tuning](#run-time-colour-tuning)). An absent file means the built-in tuning. |
+| `--snapshot-dir <dir>` | `/var/lib/gc2607-isp/snapshots` | where debug snapshots are written (see [Run-time colour tuning](#run-time-colour-tuning)). |
 
 Performance (Core Ultra 185H): `mhc` sustains the sensor's 30 fps at 8 threads
 (~29 at 4); `half` reaches 30 fps at 4 threads (~27 single-threaded). The
@@ -441,6 +443,45 @@ path to within 1 LSB, `tests/gpu.rs`) while offloading the per-pixel work. In on
 fixed scene the whole-process CPU use dropped from ~154% (CPU `mhc`, 8 threads)
 to ~37% (GPU) at the same frame rate — roughly a 4x CPU reduction, which matters
 on this thermally constrained laptop.
+
+### Run-time colour tuning
+
+White balance trims, a fixed white balance, the skin and yellow hue bands
+(limits, desaturation, skin hue rotation), the strength of the per-hue-sector
+matrices, global saturation and the AE target can be changed while the camera
+is streaming, without a rebuild or a restart. Copy the annotated example, which
+lists every key at its default value, and edit it:
+
+```sh
+sudo mkdir -p /etc/gc2607-isp
+sudo cp /usr/share/gc2607-isp/colour.conf.example /etc/gc2607-isp/colour.conf
+sudoedit /etc/gc2607-isp/colour.conf
+journalctl -u gc2607-camera -f    # "colour tuning (...): ..." on every reload
+```
+
+The service checks the file once a second. A file with an unknown key or an
+out-of-range value is rejected with a log line, and the previous tuning stays in
+effect. Deleting the file returns to the built-in tuning. The keys apply to both
+the CPU and the GPU backend; the offline CLI and the golden test always use the
+built-in values.
+
+The same file carries debugging switches, also applied live:
+
+- `debug_lsc`, `debug_ccm`, `debug_bands`, `debug_denoise`, `debug_lca` set to
+  `0` bypass lens-shading correction, the colour matrices (the picture becomes
+  white-balanced sensor RGB), the hue bands with the saturation, the denoise and
+  the chromatic aberration correction, to see which stage spoils the colour;
+- `debug_awb = 1` adds an AWB line to the log every 2 s: which pixel mask was
+  used, how many pixels it kept, the measured chroma, its distance to the white
+  locus and to each lens-shading light source;
+- `debug_awb_map = 1` tints the pixels the AWB measured on in the output video
+  itself (the other side of a call sees the tint while it is on);
+- changing `snapshot` to a new non-zero number, or `sudo pkill -USR1
+  gc2607-video`, saves the current raw frame, the output frame as PNG and the
+  state (tuning, estimate, AWB, exposure) to `/var/lib/gc2607-isp/snapshots/`
+  (`--snapshot-dir`). This works during a call, when the loopback node cannot be
+  opened by a second reader. The `.raw` file is the format the offline
+  `gc2607-isp` CLI reads.
 
 ### Troubleshooting: washed-out / banded image after changing resolution
 

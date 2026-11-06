@@ -25,7 +25,8 @@ use std::io;
 
 use bytemuck::Zeroable;
 
-use crate::pipeline::{self, interp_acm, Estimate, Lca, ACM_SAT_KNEE};
+use crate::colour::ColourTuning;
+use crate::pipeline::{self, interp_acm_tuned, AwbStats, Estimate, Lca, ACM_SAT_KNEE};
 use crate::raw::{RawFrame, BLACK, H, MAXLIN, STRIDE_SAMPLES, W};
 use crate::tuning_data::{
     ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, LCA_CELL_X, LCA_CELL_Y, LCA_GH, LCA_GW,
@@ -98,6 +99,9 @@ struct Params {
     acm_cfg: [f32; 4],  // hue0, hue_step, sat_knee, nsec
     dn_i: [u32; 4],     // chroma_radius, chroma_on, temporal_on, temporal_reset
     dn_f: [f32; 4],     // chroma_strength, temporal_alpha, temporal_motion, _
+    skin: [f32; 4],     // skin band lo, hi, soft, k
+    yellow: [f32; 4],   // yellow band lo, hi, soft, k
+    tune: [f32; 4],     // skin hue shift (deg), saturation, acm strength, bands on
 }
 
 const SHADER: &str = r#"
@@ -114,6 +118,9 @@ struct Params {
     acm_cfg: vec4<f32>,
     dn_i: vec4<u32>,
     dn_f: vec4<f32>,
+    skin: vec4<f32>,
+    yellow: vec4<f32>,
+    tune: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -211,47 +218,69 @@ fn mhc(y: u32, x: u32) -> vec3<f32> {
     else { return vec3<f32>(at_g_vcol, c, at_g_hrow); }                            // Gb
 }
 
-// Yellow-desaturation operator (mirrors pipeline::desaturate_yellow). Scales the
-// chroma of yellow / orange-yellow hues toward their luminance gray by
-// YELLOW_DESAT_K, preserving luma and hue; other hues and neutrals pass through.
-const YELLOW_DESAT_K: f32 = 0.70;
-const YELLOW_HUE_LO: f32 = 35.0;
-const YELLOW_HUE_HI: f32 = 80.0;
-const YELLOW_HUE_SOFT: f32 = 12.0;
+// Hue bands and their run-time tuning (mirrors pipeline::band_window,
+// desaturate_band and adjust_skin). The band limits, strengths, skin hue shift,
+// global saturation and ACM strength arrive in P.skin / P.yellow / P.tune from
+// the host's ColourTuning, so they can change without rebuilding the shader.
 
-// Axis 2 skin-red desaturation band (mirrors pipeline.rs SKIN_* constants).
-const SKIN_DESAT_K: f32 = 0.10;
-const SKIN_HUE_LO: f32 = 0.0;
-const SKIN_HUE_HI: f32 = 28.0;
-const SKIN_HUE_SOFT: f32 = 10.0;
-
-// Trapezoidal-band chroma desaturation toward luma (mirrors
-// pipeline::desaturate_band). Pixels outside [lo,hi] and neutrals pass through.
-fn desaturate_band(c: vec3<f32>, lo: f32, hi: f32, soft: f32, k: f32) -> vec3<f32> {
+// Weight of the trapezoidal hue window [lo,hi] (ramps of width soft) at the
+// hue of c: 1 on the flat top, 0 outside and for neutrals.
+fn band_window(c: vec3<f32>, lo: f32, hi: f32, soft: f32) -> f32 {
     let lr = max(c.x, 0.0);
     let lg = max(c.y, 0.0);
     let lb = max(c.z, 0.0);
     let mx = max(lr, max(lg, lb));
     let mn = min(lr, min(lg, lb));
     let d = mx - mn;
-    if (mx <= 0.0 || d <= 0.0) { return c; }
+    if (mx <= 0.0 || d <= 0.0) { return 0.0; }
     var h: f32;
     if (lr >= lg && lr >= lb) { h = (lg - lb) / d; }
     else if (lg >= lb) { h = 2.0 + (lb - lr) / d; }
     else { h = 4.0 + (lr - lg) / d; }
     h = h * 60.0;
-    if (h < 0.0) { h = h + 360.0; }
+    // Signed hue in (-180, 180] so a band may straddle 0 deg.
+    if (h > 180.0) { h = h - 360.0; }
     let rise = clamp((h - lo) / soft, 0.0, 1.0);
     let fall = clamp((hi - h) / soft, 0.0, 1.0);
-    let win = min(rise, fall);
-    if (win <= 0.0) { return c; }
-    let keff = 1.0 - win * (1.0 - k);
-    let y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-    return vec3<f32>(y) + keff * (c - vec3<f32>(y));
+    return min(rise, fall);
 }
 
-fn desaturate_yellow(c: vec3<f32>) -> vec3<f32> {
-    return desaturate_band(c, YELLOW_HUE_LO, YELLOW_HUE_HI, YELLOW_HUE_SOFT, YELLOW_DESAT_K);
+fn luma(c: vec3<f32>) -> f32 {
+    return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+}
+
+fn scale_chroma(c: vec3<f32>, k: f32) -> vec3<f32> {
+    let y = luma(c);
+    return vec3<f32>(y) + k * (c - vec3<f32>(y));
+}
+
+// Rotate the hue by deg around the gray axis (positive: red toward yellow),
+// then restore the original luma.
+fn rotate_hue(c: vec3<f32>, deg: f32) -> vec3<f32> {
+    let th = radians(deg);
+    let co = cos(th);
+    let a = (1.0 - co) / 3.0;
+    let q = sin(th) / sqrt(3.0);
+    let r2 = vec3<f32>(
+        (co + a) * c.x + (a - q) * c.y + (a + q) * c.z,
+        (a + q) * c.x + (co + a) * c.y + (a - q) * c.z,
+        (a - q) * c.x + (a + q) * c.y + (co + a) * c.z,
+    );
+    return r2 + vec3<f32>(luma(c) - luma(r2));
+}
+
+fn desaturate_band(c: vec3<f32>, band: vec4<f32>) -> vec3<f32> {
+    let win = band_window(c, band.x, band.y, band.z);
+    if (win <= 0.0) { return c; }
+    return scale_chroma(c, 1.0 - win * (1.0 - band.w));
+}
+
+fn adjust_skin(c: vec3<f32>) -> vec3<f32> {
+    let win = band_window(c, P.skin.x, P.skin.y, P.skin.z);
+    if (win <= 0.0) { return c; }
+    var o = c;
+    if (P.tune.x != 0.0) { o = rotate_hue(c, P.tune.x * win); }
+    return scale_chroma(o, 1.0 - win * (1.0 - P.skin.w));
 }
 
 // Hue-sectored colour correction (mirrors pipeline::acm_color). `s` is the
@@ -279,7 +308,7 @@ fn acm_apply(s: vec3<f32>) -> vec3<f32> {
     h = h * 60.0;
     if (h < 0.0) { h = h + 360.0; }
     let sat = d / mx;
-    let w = clamp(sat / P.acm_cfg.z, 0.0, 1.0);
+    let w = clamp(sat / P.acm_cfg.z, 0.0, 1.0) * P.tune.z;
 
     let nsec = i32(P.acm_cfg.w);
     let pos = (h - P.acm_cfg.x) / P.acm_cfg.y;
@@ -305,8 +334,11 @@ fn acm_apply(s: vec3<f32>) -> vec3<f32> {
         m[3] * s.x + m[4] * s.y + m[5] * s.z,
         m[6] * s.x + m[7] * s.y + m[8] * s.z,
     );
-    let skin = desaturate_band(corrected, SKIN_HUE_LO, SKIN_HUE_HI, SKIN_HUE_SOFT, SKIN_DESAT_K);
-    return desaturate_yellow(skin);
+    if (P.tune.w == 0.0) { return corrected; } // debug_bands = 0
+    let skin = adjust_skin(corrected);
+    let yel = desaturate_band(skin, P.yellow);
+    if (P.tune.y != 1.0) { return scale_chroma(yel, P.tune.y); }
+    return yel;
 }
 
 // Linear CFA-scale RGB -> hue-sectored CCM -> sRGB gamma -> 0..255 (rounded).
@@ -608,7 +640,8 @@ pub struct GpuProcessor {
     temporal_was_on: bool,
     est: Option<Estimate>,
     chroma: Option<(f32, f32)>,
-    grids_ls: Option<usize>,
+    // Light source and LSC on/off of the uploaded grids.
+    grids_ls: Option<(usize, bool)>,
 
     yuyv_host: Vec<u8>,
     raw_needed: usize,
@@ -620,6 +653,11 @@ pub struct GpuProcessor {
     awb: pipeline::AwbScratch,
     acm_flat: Vec<f32>,
     grid_scratch: Vec<f32>,
+
+    // Run-time colour tuning, and whether it changed since the last estimate
+    // (forces a re-estimate on the next frame).
+    tuning: ColourTuning,
+    force_estimate: bool,
 }
 
 /// All persistent GPU buffers, produced by `GpuProcessor::create_buffers`. `cfa`,
@@ -695,6 +733,8 @@ impl GpuProcessor {
             awb: pipeline::AwbScratch::default(),
             acm_flat: Vec::with_capacity(ACM_NSEC * 9),
             grid_scratch: Vec::with_capacity(HH * WW),
+            tuning: ColourTuning::default(),
+            force_estimate: false,
         })
     }
 
@@ -994,6 +1034,22 @@ impl GpuProcessor {
         self.est.as_ref()
     }
 
+    /// Apply a new run-time colour tuning from the next frame on.
+    pub fn set_tuning(&mut self, tuning: ColourTuning) {
+        self.tuning = tuning;
+        self.force_estimate = true;
+    }
+
+    /// AWB diagnostics from the last estimate.
+    pub fn awb_stats(&self) -> AwbStats {
+        self.awb.stats()
+    }
+
+    /// Half-res plane indices the last AWB estimate measured on.
+    pub fn awb_selection(&self) -> &[usize] {
+        self.awb.selection()
+    }
+
     /// Re-estimate AWB/CCM on the CPU from `bytes`, and upload fresh LSC grids if
     /// the chosen light source changed.
     fn reestimate(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -1005,9 +1061,10 @@ impl GpuProcessor {
         let (srg, sbg) = pipeline::smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
         let prev_ls = self.est.as_ref().map(|e| e.ls);
-        let est = pipeline::estimate_from_chroma(srg, sbg, prev_ls);
-        if self.grids_ls != Some(est.ls) {
-            let grids = pipeline::build_grids(est.ls, HH, WW);
+        let est = pipeline::estimate_from_chroma_tuned(srg, sbg, prev_ls, &self.tuning);
+        let lsc = self.tuning.debug.lsc;
+        if self.grids_ls != Some((est.ls, lsc)) {
+            let grids = pipeline::build_grids_tuned(est.ls, HH, WW, lsc);
             // Reuse one f32 scratch buffer for the f64->f32 conversion of all
             // four grids instead of allocating a fresh Vec per grid.
             let queue = &self.queue;
@@ -1021,7 +1078,7 @@ impl GpuProcessor {
             upload(&self.grid_bufs[1], &grids.g_r);
             upload(&self.grid_bufs[2], &grids.g_b);
             upload(&self.grid_bufs[3], &grids.g_gb);
-            self.grids_ls = Some(est.ls);
+            self.grids_ls = Some((est.ls, lsc));
         }
         self.est = Some(est);
         Ok(())
@@ -1054,10 +1111,20 @@ impl GpuProcessor {
         self.params.ccm2 = [c[6] as f32, c[7] as f32, c[8] as f32, 0.0];
         self.params.lca = [LCA_GW as f32, LCA_GH as f32, LCA_CELL_X, LCA_CELL_Y];
         self.params.acm_cfg = [ACM_HUE0, ACM_HUE_STEP, ACM_SAT_KNEE as f32, ACM_NSEC as f32];
+        let t = &self.tuning;
+        let band = |b: &crate::colour::Band| [b.lo as f32, b.hi as f32, b.soft as f32, b.k as f32];
+        self.params.skin = band(&t.skin);
+        self.params.yellow = band(&t.yellow);
+        self.params.tune = [
+            t.skin_hue_shift as f32,
+            t.saturation as f32,
+            t.acm_strength as f32,
+            if t.debug.bands { 1.0 } else { 0.0 },
+        ];
 
         // Per-sector matrices for this CCT, flattened sector-major row-major into
         // the reused scratch buffer.
-        let acm = interp_acm(cct);
+        let acm = interp_acm_tuned(cct, &self.tuning);
         self.acm_flat.clear();
         self.acm_flat.extend(
             acm.mats
@@ -1087,7 +1154,8 @@ impl GpuProcessor {
         }
 
         // AWB/CCM on the CPU, occasionally.
-        if self.est.is_none() || self.frame % self.interval == 0 {
+        if self.est.is_none() || self.frame % self.interval == 0 || self.force_estimate {
+            self.force_estimate = false;
             self.reestimate(bytes)?;
             self.upload_params();
         }
@@ -1133,7 +1201,7 @@ impl GpuProcessor {
             let groups = ((W * H) as u32).div_ceil(64);
             pass.dispatch_workgroups(groups, 1, 1);
         }
-        if self.lca_on {
+        if self.lca_on && self.tuning.debug.lca {
             // Pass 2a: MHC into the planar RGB buffer (full frame interior).
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1239,5 +1307,23 @@ impl GpuProcessor {
 
         self.frame = self.frame.wrapping_add(1);
         Ok(&self.yuyv_host)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The shader must parse and validate. wgpu compiles it only when a device
+    /// builds the pipeline, so without this a WGSL error would pass every test
+    /// on a machine without a GPU and fail only at service start.
+    #[test]
+    fn shader_validates() {
+        let module = naga::front::wgsl::parse_str(super::SHADER)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(super::SHADER)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}"));
     }
 }

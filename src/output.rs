@@ -822,9 +822,138 @@ fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
     )
 }
 
+/// Inverse of [`rgb_to_ycbcr`] (full-range BT.601) for one pixel.
+fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let y = y as f32;
+    let cb = cb as f32 - CHROMA_NEUTRAL;
+    let cr = cr as f32 - CHROMA_NEUTRAL;
+    let px = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    [
+        px(y + 1.402 * cr),
+        px(y - 0.344_136 * cb - 0.714_136 * cr),
+        px(y + 1.772 * cb),
+    ]
+}
+
+/// Unpack a YUYV frame (`w*h*2` bytes) to RGB8 (`w*h*3`), for snapshots.
+pub fn yuyv_to_rgb(yuyv: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut rgb = vec![0u8; w * h * 3];
+    for (word, out) in yuyv[..w * h * 2]
+        .chunks_exact(4)
+        .zip(rgb.chunks_exact_mut(6))
+    {
+        let (y0, cb, y1, cr) = (word[0], word[1], word[2], word[3]);
+        out[..3].copy_from_slice(&ycbcr_to_rgb(y0, cb, cr));
+        out[3..].copy_from_slice(&ycbcr_to_rgb(y1, cb, cr));
+    }
+    rgb
+}
+
+/// Where the output frame sits on the half-res AWB planes: the output is a
+/// centre crop of a `src_w x src_h` render, and one plane pixel covers
+/// `scale x scale` render pixels (2 for full-res MHC, 1 for half-res).
+#[derive(Debug, Clone, Copy)]
+pub struct PlaneMapping {
+    pub src_w: usize,
+    pub src_h: usize,
+    pub scale: usize,
+    pub plane_w: usize,
+}
+
+/// Tint, in a YUYV frame, the pixel pairs whose plane pixel is in `selection`
+/// (plane indices `y * plane_w + x`). Luma is kept; the chroma is set to a
+/// saturated magenta that no real scene colour in this pipeline produces.
+/// `mask` is reusable scratch.
+pub fn tint_selection_yuyv(
+    yuyv: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+    map: PlaneMapping,
+    selection: &[usize],
+    mask: &mut Vec<bool>,
+) {
+    let plane_h = map.src_h / map.scale;
+    mask.clear();
+    mask.resize(map.plane_w * plane_h, false);
+    for &i in selection {
+        if let Some(m) = mask.get_mut(i) {
+            *m = true;
+        }
+    }
+    let off_x = (map.src_w - dst_w) / 2;
+    let off_y = (map.src_h - dst_h) / 2;
+    let mask = &mask[..];
+    yuyv.par_chunks_mut(dst_w * 2)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let py = (off_y + y) / map.scale;
+            for (pair, word) in row.chunks_exact_mut(4).enumerate() {
+                let x = pair * 2;
+                let hit = |dx: usize| mask[py * map.plane_w + (off_x + x + dx) / map.scale];
+                if hit(0) || hit(1) {
+                    word[1] = TINT_CB;
+                    word[3] = TINT_CR;
+                }
+            }
+        });
+}
+
+/// Chroma of the AWB-map tint (magenta).
+const TINT_CB: u8 = 200;
+const TINT_CR: u8 = 230;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// YUYV unpacking inverts the packing to within rounding.
+    #[test]
+    fn yuyv_round_trips_rgb() {
+        let (w, h) = (4, 2);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 29 % 256) as u8).collect();
+        // Use uniform pairs so chroma subsampling does not lose information.
+        let mut rgb2 = rgb.clone();
+        for p in (0..w * h).step_by(2) {
+            let (a, b) = rgb2.split_at_mut((p + 1) * 3);
+            b[..3].copy_from_slice(&a[p * 3..p * 3 + 3]);
+        }
+        let mut yuyv = vec![0u8; w * h * 2];
+        rgb_to_yuyv_crop(&rgb2, w, h, &mut yuyv, w, h);
+        let back = yuyv_to_rgb(&yuyv, w, h);
+        for (a, b) in rgb2.iter().zip(back.iter()) {
+            assert!((*a as i32 - *b as i32).abs() <= 2, "{a} vs {b}");
+        }
+    }
+
+    /// Only the selected plane pixels are tinted, and luma is untouched.
+    #[test]
+    fn tint_marks_only_selected_pixels() {
+        // 8x4 render, full-res mapping (scale 2) onto a 4x2 plane; output is the
+        // whole render.
+        let (w, h) = (8, 4);
+        let map = PlaneMapping {
+            src_w: w,
+            src_h: h,
+            scale: 2,
+            plane_w: 4,
+        };
+        let mut yuyv: Vec<u8> = (0..w * h * 2)
+            .map(|i| if i % 2 == 0 { 50 } else { 128 })
+            .collect();
+        let before = yuyv.clone();
+        let mut mask = Vec::new();
+        // Plane pixel (x=1, y=0) covers render x 2..3, y 0..1: word 1 of rows 0, 1.
+        tint_selection_yuyv(&mut yuyv, w, h, map, &[1], &mut mask);
+        for y in 0..h {
+            for pair in 0..w / 2 {
+                let o = (y * w + pair * 2) * 2;
+                let tinted = y < 2 && pair == 1;
+                assert_eq!(yuyv[o + 1] == TINT_CB, tinted, "row {y} pair {pair}");
+                assert_eq!(yuyv[o], before[o], "luma kept");
+                assert_eq!(yuyv[o + 2], before[o + 2], "luma kept");
+            }
+        }
+    }
 
     /// A YUYV frame with a per-pixel luma ramp and a checkerboard chroma. After
     /// chroma denoise the luma must be byte-identical and the chroma must move

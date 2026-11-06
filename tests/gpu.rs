@@ -11,11 +11,12 @@
 
 #![cfg(all(feature = "gpu", feature = "video"))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use gc2607_isp::colour::ColourTuning;
 use gc2607_isp::gpu::{DenoiseParams, GpuProcessor, OUT_H, OUT_W};
 use gc2607_isp::output::{denoise_chroma_yuyv, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv};
-use gc2607_isp::pipeline;
+use gc2607_isp::pipeline::{self, DebayerMode, Processor};
 use gc2607_isp::raw;
 
 fn data(name: &str) -> PathBuf {
@@ -40,7 +41,7 @@ fn diff_stats(a: &[u8], b: &[u8]) -> (i32, f64) {
 }
 
 /// CPU reference YUYV for the sample raw: estimate, full-res MHC, centre-crop pack.
-fn cpu_reference(raw_path: &PathBuf) -> Vec<u8> {
+fn cpu_reference(raw_path: &Path) -> Vec<u8> {
     let frame = raw::load_blc(raw_path).expect("raw");
     let planes = pipeline::bayer_planes(&frame);
     let est = pipeline::estimate(&planes);
@@ -83,6 +84,64 @@ fn gpu_yuyv_matches_cpu_mhc() {
     assert!(
         max_diff <= 4 && frac < 0.01,
         "GPU diverges from CPU MHC: max_diff={max_diff}, fraction |diff|>2 = {frac:.5}"
+    );
+}
+
+/// With every run-time colour knob away from its default, the GPU shader and
+/// the CPU live processor must still agree: both receive the same
+/// `ColourTuning`, and the shader's band, hue-rotation, saturation and ACM
+/// weighting mirror the CPU arithmetic.
+#[test]
+fn gpu_matches_cpu_with_runtime_tuning() {
+    let raw_path = data("sample-raw.bin");
+    if !raw_path.exists() {
+        eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
+        return;
+    }
+    let bytes = std::fs::read(&raw_path).expect("raw");
+    // Two tunings: every colour knob moved, then every stage switch off.
+    for text in [
+        "wb_red_trim = 1.05\nwb_blue_trim = 0.97\nacm_strength = 0.7\n\
+         skin_hue_lo = -40\nskin_hue_hi = 40\nskin_hue_soft = 12\nskin_desat_k = 0.5\n\
+         skin_hue_shift = 15\nyellow_desat_k = 0.8\nsaturation = 1.2\n",
+        "debug_lsc = 0\ndebug_ccm = 0\ndebug_bands = 0\ndebug_lca = 0\n",
+    ] {
+        compare_tuned(&raw_path, &bytes, text);
+    }
+}
+
+fn compare_tuned(raw_path: &Path, bytes: &[u8], text: &str) {
+    let tuning = ColourTuning::parse(text).expect("tuning");
+
+    let mut cpu_proc = Processor::new(DebayerMode::Mhc, 8, true);
+    cpu_proc.set_tuning(tuning);
+    let (w, h, rgb) = cpu_proc.process(bytes).expect("cpu process");
+    let mut cpu = vec![0u8; OUT_W * OUT_H * 2];
+    rgb_to_yuyv_crop(rgb, w, h, &mut cpu, OUT_W, OUT_H);
+
+    let mut proc = match GpuProcessor::new(8, true) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gpu: skipped (no usable Vulkan device: {e})");
+            return;
+        }
+    };
+    proc.set_tuning(tuning);
+    let gpu = proc
+        .process(bytes, DenoiseParams::default())
+        .expect("gpu process")
+        .to_vec();
+
+    // The tuning must actually change the picture, or the comparison proves
+    // nothing about the tuned arithmetic.
+    let (changed, _) = diff_stats(&cpu, &cpu_reference(raw_path));
+    assert!(changed > 10, "tuning left the CPU render unchanged");
+
+    let (max_diff, frac) = diff_stats(&gpu, &cpu);
+    eprintln!("gpu vs cpu ({text:?}): max_diff={max_diff}, fraction |diff|>2 = {frac:.5}");
+    assert!(
+        max_diff <= 4 && frac < 0.01,
+        "tuned GPU diverges from CPU: max_diff={max_diff}, fraction |diff|>2 = {frac:.5}"
     );
 }
 

@@ -1,0 +1,56 @@
+# gc2607-video run-time colour tuning.
+#
+# Copy to /etc/gc2607-isp/colour.conf and edit. The running service re-reads
+# the file within a second of every change, no restart needed; each reload is
+# logged (journalctl -u gc2607-camera). A file with an unknown key or an
+# out-of-range value is rejected and the previous tuning stays in effect.
+# Every key is optional; the values below are the built-in defaults.
+
+# White balance. Trims multiply the estimated red/blue gains (>1 adds that
+# colour). wb_fixed_rg/bg replace the AWB scene chroma (r/g, b/g; see "rg="
+# and "bg=" in the service log); set both, or 0 for automatic.
+wb_red_trim = 1.0       # 0.5..2.0
+wb_blue_trim = 1.05     # 0.5..2.0
+wb_fixed_rg = 0         # 0 or 0.1..4.0
+wb_fixed_bg = 0         # 0 or 0.1..4.0
+
+# Weight of the per-hue-sector colour matrices against the global one
+# (1 = calibrated, 0 = global matrix only).
+acm_strength = 1.0      # 0..1
+
+# Skin band. Hue in degrees, signed (-20 is pinkish red, 0 red, 30 orange).
+# Inside [lo, hi], with linear ramps of width soft at the edges, the chroma is
+# scaled by desat_k (<1 paler) and the hue rotated by hue_shift (positive:
+# toward orange, which turns a pinkish skin cast natural).
+skin_hue_lo = -20       # -180..180
+skin_hue_hi = 45        # -180..180, above lo
+skin_hue_soft = 10      # 0.5..90
+skin_desat_k = 0.35     # 0..1.5
+skin_hue_shift = 0      # -60..60
+
+# Yellow band, same meaning.
+yellow_hue_lo = 35
+yellow_hue_hi = 80
+yellow_hue_soft = 12
+yellow_desat_k = 0.70
+
+# Global chroma factor, applied last.
+saturation = 1.0        # 0..2
+
+# Auto-exposure target in linear light; 0 keeps the --target value (0.15).
+ae_target = 0           # 0 or 0.02..0.6
+
+# Debugging. Stage switches: 1 = on (default), 0 = the stage is bypassed, to
+# see which stage spoils the colour. Diagnostics: 0 = off (default).
+debug_lsc = 1           # lens-shading correction
+debug_ccm = 1           # colour matrices (0: white-balanced sensor RGB)
+debug_bands = 1         # skin/yellow bands and saturation above
+debug_denoise = 1       # chroma and temporal denoise
+debug_lca = 1           # chromatic aberration correction (if on at start)
+debug_awb = 0           # AWB statistics in the log every 2 s
+debug_awb_map = 0       # tint the pixels AWB measures on, in the video itself
+
+# Snapshot: change to a new non-zero number (or `kill -USR1` the service) to
+# save the current raw frame, the output frame (PNG) and the state to
+# /var/lib/gc2607-isp/snapshots/.
+snapshot = 0
