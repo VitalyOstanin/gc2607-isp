@@ -19,6 +19,18 @@ use gc2607_isp::output::{denoise_chroma_yuyv, rgb_to_yuyv_crop, temporal_denoise
 use gc2607_isp::pipeline::{self, DebayerMode, Processor};
 use gc2607_isp::raw;
 
+/// Serialises the tests of this file. Each builds its own Vulkan instance, and
+/// in a debug build wgpu names objects through the loader's debug-utils
+/// trampoline; when one test drops its instance while another is creating
+/// buffers, the loader unloads a library the other is calling into and the
+/// process crashes (seen intermittently with several tests in flight). The
+/// daemon has a single instance for its lifetime and is not affected.
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn data(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
@@ -53,6 +65,7 @@ fn cpu_reference(raw_path: &Path) -> Vec<u8> {
 
 #[test]
 fn gpu_yuyv_matches_cpu_mhc() {
+    let _gpu = gpu_lock();
     let raw_path = data("sample-raw.bin");
     if !raw_path.exists() {
         eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
@@ -93,6 +106,7 @@ fn gpu_yuyv_matches_cpu_mhc() {
 /// weighting mirror the CPU arithmetic.
 #[test]
 fn gpu_matches_cpu_with_runtime_tuning() {
+    let _gpu = gpu_lock();
     let raw_path = data("sample-raw.bin");
     if !raw_path.exists() {
         eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
@@ -152,6 +166,7 @@ fn compare_tuned(raw_path: &Path, bytes: &[u8], text: &str) {
 /// matches the mid gain table entry.
 #[test]
 fn gpu_chroma_denoise_matches_cpu() {
+    let _gpu = gpu_lock();
     let raw_path = data("sample-raw.bin");
     if !raw_path.exists() {
         eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
@@ -196,6 +211,7 @@ fn gpu_chroma_denoise_matches_cpu() {
 /// f32 blend itself shares its structure with the chroma blend validated above.
 #[test]
 fn gpu_temporal_denoise_seeds_first_frame() {
+    let _gpu = gpu_lock();
     let raw_path = data("sample-raw.bin");
     if !raw_path.exists() {
         eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
@@ -238,4 +254,48 @@ fn gpu_temporal_denoise_seeds_first_frame() {
         max_diff <= 4 && frac < 0.01,
         "GPU temporal seed frame altered luma: max_diff={max_diff}, frac>2 = {frac:.5}"
     );
+}
+
+/// The AWB measurement runs on a background thread and lands a few frames
+/// later. On a repeated frame the estimate it brings is the one the first frame
+/// waited for, so every later output must equal the first exactly; a stale,
+/// lost or mis-applied measurement would change the colour.
+#[test]
+fn gpu_background_awb_keeps_a_steady_frame_steady() {
+    let _gpu = gpu_lock();
+    let raw_path = data("sample-raw.bin");
+    if !raw_path.exists() {
+        eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
+        return;
+    }
+    let bytes = std::fs::read(&raw_path).expect("raw");
+    let mut proc = match GpuProcessor::new(4, true) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gpu: skipped (no usable Vulkan device: {e})");
+            return;
+        }
+    };
+    let first = proc
+        .process(&bytes, DenoiseParams::default())
+        .expect("gpu process")
+        .to_vec();
+    // Feed frames until three background measurements have been applied; the
+    // worker's speed depends on the build profile, so bound by time, not count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (mut applied, mut n) = (0u32, 0u32);
+    while applied < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background AWB applied only {applied} times in {n} frames"
+        );
+        n += 1;
+        let out = proc
+            .process(&bytes, DenoiseParams::default())
+            .expect("gpu process");
+        assert!(out == &first[..], "frame {n} differs from the first");
+        applied += proc.timing().estimate.is_some() as u32;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    eprintln!("background AWB: {applied} measurements applied over {n} frames");
 }

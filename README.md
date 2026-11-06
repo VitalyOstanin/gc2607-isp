@@ -479,6 +479,10 @@ The same file carries debugging switches, also applied live:
   locus and to each lens-shading light source;
 - `debug_awb_map = 1` tints the pixels the AWB measured on in the output video
   itself (the other side of a call sees the tint while it is on);
+- `debug_timing = 1` adds a timing line to the log every 2 s: mean and maximum
+  milliseconds of the frame interval, the wait for a capture, the ISP as a whole
+  and, on the GPU backend, its AWB estimate, submit, GPU wait and readback, the
+  diagnostics and the loopback write;
 - changing `snapshot` to a new non-zero number, or `sudo pkill -USR1
   gc2607-video`, saves the current raw frame, the output frame as PNG and the
   state (tuning, estimate, AWB, exposure) to `/var/lib/gc2607-isp/snapshots/`

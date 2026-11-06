@@ -27,7 +27,7 @@ use bytemuck::Zeroable;
 
 use crate::colour::ColourTuning;
 use crate::pipeline::{self, interp_acm_tuned, AwbStats, Estimate, Lca, ACM_SAT_KNEE};
-use crate::raw::{RawFrame, BLACK, H, MAXLIN, STRIDE_SAMPLES, W};
+use crate::raw::{BLACK, H, MAXLIN, STRIDE_SAMPLES, W};
 use crate::tuning_data::{
     ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, LCA_CELL_X, LCA_CELL_Y, LCA_GH, LCA_GW,
 };
@@ -610,6 +610,66 @@ pub struct DenoiseParams {
     pub temporal_motion: f32,
 }
 
+/// Copy a mapped GPU readback buffer into host memory.
+///
+/// The staging buffer of an integrated GPU can live in uncached
+/// (write-combined) memory, where ordinary loads run at a few hundred MB/s.
+/// SSE4.1 streaming loads (`movntdqa`) read such memory a full line at a time
+/// and run at memory speed; on cached memory they behave as ordinary loads.
+/// Falls back to `copy_from_slice` without SSE4.1 or on a source that is not
+/// 16-byte aligned.
+pub fn copy_from_mapped(dst: &mut [u8], src: &[u8]) {
+    assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    if src.as_ptr() as usize % 16 == 0 && std::arch::is_x86_feature_detected!("sse4.1") {
+        // SAFETY: SSE4.1 is present (checked above), and `src` is 16-byte
+        // aligned as `_mm_stream_load_si128` requires.
+        unsafe { copy_stream_sse41(dst, src) };
+        return;
+    }
+    dst.copy_from_slice(src);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn copy_stream_sse41(dst: &mut [u8], src: &[u8]) {
+    use std::arch::x86_64::{__m128i, _mm_storeu_si128, _mm_stream_load_si128};
+    let body = src.len() / 64 * 64;
+    let (s, d) = (src.as_ptr(), dst.as_mut_ptr());
+    let mut i = 0;
+    while i < body {
+        // SAFETY: `i + 64 <= body <= len` for both slices, `s + i` stays
+        // 16-byte aligned, and the stores are unaligned.
+        unsafe {
+            let a = _mm_stream_load_si128(s.add(i) as *const __m128i);
+            let b = _mm_stream_load_si128(s.add(i + 16) as *const __m128i);
+            let c = _mm_stream_load_si128(s.add(i + 32) as *const __m128i);
+            let e = _mm_stream_load_si128(s.add(i + 48) as *const __m128i);
+            _mm_storeu_si128(d.add(i) as *mut __m128i, a);
+            _mm_storeu_si128(d.add(i + 16) as *mut __m128i, b);
+            _mm_storeu_si128(d.add(i + 32) as *mut __m128i, c);
+            _mm_storeu_si128(d.add(i + 48) as *mut __m128i, e);
+        }
+        i += 64;
+    }
+    dst[body..].copy_from_slice(&src[body..]);
+}
+
+/// Where the last [`GpuProcessor::process`] call spent its time.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FrameTiming {
+    /// Applying a finished AWB measurement (estimate, grids, uniforms), on
+    /// the frames that got one. The measurement itself runs on the AWB worker;
+    /// only the first frame waits for it, and its wait is included.
+    pub estimate: Option<std::time::Duration>,
+    /// Uniform and raw uploads, command encoding and submit.
+    pub submit: std::time::Duration,
+    /// Waiting for the GPU to finish and the readback buffer to map.
+    pub gpu: std::time::Duration,
+    /// Copying the mapped YUYV out to host memory.
+    pub readback: std::time::Duration,
+}
+
 pub struct GpuProcessor {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -650,7 +710,7 @@ pub struct GpuProcessor {
     // Reused CPU-side scratch: AWB working buffers, the flattened per-sector ACM
     // upload buffer, and the f64->f32 grid conversion buffer. Kept here so the
     // periodic re-estimate path does not reallocate them.
-    awb: pipeline::AwbScratch,
+    awb: pipeline::AwbWorker,
     acm_flat: Vec<f32>,
     grid_scratch: Vec<f32>,
 
@@ -658,6 +718,7 @@ pub struct GpuProcessor {
     // (forces a re-estimate on the next frame).
     tuning: ColourTuning,
     force_estimate: bool,
+    timing: FrameTiming,
 }
 
 /// All persistent GPU buffers, produced by `GpuProcessor::create_buffers`. `cfa`,
@@ -730,11 +791,12 @@ impl GpuProcessor {
             yuyv_host: vec![0u8; OUT_W * OUT_H * 2],
             raw_needed: H * STRIDE_SAMPLES * 2,
             yuyv_bytes: OUT_W * OUT_H * 2,
-            awb: pipeline::AwbScratch::default(),
+            awb: pipeline::AwbWorker::spawn(),
             acm_flat: Vec::with_capacity(ACM_NSEC * 9),
             grid_scratch: Vec::with_capacity(HH * WW),
             tuning: ColourTuning::default(),
             force_estimate: false,
+            timing: FrameTiming::default(),
         })
     }
 
@@ -1050,15 +1112,17 @@ impl GpuProcessor {
         self.awb.selection()
     }
 
+    /// Stage times of the last [`process`](Self::process) call.
+    pub fn timing(&self) -> FrameTiming {
+        self.timing
+    }
+
     /// Re-estimate AWB/CCM on the CPU from `bytes`, and upload fresh LSC grids if
     /// the chosen light source changed.
-    fn reestimate(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let frame = RawFrame::from_bytes(bytes)?;
-        let planes = pipeline::bayer_planes(&frame);
+    fn apply_measure(&mut self, (rg, bg): (f32, f32)) {
         // Same temporal smoothing / LSC hysteresis as the CPU `Processor`: the
         // first frame (no history) reproduces the stateless estimate exactly.
         let prev_ls = self.est.as_ref().map(|e| e.ls);
-        let (rg, bg) = pipeline::awb_measure(&planes, &mut self.awb, prev_ls, &self.tuning);
         let (srg, sbg) = pipeline::smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
         let est = pipeline::estimate_from_chroma_tuned(srg, sbg, prev_ls, &self.tuning);
@@ -1081,7 +1145,6 @@ impl GpuProcessor {
             self.grids_ls = Some((est.ls, lsc));
         }
         self.est = Some(est);
-        Ok(())
     }
 
     /// Pack the current estimate into the uniform block and upload it, along with
@@ -1153,12 +1216,26 @@ impl GpuProcessor {
             ));
         }
 
-        // AWB/CCM on the CPU, occasionally.
-        if self.est.is_none() || self.frame % self.interval == 0 || self.force_estimate {
+        // AWB/CCM on the CPU, occasionally, on the background worker: a
+        // finished measurement is applied here, and a new one is started every
+        // `interval` frames (or after a tuning change) when the worker is free.
+        // The first frame has no estimate to render with, so it waits for its
+        // own; that also keeps a single frame bit-exact with the CPU path.
+        let t0 = std::time::Instant::now();
+        self.timing.estimate = None;
+        let prev_ls = self.est.as_ref().map(|e| e.ls);
+        let first = self.est.is_none();
+        let due = self.frame % self.interval == 0 || self.force_estimate;
+        let (started, measured) = self.awb.step(bytes, first, due, prev_ls, &self.tuning)?;
+        if started {
             self.force_estimate = false;
-            self.reestimate(bytes)?;
-            self.upload_params();
         }
+        if let Some(chroma) = measured {
+            self.apply_measure(chroma);
+            self.upload_params();
+            self.timing.estimate = Some(t0.elapsed());
+        }
+        let t_submit = std::time::Instant::now();
 
         // Resolve this frame's denoise state and refresh the uniform. Chroma
         // needs a positive radius and strength; temporal needs a positive alpha.
@@ -1270,6 +1347,8 @@ impl GpuProcessor {
             self.yuyv_bytes as u64,
         );
         self.queue.submit(Some(encoder.finish()));
+        let t_gpu = std::time::Instant::now();
+        self.timing.submit = t_gpu - t_submit;
 
         // Read the packed YUYV back.
         let slice = self.staging_buf.slice(..);
@@ -1286,19 +1365,22 @@ impl GpuProcessor {
         rx.recv()
             .map_err(|e| io::Error::other(format!("gpu map channel: {e}")))?
             .map_err(|e| io::Error::other(format!("gpu map: {e}")))?;
+        let t_read = std::time::Instant::now();
+        self.timing.gpu = t_read - t_gpu;
         // Copy the readback out, guarding against a size mismatch (which would
         // make copy_from_slice panic) by surfacing it as an Err instead. `data`
         // is dropped before unmap so the buffer is no longer borrowed.
         let mismatch = {
             let data = slice.get_mapped_range();
             if data.len() == self.yuyv_host.len() {
-                self.yuyv_host.copy_from_slice(&data);
+                copy_from_mapped(&mut self.yuyv_host, &data);
                 None
             } else {
                 Some((data.len(), self.yuyv_host.len()))
             }
         };
         self.staging_buf.unmap();
+        self.timing.readback = t_read.elapsed();
         if let Some((got, want)) = mismatch {
             return Err(io::Error::other(format!(
                 "gpu readback size {got} != expected {want}"
@@ -1312,6 +1394,58 @@ impl GpuProcessor {
 
 #[cfg(test)]
 mod tests {
+    /// Timing probe for the readback copy (run with `--ignored --nocapture`):
+    /// plain `copy_from_slice` against `copy_from_mapped` on the real staging
+    /// buffer, mapped once.
+    #[test]
+    #[ignore]
+    fn readback_copy_probe() {
+        let mut p = super::GpuProcessor::new(8, false).expect("gpu");
+        let n = p.yuyv_bytes;
+        let mut enc = p.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&p.yuyv_buf, 0, &p.staging_buf, 0, n as u64);
+        p.queue.submit(Some(enc.finish()));
+        let slice = p.staging_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        p.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .unwrap();
+        let data = slice.get_mapped_range();
+        eprintln!("mapped ptr align 64: {}", data.as_ptr() as usize % 64 == 0);
+        let mut dst = vec![0u8; n];
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            dst.copy_from_slice(&data);
+            let plain = t.elapsed();
+            let t = std::time::Instant::now();
+            super::copy_from_mapped(&mut dst, &data);
+            let stream = t.elapsed();
+            eprintln!("round {round}: copy_from_slice {plain:?}, copy_from_mapped {stream:?}");
+        }
+        assert_eq!(&dst[..], &data[..]);
+        drop(data);
+        p.staging_buf.unmap();
+        let _ = &mut p;
+    }
+
+    #[test]
+    fn copy_from_mapped_copies_every_byte() {
+        for len in [0usize, 1, 63, 64, 65, 4096 + 17] {
+            let src: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            // Misaligned source too: the fast path must fall back, not misread.
+            let mut big = vec![0u8; len + 1];
+            big[1..].copy_from_slice(&src);
+            for s in [&src[..], &big[1..]] {
+                let mut dst = vec![0u8; len];
+                super::copy_from_mapped(&mut dst, s);
+                assert_eq!(dst, src, "len {len}");
+            }
+        }
+    }
+
     /// The shader must parse and validate. wgpu compiles it only when a device
     /// builds the pipeline, so without this a WGSL error would pass every test
     /// on a machine without a GPU and fail only at service start.

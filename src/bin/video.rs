@@ -175,6 +175,23 @@ impl Engine {
         }
     }
 
+    /// GPU stage times of the last frame (`None` on the CPU backend).
+    fn gpu_timing(&self) -> Option<GpuStages> {
+        match self {
+            Engine::Cpu { .. } => None,
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => {
+                let t = p.timing();
+                Some(GpuStages {
+                    estimate: t.estimate,
+                    submit: t.submit,
+                    gpu: t.gpu,
+                    readback: t.readback,
+                })
+            }
+        }
+    }
+
     /// Half-res plane indices the last AWB estimate measured on.
     fn awb_selection(&self) -> &[usize] {
         match self {
@@ -253,8 +270,82 @@ fn install_snapshot_signal() {
 
 /// Run-time debugging state of one live session: the tuning in effect (its
 /// `debug` switches and snapshot counter) and the scratch the diagnostics use.
+/// GPU backend stage times of one frame (see `gpu::FrameTiming`).
+#[derive(Clone, Copy)]
+struct GpuStages {
+    estimate: Option<Duration>,
+    submit: Duration,
+    gpu: Duration,
+    readback: Duration,
+}
+
+/// Mean and maximum of a stage time over one report period.
+#[derive(Default)]
+struct Stat {
+    sum: Duration,
+    max: Duration,
+    n: u32,
+}
+
+impl Stat {
+    fn add(&mut self, d: Duration) {
+        self.sum += d;
+        self.max = self.max.max(d);
+        self.n += 1;
+    }
+}
+
+impl std::fmt::Display for Stat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        if self.n == 0 {
+            return write!(f, "-");
+        }
+        write!(f, "{:.1}/{:.1}", ms(self.sum) / self.n as f64, ms(self.max))
+    }
+}
+
+/// Per-stage frame times over one report period (`debug_timing`).
+#[derive(Default)]
+struct Timing {
+    /// Loop start to loop start: the frame interval the daemon achieves.
+    interval: Stat,
+    /// Blocked waiting for a completed capture request.
+    wait: Stat,
+    /// `Engine::process` as a whole.
+    process: Stat,
+    estimate: Stat,
+    submit: Stat,
+    gpu: Stat,
+    readback: Stat,
+    /// Diagnostics on the frame copy (AWB map, snapshot).
+    debug: Stat,
+    /// Loopback write.
+    write: Stat,
+}
+
+impl std::fmt::Display for Timing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timing ms avg/max: interval={} wait={} process={} (estimate={} x{} submit={} gpu={} readback={}) debug={} write={}",
+            self.interval,
+            self.wait,
+            self.process,
+            self.estimate,
+            self.estimate.n,
+            self.submit,
+            self.gpu,
+            self.readback,
+            self.debug,
+            self.write,
+        )
+    }
+}
+
 struct LiveDebug {
     tuning: colour::ColourTuning,
+    timing: Timing,
     // Snapshot counter seen at the last reload; `None` until the first load, so
     // a counter left in the file does not fire at every session start.
     snapshot_seen: Option<u64>,
@@ -269,6 +360,7 @@ impl LiveDebug {
     fn new(args: &Args) -> Self {
         LiveDebug {
             tuning: colour::ColourTuning::default(),
+            timing: Timing::default(),
             snapshot_seen: None,
             snapshot_pending: false,
             snapshot_dir: PathBuf::from(&args.snapshot_dir),
@@ -290,6 +382,7 @@ fn poll_tuning(
     match watcher.poll() {
         Poll::Unchanged => {}
         Poll::Changed(t, source) => {
+            let t = *t;
             println!("colour tuning ({source}): {t}");
             ae_cfg.target = t.ae_target.unwrap_or(args.target);
             if live.snapshot_seen.is_some_and(|s| s != t.snapshot) && t.snapshot != 0 {
@@ -1219,6 +1312,18 @@ fn process_and_write(
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let tint = live.tuning.debug.awb_map;
+        // GPU stage times of the previous frame: the output buffer borrows the
+        // engine once this frame is processed. Zero before the first frame.
+        if let Some(g) = engine.gpu_timing().filter(|g| !g.gpu.is_zero()) {
+            let t = &mut live.timing;
+            if let Some(e) = g.estimate {
+                t.estimate.add(e);
+            }
+            t.submit.add(g.submit);
+            t.gpu.add(g.gpu);
+            t.readback.add(g.readback);
+        }
+        let t_process = Instant::now();
         let yuyv: &[u8] = if tint || live.snapshot_pending {
             // Work on a copy: the engine's buffer is borrowed until the next
             // frame, and the diagnostics need the engine again.
@@ -1229,6 +1334,8 @@ fn process_and_write(
                 }
                 Err(e) => return FrameOutcome::Skipped(e.to_string()),
             }
+            let t_debug = Instant::now();
+            live.timing.process.add(t_debug - t_process);
             let (w, h, map) = engine.geometry();
             if live.snapshot_pending {
                 live.snapshot_pending = false;
@@ -1260,15 +1367,22 @@ fn process_and_write(
                 let LiveDebug { frame, mask, .. } = live;
                 tint_selection_yuyv(frame, w, h, map, engine.awb_selection(), mask);
             }
+            live.timing.debug.add(t_debug.elapsed());
             &live.frame
         } else {
             match engine.process(buf, &dn) {
-                Ok(y) => y,
+                Ok(y) => {
+                    live.timing.process.add(t_process.elapsed());
+                    y
+                }
                 Err(e) => return FrameOutcome::Skipped(e.to_string()),
             }
         };
         let luma = mean_linear_luma(yuyv);
-        match out.write_frame(yuyv, timestamp_ns) {
+        let t_write = Instant::now();
+        let written = out.write_frame(yuyv, timestamp_ns);
+        live.timing.write.add(t_write.elapsed());
+        match written {
             Ok(()) => FrameOutcome::Written {
                 luma,
                 chroma_radius: dn.chroma_radius,
@@ -1422,6 +1536,8 @@ fn run_live(
     // is used.
     const APPLY_DELAY: usize = 2;
     let mut gain_log: VecDeque<u8> = VecDeque::new();
+    // Start of the previous loop iteration, for the `debug_timing` interval.
+    let mut last_loop: Option<Instant> = None;
 
     let exit = loop {
         // On-demand: stop as soon as the last consumer disconnects. The event
@@ -1434,6 +1550,10 @@ fn run_live(
 
         // Block for one completed request, then drain any extra ready ones,
         // requeuing all but the freshest so we always process the newest frame.
+        let t_loop = Instant::now();
+        if let Some(prev) = last_loop.replace(t_loop) {
+            live.timing.interval.add(t_loop - prev);
+        }
         let mut req = match rx.recv_timeout(cam_setup::RECV_TIMEOUT) {
             Ok(r) => r,
             Err(_) => {
@@ -1445,6 +1565,7 @@ fn run_live(
                 };
             }
         };
+        live.timing.wait.add(t_loop.elapsed());
         while let Ok(newer) = rx.try_recv() {
             req.reuse(ReuseFlag::REUSE_BUFFERS);
             if let Err(e) = cam.queue_request(req).map_err(|(_, e)| e) {
@@ -1587,6 +1708,10 @@ fn run_live(
             if live.tuning.debug.awb {
                 println!("{}", awb_line(&engine.awb_stats()));
             }
+            if live.tuning.debug.timing {
+                println!("{}", live.timing);
+            }
+            live.timing = Timing::default();
             last_report = Instant::now();
             report_frames = 0;
         }

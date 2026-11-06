@@ -97,6 +97,8 @@ pub struct Debug {
     pub awb: bool,
     /// Tint the pixels the AWB measured on, in the output video.
     pub awb_map: bool,
+    /// Per-stage frame timings in the periodic log line.
+    pub timing: bool,
 }
 
 impl Default for Debug {
@@ -109,6 +111,7 @@ impl Default for Debug {
             lca: true,
             awb: false,
             awb_map: false,
+            timing: false,
         }
     }
 }
@@ -182,6 +185,7 @@ const RANGES: &[(&str, f64, f64)] = &[
     ("debug_lca", 0.0, 1.0),
     ("debug_awb", 0.0, 1.0),
     ("debug_awb_map", 0.0, 1.0),
+    ("debug_timing", 0.0, 1.0),
     ("snapshot", 0.0, 1e9),
 ];
 
@@ -196,6 +200,7 @@ const INTEGER_KEYS: &[&str] = &[
     "debug_lca",
     "debug_awb",
     "debug_awb_map",
+    "debug_timing",
     "snapshot",
 ];
 
@@ -273,6 +278,7 @@ impl ColourTuning {
                 "debug_lca" => t.debug.lca = on,
                 "debug_awb" => t.debug.awb = on,
                 "debug_awb_map" => t.debug.awb_map = on,
+                "debug_timing" => t.debug.timing = on,
                 "snapshot" => t.snapshot = value as u64,
                 _ => unreachable!("every key in RANGES is matched"),
             }
@@ -355,6 +361,9 @@ impl fmt::Display for ColourTuning {
         if d.awb_map {
             write!(f, " debug_awb_map")?;
         }
+        if d.timing {
+            write!(f, " debug_timing")?;
+        }
         Ok(())
     }
 }
@@ -373,7 +382,7 @@ pub enum Poll {
     Unchanged,
     /// The file changed (or appeared, or disappeared) and this is the tuning to
     /// apply now; the string says where it came from, for the log.
-    Changed(ColourTuning, String),
+    Changed(Box<ColourTuning>, String),
     /// The file changed but was rejected; the previous tuning stays in effect.
     Rejected(String),
 }
@@ -401,13 +410,13 @@ impl TuningWatcher {
         self.seen = Some(stamp);
         if stamp.is_none() {
             return Poll::Changed(
-                ColourTuning::default(),
+                Box::default(),
                 format!("{} absent, built-in defaults", self.path.display()),
             );
         }
         match std::fs::read_to_string(&self.path) {
             Ok(text) => match ColourTuning::parse(&text) {
-                Ok(t) => Poll::Changed(t, format!("{}", self.path.display())),
+                Ok(t) => Poll::Changed(Box::new(t), format!("{}", self.path.display())),
                 Err(e) => Poll::Rejected(format!("{}: {e}", self.path.display())),
             },
             Err(e) => Poll::Rejected(format!("{}: {e}", self.path.display())),
@@ -536,7 +545,7 @@ mod tests {
         let path = dir.join("colour.conf");
         let _ = std::fs::remove_file(&path);
         let mut w = TuningWatcher::new(&path);
-        assert!(matches!(w.poll(), Poll::Changed(t, _) if t == ColourTuning::default()));
+        assert!(matches!(w.poll(), Poll::Changed(t, _) if *t == ColourTuning::default()));
         assert!(matches!(w.poll(), Poll::Unchanged));
         std::fs::write(&path, "saturation = 0.8\n").unwrap();
         assert!(matches!(w.poll(), Poll::Changed(t, _) if t.saturation == 0.8));

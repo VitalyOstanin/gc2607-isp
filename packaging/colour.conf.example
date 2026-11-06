@@ -64,6 +64,7 @@ debug_denoise = 1       # chroma and temporal denoise
 debug_lca = 1           # chromatic aberration correction (if on at start)
 debug_awb = 0           # AWB statistics in the log every 2 s
 debug_awb_map = 0       # tint the pixels AWB measures on, in the video itself
+debug_timing = 0        # per-stage frame times (avg/max, ms) in the log every 2 s
 
 # Snapshot: change to a new non-zero number (or `kill -USR1` the service) to
 # save the current raw frame, the output frame (PNG) and the state to

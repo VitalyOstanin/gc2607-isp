@@ -439,6 +439,188 @@ pub(crate) fn awb_measure(
     out
 }
 
+/// One AWB measurement for [`AwbWorker`]: the raw frame (a reused buffer), the
+/// light source of the current estimate and the tuning to measure with.
+struct AwbJob {
+    raw: Vec<u8>,
+    sel: Vec<usize>,
+    prev_ls: Option<usize>,
+    tuning: ColourTuning,
+}
+
+/// A finished [`AwbJob`]: the measured scene chroma, the diagnostics, and the
+/// job's buffers handed back for reuse (`sel` now holds the selection).
+struct AwbDone {
+    raw: Vec<u8>,
+    sel: Vec<usize>,
+    chroma: Result<(f32, f32), String>,
+    stats: AwbStats,
+}
+
+/// Measure the scene chroma of one raw frame: unpack, split the Bayer planes
+/// and run the robust neutral search.
+fn awb_measure_raw(
+    raw: &[u8],
+    s: &mut AwbScratch,
+    prev_ls: Option<usize>,
+    t: &ColourTuning,
+) -> Result<(f32, f32), String> {
+    let frame = RawFrame::from_bytes(raw).map_err(|e| e.to_string())?;
+    let planes = bayer_planes(&frame);
+    Ok(awb_measure(&planes, s, prev_ls, t))
+}
+
+/// Channels to the AWB thread.
+struct AwbThread {
+    jobs: std::sync::mpsc::Sender<AwbJob>,
+    done: std::sync::mpsc::Receiver<AwbDone>,
+}
+
+/// Measures AWB off the frame loop.
+///
+/// Unpacking the raw frame, splitting the Bayer planes and the robust neutral
+/// search take 25–50 ms on the CPU, longer than a frame at 30 fps; run inline,
+/// every `awb_interval`-th frame overran and pushed the next capture out. The
+/// worker thread takes a copy of the raw frame, and the result is applied to a
+/// later frame; at most one job is in flight. The first frame has no estimate
+/// to render with, so it waits for its own. If the thread cannot be started the
+/// measurement runs inline, as before.
+pub(crate) struct AwbWorker {
+    thread: Option<AwbThread>,
+    busy: bool,
+    // Buffers of the last finished job, reused by the next one.
+    spare: Option<(Vec<u8>, Vec<usize>)>,
+    // Inline fallback scratch (no thread).
+    inline: AwbScratch,
+    // Diagnostics and selection of the last applied measurement.
+    stats: Option<AwbStats>,
+    sel: Vec<usize>,
+}
+
+impl AwbWorker {
+    pub(crate) fn spawn() -> AwbWorker {
+        let (jobs, job_rx) = std::sync::mpsc::channel::<AwbJob>();
+        let (done_tx, done) = std::sync::mpsc::channel::<AwbDone>();
+        let spawned = std::thread::Builder::new()
+            .name("awb".into())
+            .spawn(move || {
+                let mut scratch = AwbScratch::default();
+                for AwbJob {
+                    raw,
+                    mut sel,
+                    prev_ls,
+                    tuning,
+                } in job_rx
+                {
+                    let chroma = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        awb_measure_raw(&raw, &mut scratch, prev_ls, &tuning)
+                    }))
+                    .unwrap_or_else(|_| Err("panic in AWB measurement".into()));
+                    sel.clear();
+                    sel.extend_from_slice(scratch.selection());
+                    let msg = AwbDone {
+                        raw,
+                        sel,
+                        chroma,
+                        stats: scratch.stats(),
+                    };
+                    if done_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = &spawned {
+            eprintln!("AWB thread unavailable ({e}); measuring inline");
+        }
+        AwbWorker {
+            thread: spawned.ok().map(|_| AwbThread { jobs, done }),
+            busy: false,
+            spare: None,
+            inline: AwbScratch::default(),
+            stats: None,
+            sel: Vec::new(),
+        }
+    }
+
+    /// Advance the measurement for one frame. Starts a new measurement of
+    /// `bytes` when `first` (no estimate yet) or `due` and none is running, and
+    /// returns whether it started one, plus the chroma of a measurement that
+    /// finished (on the `first` frame: waits for it).
+    pub(crate) fn step(
+        &mut self,
+        bytes: &[u8],
+        first: bool,
+        due: bool,
+        prev_ls: Option<usize>,
+        tuning: &ColourTuning,
+    ) -> std::io::Result<(bool, Option<(f32, f32)>)> {
+        let start = (first || due) && !self.busy;
+        let Some(th) = &self.thread else {
+            if !start {
+                return Ok((false, None));
+            }
+            let chroma = awb_measure_raw(bytes, &mut self.inline, prev_ls, tuning);
+            self.stats = Some(self.inline.stats());
+            self.sel.clear();
+            self.sel.extend_from_slice(self.inline.selection());
+            return chroma
+                .map(|c| (true, Some(c)))
+                .map_err(std::io::Error::other);
+        };
+        let stopped = || std::io::Error::other("AWB worker stopped");
+        if start {
+            let (mut raw, sel) = self.spare.take().unwrap_or_default();
+            raw.clear();
+            raw.extend_from_slice(bytes);
+            th.jobs
+                .send(AwbJob {
+                    raw,
+                    sel,
+                    prev_ls,
+                    tuning: *tuning,
+                })
+                .map_err(|_| stopped())?;
+            self.busy = true;
+        }
+        if !self.busy {
+            return Ok((start, None));
+        }
+        let done = if first {
+            th.done.recv().map_err(|_| stopped())?
+        } else {
+            match th.done.try_recv() {
+                Ok(d) => d,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok((start, None)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(stopped()),
+            }
+        };
+        self.busy = false;
+        let AwbDone {
+            raw,
+            sel,
+            chroma,
+            stats,
+        } = done;
+        let old_sel = std::mem::replace(&mut self.sel, sel);
+        self.spare = Some((raw, old_sel));
+        self.stats = Some(stats);
+        let chroma = chroma.map_err(std::io::Error::other)?;
+        Ok((start, Some(chroma)))
+    }
+
+    /// Diagnostics of the last applied measurement.
+    pub(crate) fn stats(&self) -> AwbStats {
+        self.stats
+            .clone()
+            .unwrap_or_else(|| AwbScratch::default().stats())
+    }
+
+    /// Plane indices the last applied measurement used.
+    pub(crate) fn selection(&self) -> &[usize] {
+        &self.sel
+    }
+}
+
 /// Project chromaticity onto the locus polyline; return (segment index, t).
 fn project_to_locus(rg: f64, bg: f64) -> (usize, f64) {
     // Distance from (rg, bg) to segment i, with the clamped projection parameter.
@@ -1599,7 +1781,9 @@ pub struct Processor {
     chroma: Option<(f32, f32)>,
     planar: Vec<f32>,
     lca: Option<Lca>,
-    awb: AwbScratch,
+    awb: AwbWorker,
+    // AWB measurements applied so far (diagnostics and tests).
+    awb_applied: u64,
     tuning: ColourTuning,
     // Re-estimate on the next frame regardless of the interval (a new tuning
     // changes the gains and the matrices).
@@ -1643,7 +1827,8 @@ impl Processor {
             chroma: None,
             planar,
             lca,
-            awb: AwbScratch::default(),
+            awb: AwbWorker::spawn(),
+            awb_applied: 0,
             tuning: ColourTuning::default(),
             force_estimate: false,
         }
@@ -1670,20 +1855,25 @@ impl Processor {
         self.awb.selection()
     }
 
+    /// AWB measurements applied since the processor was created.
+    pub fn awb_applied(&self) -> u64 {
+        self.awb_applied
+    }
+
     /// The most recent scene estimate, if any frame has been processed.
     pub fn estimate(&self) -> Option<&Estimate> {
         self.est.as_ref()
     }
 
-    /// Re-estimate from the current (BLC) planes and rebuild the LSC grids if
-    /// the chosen light source changed. The scene chroma is exponentially
+    /// Apply a scene chroma measured by the AWB worker and rebuild the LSC
+    /// grids if the chosen light source changed. The scene chroma is exponentially
     /// smoothed across estimates (see [`AWB_SMOOTH_ALPHA`]) and the LSC source
     /// switch is hysteretic (see [`LS_HYST`]), so white balance follows lighting
     /// changes gradually instead of stepping every interval. The first frame has
     /// no history, so it reproduces the stateless [`estimate`] exactly.
-    fn reestimate(&mut self) {
+    fn apply_measure(&mut self, (rg, bg): (f32, f32)) {
+        self.awb_applied += 1;
         let prev_ls = self.est.as_ref().map(|e| e.ls);
-        let (rg, bg) = awb_measure(&self.planes, &mut self.awb, prev_ls, &self.tuning);
         let (srg, sbg) = smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
         let est = estimate_from_chroma_tuned(srg, sbg, prev_ls, &self.tuning);
@@ -1712,16 +1902,22 @@ impl Processor {
                 format!("raw too small: {} bytes, need >= {needed}", bytes.len()),
             ));
         }
-        let estimating =
-            self.est.is_none() || self.frame % self.interval == 0 || self.force_estimate;
-        self.force_estimate = false;
+        // AWB on the background worker (see `AwbWorker`): a finished
+        // measurement is applied here; the first frame waits for its own.
+        let prev_ls = self.est.as_ref().map(|e| e.ls);
+        let first = self.est.is_none();
+        let due = self.frame % self.interval == 0 || self.force_estimate;
+        let (started, measured) = self.awb.step(bytes, first, due, prev_ls, &self.tuning)?;
+        if started {
+            self.force_estimate = false;
+        }
+        if let Some(chroma) = measured {
+            self.apply_measure(chroma);
+        }
 
         match self.mode {
             DebayerMode::HalfRes => {
                 fill_planes_blc_from_bytes(bytes, &mut self.planes);
-                if estimating {
-                    self.reestimate();
-                }
                 let gains = self
                     .est
                     .as_ref()
@@ -1749,10 +1945,6 @@ impl Processor {
                 );
             }
             DebayerMode::Mhc => {
-                if estimating {
-                    fill_planes_blc_from_bytes(bytes, &mut self.planes);
-                    self.reestimate();
-                }
                 let gains = self
                     .est
                     .as_ref()
