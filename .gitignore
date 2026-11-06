@@ -20,6 +20,9 @@ __pycache__/
 # local project-check review reports (generated, not part of the source)
 /docs/reviews/
 
+# local brainstorming/design specs (working artefacts, not part of the source)
+/docs/superpowers/
+
 # Debian packaging build artefacts
 /debian/.debhelper/
 /debian/files
