@@ -64,6 +64,12 @@ pub struct ColourTuning {
     /// Maximum distance of an AWB sample's chroma to the white locus, in raw
     /// `(r/g, b/g)` space; smaller rejects skin and other off-white colours.
     pub awb_locus_dist: f64,
+    /// Chroma-denoise box-blur radius on the chroma grid at every gain, or
+    /// `None` for the gain table (0 below ~2x gain).
+    pub denoise_chroma_radius: Option<usize>,
+    /// Chroma-denoise blend strength (0..1) at every gain, or `None` for the
+    /// gain table scaled by `--denoise`.
+    pub denoise_chroma_strength: Option<f64>,
     /// Debugging switches: stage bypasses and diagnostics.
     pub debug: Debug,
     /// Snapshot request counter: each change to a new non-zero value asks the
@@ -131,14 +137,19 @@ impl Default for ColourTuning {
             ae_target: None,
             awb_lsc: false,
             awb_locus_dist: AWB_LOCUS_MAX_DIST,
+            denoise_chroma_radius: None,
+            denoise_chroma_strength: None,
             debug: Debug::default(),
             snapshot: 0,
         }
     }
 }
 
+/// Largest accepted chroma-denoise radius (the blur cost grows with it).
+pub const DENOISE_CHROMA_RADIUS_MAX: usize = 8;
+
 /// Accepted range per key: `(key, min, max)`. Keys whose value 0 means "off"
-/// (`wb_fixed_*`, `ae_target`) accept 0 in addition to the range.
+/// or "automatic" (`ZERO_MEANS_OFF`) accept 0 in addition to the range.
 const RANGES: &[(&str, f64, f64)] = &[
     ("wb_red_trim", 0.5, 2.0),
     ("wb_blue_trim", 0.5, 2.0),
@@ -158,6 +169,12 @@ const RANGES: &[(&str, f64, f64)] = &[
     ("ae_target", 0.02, 0.6),
     ("awb_lsc", 0.0, 1.0),
     ("awb_locus_dist", 0.02, 0.5),
+    (
+        "denoise_chroma_radius",
+        1.0,
+        DENOISE_CHROMA_RADIUS_MAX as f64,
+    ),
+    ("denoise_chroma_strength", 0.01, 1.0),
     ("debug_lsc", 0.0, 1.0),
     ("debug_ccm", 0.0, 1.0),
     ("debug_bands", 0.0, 1.0),
@@ -171,6 +188,7 @@ const RANGES: &[(&str, f64, f64)] = &[
 /// Keys that take only whole numbers (switches are 0 or 1).
 const INTEGER_KEYS: &[&str] = &[
     "awb_lsc",
+    "denoise_chroma_radius",
     "debug_lsc",
     "debug_ccm",
     "debug_bands",
@@ -181,7 +199,13 @@ const INTEGER_KEYS: &[&str] = &[
     "snapshot",
 ];
 
-const ZERO_MEANS_OFF: &[&str] = &["wb_fixed_rg", "wb_fixed_bg", "ae_target"];
+const ZERO_MEANS_OFF: &[&str] = &[
+    "wb_fixed_rg",
+    "wb_fixed_bg",
+    "ae_target",
+    "denoise_chroma_radius",
+    "denoise_chroma_strength",
+];
 
 impl ColourTuning {
     /// Parse a tuning file's text over the defaults. Unknown keys, malformed
@@ -238,6 +262,10 @@ impl ColourTuning {
                 "ae_target" => t.ae_target = (!off).then_some(value),
                 "awb_lsc" => t.awb_lsc = on,
                 "awb_locus_dist" => t.awb_locus_dist = value,
+                "denoise_chroma_radius" => {
+                    t.denoise_chroma_radius = (!off).then_some(value as usize)
+                }
+                "denoise_chroma_strength" => t.denoise_chroma_strength = (!off).then_some(value),
                 "debug_lsc" => t.debug.lsc = on,
                 "debug_ccm" => t.debug.ccm = on,
                 "debug_bands" => t.debug.bands = on,
@@ -298,6 +326,13 @@ impl fmt::Display for ColourTuning {
             f,
             " awb_lsc={} awb_locus_dist={:.3}",
             self.awb_lsc as u8, self.awb_locus_dist
+        )?;
+        let auto = |v: Option<String>| v.unwrap_or_else(|| "auto".into());
+        write!(
+            f,
+            " denoise_chroma r={} s={}",
+            auto(self.denoise_chroma_radius.map(|r| r.to_string())),
+            auto(self.denoise_chroma_strength.map(|v| format!("{v:.2}"))),
         )?;
         let d = &self.debug;
         let off: Vec<&str> = [
@@ -427,6 +462,22 @@ mod tests {
                 "example lacks {key}"
             );
         }
+    }
+
+    #[test]
+    fn denoise_chroma_keys_zero_is_auto() {
+        let t = ColourTuning::parse("denoise_chroma_radius = 2\ndenoise_chroma_strength = 0.6\n")
+            .unwrap();
+        assert_eq!(t.denoise_chroma_radius, Some(2));
+        assert_eq!(t.denoise_chroma_strength, Some(0.6));
+        let t = ColourTuning::parse("denoise_chroma_radius = 0\ndenoise_chroma_strength = 0\n")
+            .unwrap();
+        assert_eq!(
+            (t.denoise_chroma_radius, t.denoise_chroma_strength),
+            (None, None)
+        );
+        assert!(ColourTuning::parse("denoise_chroma_radius = 9\n").is_err());
+        assert!(ColourTuning::parse("denoise_chroma_radius = 1.5\n").is_err());
     }
 
     #[test]

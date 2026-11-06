@@ -565,6 +565,17 @@ fn chroma_denoise_for_gain(gain_index: u8, scale: f64) -> (usize, f64) {
     (radius, (base * scale).clamp(0.0, 1.0))
 }
 
+/// [`chroma_denoise_for_gain`] with the run-time overrides applied: a set
+/// `denoise_chroma_radius` / `denoise_chroma_strength` replaces the table value
+/// at every gain (the fixed strength is not scaled by `--denoise`).
+fn chroma_denoise_tuned(gain_index: u8, scale: f64, tuning: &colour::ColourTuning) -> (usize, f64) {
+    let (radius, strength) = chroma_denoise_for_gain(gain_index, scale);
+    (
+        tuning.denoise_chroma_radius.unwrap_or(radius),
+        tuning.denoise_chroma_strength.unwrap_or(strength),
+    )
+}
+
 /// Maximum temporal-blend weight (alpha, 0..1) for an analogue-gain LUT index,
 /// multiplied by the `--temporal` scaler. Off at low gain; ramps up with gain.
 fn temporal_luma_for_gain(gain_index: u8, scale: f64) -> f64 {
@@ -602,8 +613,11 @@ struct DenoiseSpec {
 }
 
 impl DenoiseSpec {
-    fn from_gain(gain_index: u8, args: &Args) -> DenoiseSpec {
-        let (chroma_radius, chroma_strength) = chroma_denoise_for_gain(gain_index, args.denoise);
+    /// Strengths for `gain_index`; the run-time tuning's chroma radius and
+    /// strength, where set, replace the gain-table values at every gain.
+    fn from_gain(gain_index: u8, args: &Args, tuning: &colour::ColourTuning) -> DenoiseSpec {
+        let (chroma_radius, chroma_strength) =
+            chroma_denoise_tuned(gain_index, args.denoise, tuning);
         DenoiseSpec {
             chroma_radius,
             chroma_strength,
@@ -1144,10 +1158,11 @@ fn queue_initial(session: &mut cam_setup::Session<'_>) {
 enum FrameOutcome {
     /// Written to the loopback. Carries the output mean linear luminance (the AE
     /// control variable; see [`mean_linear_luma`]) and the applied denoise
-    /// strengths (chroma radius, temporal alpha).
+    /// strengths (chroma radius and strength, temporal alpha).
     Written {
         luma: f64,
         chroma_radius: usize,
+        chroma_strength: f64,
         temporal_alpha: f64,
     },
     /// The ISP/GPU returned an error or the frame work panicked; the frame is
@@ -1190,7 +1205,7 @@ fn process_and_write(
     // denoised frame and the AE luma metric is metered on it (post-denoise).
     // `debug_denoise = 0` bypasses it.
     let dn = if live.tuning.debug.denoise {
-        DenoiseSpec::from_gain(gain_index, args)
+        DenoiseSpec::from_gain(gain_index, args, &live.tuning)
     } else {
         DenoiseSpec {
             chroma_radius: 0,
@@ -1219,7 +1234,7 @@ fn process_and_write(
                 live.snapshot_pending = false;
                 let info = format!(
                     "tuning: {}\nestimate: {:?}\n{}\nexposure={} gain_idx={} vblank={}\n\
-                     denoise_r={} temporal_a={:.2}\n",
+                     denoise_r={} denoise_s={:.2} temporal_a={:.2}\n",
                     live.tuning,
                     engine.estimate(),
                     awb_line(&engine.awb_stats()),
@@ -1227,6 +1242,7 @@ fn process_and_write(
                     state.gain_index,
                     state.vblank,
                     dn.chroma_radius,
+                    dn.chroma_strength,
                     dn.temporal_alpha,
                 );
                 spawn_snapshot(
@@ -1256,6 +1272,7 @@ fn process_and_write(
             Ok(()) => FrameOutcome::Written {
                 luma,
                 chroma_radius: dn.chroma_radius,
+                chroma_strength: dn.chroma_strength,
                 temporal_alpha: dn.temporal_alpha,
             },
             Err(e) => FrameOutcome::WriteFailed(e),
@@ -1381,6 +1398,7 @@ fn run_live(
     // Last applied denoise strengths, for the telemetry line. (The temporal
     // history and any scratch now live inside the engine; see `Engine::process`.)
     let mut last_dn = 0usize;
+    let mut last_ds = 0f64;
     let mut last_ta = 0f64;
 
     // AE settling: the sensor applies a new exposure/gain with a delay. If we
@@ -1482,10 +1500,12 @@ fn run_live(
             FrameOutcome::Written {
                 luma: m,
                 chroma_radius,
+                chroma_strength,
                 temporal_alpha,
             } => {
                 luma = Some(m);
                 last_dn = chroma_radius;
+                last_ds = chroma_strength;
                 last_ta = temporal_alpha;
                 true
             }
@@ -1559,7 +1579,7 @@ fn run_live(
             };
             println!(
                 "{frames} frames, {fps:.1} fps processed, {dropped} dropped, {errors} errors, \
-                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, denoise_r={last_dn}, temporal_a={last_ta:.2}, {colour}",
+                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, denoise_r={last_dn}, denoise_s={last_ds:.2}, temporal_a={last_ta:.2}, {colour}",
                 state.exposure,
                 state.gain_index,
                 ae::frame_rate(state.vblank),
@@ -1745,5 +1765,25 @@ fn run_on_demand(
         if !keep_running {
             return false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chroma_denoise_overrides_replace_the_gain_table() {
+        let auto = colour::ColourTuning::default();
+        assert_eq!(chroma_denoise_tuned(0, 1.0, &auto), (0, 0.0));
+        assert_eq!(chroma_denoise_tuned(9, 1.0, &auto), (2, 0.7));
+        let fixed = colour::ColourTuning::parse(
+            "denoise_chroma_radius = 2\ndenoise_chroma_strength = 0.4\n",
+        )
+        .unwrap();
+        assert_eq!(chroma_denoise_tuned(0, 1.0, &fixed), (2, 0.4));
+        assert_eq!(chroma_denoise_tuned(14, 2.0, &fixed), (2, 0.4));
+        let radius_only = colour::ColourTuning::parse("denoise_chroma_radius = 3\n").unwrap();
+        assert_eq!(chroma_denoise_tuned(5, 1.0, &radius_only), (3, 0.5));
     }
 }

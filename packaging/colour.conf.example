@@ -47,6 +47,14 @@ ae_target = 0           # 0 or 0.02..0.6
 awb_lsc = 0             # 0 or 1
 awb_locus_dist = 0.12   # 0.02..0.5
 
+# Chroma denoise (box blur on the chroma grid, blended back with a strength).
+# 0 = from the gain table: off below ~2x analogue gain, then radius 1..3 and
+# strength 0.5..0.85 (times --denoise) as the gain rises. A set value replaces
+# the table at every gain; in good light the table strength is 0, so a fixed
+# radius needs a fixed strength too. The log shows denoise_r= and denoise_s=.
+denoise_chroma_radius = 0     # 0 or 1..8
+denoise_chroma_strength = 0   # 0 or 0.01..1
+
 # Debugging. Stage switches: 1 = on (default), 0 = the stage is bypassed, to
 # see which stage spoils the colour. Diagnostics: 0 = off (default).
 debug_lsc = 1           # lens-shading correction

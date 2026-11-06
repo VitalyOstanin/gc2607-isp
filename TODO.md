@@ -3,7 +3,6 @@
 ## Contents
 
 - [Image quality](#image-quality)
-- [Configuration](#configuration)
 - [Performance](#performance)
 - [Tooling](#tooling)
 - [CI](#ci)
@@ -17,16 +16,6 @@
       (`chroma_denoise_for_gain`, `temporal_luma_for_gain` in
       `src/bin/video.rs`) if needed. Pair this with the chroma box-blur
       running-sum optimization.
-
-## Configuration
-
-- [ ] Let the chroma-denoise radius be reachable at run time, as a key of
-      the run-time tuning file (`src/colour.rs`). `--denoise <scale>`
-      multiplies only the blend strength; the box-blur radius comes from the
-      gain-index table in `chroma_denoise_for_gain` (`src/bin/video.rs`), and at
-      gain indices 0..3 the radius is 0, so in good light chroma speckle cannot
-      be attenuated at all without a rebuild. Either let the scaler also raise
-      the radius, or expose radius and the gain thresholds as tuning keys.
 
 ## Performance
 
