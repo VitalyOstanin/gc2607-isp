@@ -1057,10 +1057,10 @@ impl GpuProcessor {
         let planes = pipeline::bayer_planes(&frame);
         // Same temporal smoothing / LSC hysteresis as the CPU `Processor`: the
         // first frame (no history) reproduces the stateless estimate exactly.
-        let (rg, bg) = pipeline::robust_neutral_into(&planes, &mut self.awb);
+        let prev_ls = self.est.as_ref().map(|e| e.ls);
+        let (rg, bg) = pipeline::awb_measure(&planes, &mut self.awb, prev_ls, &self.tuning);
         let (srg, sbg) = pipeline::smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
-        let prev_ls = self.est.as_ref().map(|e| e.ls);
         let est = pipeline::estimate_from_chroma_tuned(srg, sbg, prev_ls, &self.tuning);
         let lsc = self.tuning.debug.lsc;
         if self.grids_ls != Some((est.ls, lsc)) {

@@ -448,8 +448,10 @@ on this thermally constrained laptop.
 
 White balance trims, a fixed white balance, the skin and yellow hue bands
 (limits, desaturation, skin hue rotation), the strength of the per-hue-sector
-matrices, global saturation and the AE target can be changed while the camera
-is streaming, without a rebuild or a restart. Copy the annotated example, which
+matrices, global saturation, the AE target and how the AWB samples the frame
+(on lens-shading corrected data, how close to white a pixel must be) can be
+changed while the camera is streaming, without a rebuild or a restart. Copy the
+annotated example, which
 lists every key at its default value, and edit it:
 
 ```sh

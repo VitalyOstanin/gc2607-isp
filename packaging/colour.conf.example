@@ -40,6 +40,13 @@ saturation = 1.0        # 0..2
 # Auto-exposure target in linear light; 0 keeps the --target value (0.15).
 ae_target = 0           # 0 or 0.02..0.6
 
+# Auto white balance. awb_lsc = 1 measures on lens-shading corrected planes,
+# so the vignetting no longer leaves the frame centre to decide alone.
+# awb_locus_dist is how far from the white locus (raw r/g, b/g) a pixel may lie
+# and still count as neutral; lower rejects skin and other off-white colours.
+awb_lsc = 0             # 0 or 1
+awb_locus_dist = 0.12   # 0.02..0.5
+
 # Debugging. Stage switches: 1 = on (default), 0 = the stage is bypassed, to
 # see which stage spoils the colour. Diagnostics: 0 = off (default).
 debug_lsc = 1           # lens-shading correction

@@ -192,7 +192,7 @@ const AWB_MIN_SAMPLES: usize = 100;
 /// when too few near-locus pixels exist (an unusual illuminant) the ungated
 /// masks below reproduce the previous behaviour, so the selection never
 /// collapses to fewer samples than before.
-const AWB_LOCUS_MAX_DIST: f64 = 0.12;
+pub(crate) const AWB_LOCUS_MAX_DIST: f64 = 0.12;
 
 /// Reusable scratch buffers for [`robust_neutral_into`] so the live runtimes do
 /// not reallocate the per-estimate working vectors every AWB interval. Held by
@@ -211,6 +211,10 @@ pub(crate) struct AwbScratch {
     level: u8,
     raw: (f32, f32),
     total: usize,
+    // `awb_lsc = 1`: the lens-shading grids last used to correct the planes
+    // before measuring, and the corrected planes (reused buffers).
+    lsc_grids: Option<Grids>,
+    lsc_planes: Option<Planes>,
 }
 
 /// AWB diagnostics from the last estimate (see `debug_awb` in the tuning file).
@@ -290,7 +294,12 @@ pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
 /// bit-identical to the previous sort-based implementation: the same predicates
 /// select the same index sets and the percentile/median order statistics match.
 pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) {
-    let (raw, level) = robust_neutral_select(p, s);
+    robust_neutral_gated(p, s, AWB_LOCUS_MAX_DIST)
+}
+
+/// [`robust_neutral_into`] with an explicit white-locus gate distance.
+fn robust_neutral_gated(p: &Planes, s: &mut AwbScratch, locus_max: f64) -> (f32, f32) {
+    let (raw, level) = robust_neutral_select(p, s, locus_max);
     s.level = level;
     s.raw = raw;
     s.total = p.hh * p.ww;
@@ -302,7 +311,7 @@ pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) 
 
 /// The mask cascade of [`robust_neutral_into`]; returns the chroma and the
 /// 1-based number of the mask that produced it (7 = mean fallback).
-fn robust_neutral_select(p: &Planes, s: &mut AwbScratch) -> ((f32, f32), u8) {
+fn robust_neutral_select(p: &Planes, s: &mut AwbScratch, locus_max: f64) -> ((f32, f32), u8) {
     let n = p.hh * p.ww;
     let clip = AWB_CLIP_FRACTION * MAXLIN;
 
@@ -336,14 +345,14 @@ fn robust_neutral_select(p: &Planes, s: &mut AwbScratch) -> ((f32, f32), u8) {
         g[i] > 1.0
             && p.r[i].max(g[i]).max(p.b[i]) < clip
             && g[i] >= p60
-            && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= AWB_LOCUS_MAX_DIST
+            && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= locus_max
     }) {
         return (r, 1);
     }
     if let Some(r) = awb_try_mask(p, g, idx, rg, bg, n, |i| {
         g[i] > 1.0
             && p.r[i].max(g[i]).max(p.b[i]) < clip
-            && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= AWB_LOCUS_MAX_DIST
+            && locus_distance((p.r[i] / g[i]) as f64, (p.b[i] / g[i]) as f64) <= locus_max
     }) {
         return (r, 2);
     }
@@ -379,6 +388,55 @@ fn robust_neutral_select(p: &Planes, s: &mut AwbScratch) -> ((f32, f32), u8) {
         return ((1.0, 1.0), 7);
     }
     (((sr / sg) as f32, (sb / sg) as f32), 7)
+}
+
+/// The live runtimes' AWB measurement under the run-time tuning: the locus
+/// gate distance is `awb_locus_dist`, and with `awb_lsc` the planes are first
+/// lens-shading corrected, so the brightness percentile and the chroma are not
+/// skewed by the vignetting (the dark, colour-shifted corners otherwise drop out
+/// and the frame centre decides alone). The grids are those of the previous
+/// light source, or, on the first estimate, of the source the uncorrected
+/// measurement points to.
+pub(crate) fn awb_measure(
+    p: &Planes,
+    s: &mut AwbScratch,
+    prev_ls: Option<usize>,
+    t: &ColourTuning,
+) -> (f32, f32) {
+    if !t.awb_lsc {
+        return robust_neutral_gated(p, s, t.awb_locus_dist);
+    }
+    let ls = prev_ls.unwrap_or_else(|| {
+        let (rg, bg) = robust_neutral_gated(p, s, t.awb_locus_dist);
+        select_ls_hyst(rg as f64, bg as f64, None)
+    });
+    if s.lsc_grids.as_ref().map(|g| (g.ls, g.hh, g.ww)) != Some((ls, p.hh, p.ww)) {
+        s.lsc_grids = Some(build_grids(ls, p.hh, p.ww));
+    }
+    let mut corr = s.lsc_planes.take().unwrap_or_else(|| Planes {
+        hh: 0,
+        ww: 0,
+        gr: Vec::new(),
+        r: Vec::new(),
+        b: Vec::new(),
+        gb: Vec::new(),
+    });
+    {
+        let g = s.lsc_grids.as_ref().expect("grids built above");
+        corr.hh = p.hh;
+        corr.ww = p.ww;
+        let scale = |dst: &mut Vec<f32>, src: &[f32], grid: &[f64]| {
+            dst.clear();
+            dst.extend(src.iter().zip(grid).map(|(&v, &k)| (v as f64 * k) as f32));
+        };
+        scale(&mut corr.gr, &p.gr, &g.g_gr);
+        scale(&mut corr.r, &p.r, &g.g_r);
+        scale(&mut corr.b, &p.b, &g.g_b);
+        scale(&mut corr.gb, &p.gb, &g.g_gb);
+    }
+    let out = robust_neutral_gated(&corr, s, t.awb_locus_dist);
+    s.lsc_planes = Some(corr);
+    out
 }
 
 /// Project chromaticity onto the locus polyline; return (segment index, t).
@@ -1624,10 +1682,10 @@ impl Processor {
     /// changes gradually instead of stepping every interval. The first frame has
     /// no history, so it reproduces the stateless [`estimate`] exactly.
     fn reestimate(&mut self) {
-        let (rg, bg) = robust_neutral_into(&self.planes, &mut self.awb);
+        let prev_ls = self.est.as_ref().map(|e| e.ls);
+        let (rg, bg) = awb_measure(&self.planes, &mut self.awb, prev_ls, &self.tuning);
         let (srg, sbg) = smooth_chroma(self.chroma, rg, bg);
         self.chroma = Some((srg, sbg));
-        let prev_ls = self.est.as_ref().map(|e| e.ls);
         let est = estimate_from_chroma_tuned(srg, sbg, prev_ls, &self.tuning);
         let lsc = self.tuning.debug.lsc;
         if self.grids.as_ref().map(|g| (g.ls, g.lsc)) != Some((est.ls, lsc)) {
@@ -1873,6 +1931,35 @@ mod tests {
         for &(r, g, b) in &[(0.60, 0.15, 0.22), (0.2, 0.4, 0.6), (0.3, 0.3, 0.3)] {
             assert_eq!(acm_color(r, g, b, &est.ccm, &acm), (r, g, b));
         }
+    }
+
+    /// With the default tuning the live AWB measurement is the reference one;
+    /// with `awb_lsc` the corrected planes give a finite chroma and keep the
+    /// selection on the plane grid.
+    #[test]
+    fn awb_measure_default_is_reference() {
+        let (hh, ww) = (24, 40);
+        let n = hh * ww;
+        let p = Planes {
+            hh,
+            ww,
+            gr: (0..n).map(|i| 300.0 + (i % 97) as f32).collect(),
+            gb: (0..n).map(|i| 300.0 + (i % 89) as f32).collect(),
+            r: (0..n).map(|i| 180.0 + (i % 53) as f32).collect(),
+            b: (0..n).map(|i| 150.0 + (i % 61) as f32).collect(),
+        };
+        let mut a = AwbScratch::default();
+        let mut b = AwbScratch::default();
+        let t = ColourTuning::default();
+        assert_eq!(
+            awb_measure(&p, &mut a, None, &t),
+            robust_neutral_into(&p, &mut b)
+        );
+        let mut t = t;
+        t.awb_lsc = true;
+        let (rg, bg) = awb_measure(&p, &mut a, None, &t);
+        assert!(rg.is_finite() && bg.is_finite() && rg > 0.0 && bg > 0.0);
+        assert!(a.selection().iter().all(|&i| i < n));
     }
 
     /// The AWB statistics name the mask used and expose exactly its pixels.

@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::pipeline::{
-    SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO, SKIN_HUE_SOFT, WB_BLUE_TRIM, YELLOW_DESAT_K,
-    YELLOW_HUE_HI, YELLOW_HUE_LO, YELLOW_HUE_SOFT,
+    AWB_LOCUS_MAX_DIST, SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO, SKIN_HUE_SOFT, WB_BLUE_TRIM,
+    YELLOW_DESAT_K, YELLOW_HUE_HI, YELLOW_HUE_LO, YELLOW_HUE_SOFT,
 };
 
 /// Default location of the run-time tuning file.
@@ -58,6 +58,12 @@ pub struct ColourTuning {
     pub saturation: f64,
     /// AE target in linear light, or `None` to keep the command-line value.
     pub ae_target: Option<f64>,
+    /// Measure the AWB on lens-shading corrected planes (off: on the raw
+    /// planes, where the vignetting lets the frame centre decide alone).
+    pub awb_lsc: bool,
+    /// Maximum distance of an AWB sample's chroma to the white locus, in raw
+    /// `(r/g, b/g)` space; smaller rejects skin and other off-white colours.
+    pub awb_locus_dist: f64,
     /// Debugging switches: stage bypasses and diagnostics.
     pub debug: Debug,
     /// Snapshot request counter: each change to a new non-zero value asks the
@@ -123,6 +129,8 @@ impl Default for ColourTuning {
             },
             saturation: 1.0,
             ae_target: None,
+            awb_lsc: false,
+            awb_locus_dist: AWB_LOCUS_MAX_DIST,
             debug: Debug::default(),
             snapshot: 0,
         }
@@ -148,6 +156,8 @@ const RANGES: &[(&str, f64, f64)] = &[
     ("yellow_desat_k", 0.0, 1.5),
     ("saturation", 0.0, 2.0),
     ("ae_target", 0.02, 0.6),
+    ("awb_lsc", 0.0, 1.0),
+    ("awb_locus_dist", 0.02, 0.5),
     ("debug_lsc", 0.0, 1.0),
     ("debug_ccm", 0.0, 1.0),
     ("debug_bands", 0.0, 1.0),
@@ -160,6 +170,7 @@ const RANGES: &[(&str, f64, f64)] = &[
 
 /// Keys that take only whole numbers (switches are 0 or 1).
 const INTEGER_KEYS: &[&str] = &[
+    "awb_lsc",
     "debug_lsc",
     "debug_ccm",
     "debug_bands",
@@ -225,6 +236,8 @@ impl ColourTuning {
                 "yellow_desat_k" => t.yellow.k = value,
                 "saturation" => t.saturation = value,
                 "ae_target" => t.ae_target = (!off).then_some(value),
+                "awb_lsc" => t.awb_lsc = on,
+                "awb_locus_dist" => t.awb_locus_dist = value,
                 "debug_lsc" => t.debug.lsc = on,
                 "debug_ccm" => t.debug.ccm = on,
                 "debug_bands" => t.debug.bands = on,
@@ -280,6 +293,11 @@ impl fmt::Display for ColourTuning {
             self.yellow.soft,
             self.yellow.k,
             self.saturation,
+        )?;
+        write!(
+            f,
+            " awb_lsc={} awb_locus_dist={:.3}",
+            self.awb_lsc as u8, self.awb_locus_dist
         )?;
         let d = &self.debug;
         let off: Vec<&str> = [
@@ -395,6 +413,7 @@ mod tests {
             (1.0, 1.0, 0.0, 1.0)
         );
         assert_eq!((t.wb_fixed, t.ae_target), (None, None));
+        assert_eq!((t.awb_lsc, t.awb_locus_dist), (false, AWB_LOCUS_MAX_DIST));
     }
 
     /// The shipped example lists every key at its default value.
