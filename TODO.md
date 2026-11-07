@@ -43,6 +43,15 @@
       shared parser, the flag set keeps growing, and `--help`/usage strings are
       maintained manually. A derive-based parser would give validation, generated
       help, and a single source of truth for the shared flags.
+- [ ] GUI tool for runtime colour tuning. Today the only way to change the
+      tuning of a running service is to edit `/etc/gc2607-isp/colour.conf` by
+      hand (re-read live) and to request a snapshot by bumping the `snapshot`
+      key. A small GUI would expose every key of the file as sliders and
+      toggles with the documented ranges, write the file on change, offer
+      "reset to defaults" (from `packaging/colour.conf.example`), save and
+      recall named presets for A/B comparison, and trigger a snapshot. It must
+      keep the file format and the comments intact and never restart the
+      service.
 
 ## CI
 
