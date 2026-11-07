@@ -33,7 +33,11 @@
 //!   gc2607-video [--device /dev/videoN] [--device-label <name>] [--backend cpu|gpu]
 //!                [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>]
 //!                [--min-fps <fps>] [--threads <n>] [--on-demand auto|on|off]
-//!                [--measure-delay]
+//!                [--measure-delay] [--full-range]
+//!
+//! The YUYV output is limited range (Y 16..235) by default: Chromium-based
+//! capture reads YUYV as limited range whatever the device declares.
+//! `--full-range` writes full-range YCbCr (Y 0..255) instead.
 
 use std::collections::VecDeque;
 use std::io;
@@ -56,7 +60,7 @@ use gc2607_isp::camera as cam_setup;
 use gc2607_isp::colour::{self, Poll, TuningWatcher};
 use gc2607_isp::output::{
     denoise_chroma_yuyv, find_loopback_by_label, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv,
-    tint_selection_yuyv, LoopbackOutput, PlaneMapping,
+    tint_selection_yuyv, LoopbackOutput, PlaneMapping, YuvRange,
 };
 use gc2607_isp::pipeline::{AwbStats, DebayerMode, Estimate, Processor};
 use gc2607_isp::recovery;
@@ -466,6 +470,7 @@ struct Args {
     on_demand: OnDemandMode,
     colour_config: String,
     snapshot_dir: String,
+    yuv_range: YuvRange,
 }
 
 fn parse_args() -> Args {
@@ -498,6 +503,8 @@ fn parse_args() -> Args {
     // Gain-adaptive temporal luma-denoise scaler (0 disables; 1 is the default;
     // >1 strengthens). See `temporal_luma_for_gain`.
     let mut temporal = 1.0f64;
+    // YCbCr range of the output; see the module docs.
+    let mut yuv_range = YuvRange::Limited;
     // On-demand camera gating: open the camera only while a consumer captures.
     // Auto by default (uses the v4l2loopback client-usage event when available).
     let mut on_demand = OnDemandMode::Auto;
@@ -565,6 +572,7 @@ fn parse_args() -> Args {
                     .max(0.0)
             }
             "--measure-delay" => measure = true,
+            "--full-range" => yuv_range = YuvRange::Full,
             "--on-demand" => match it.next().as_deref() {
                 Some("auto") => on_demand = OnDemandMode::Auto,
                 Some("on") => on_demand = OnDemandMode::On,
@@ -602,7 +610,7 @@ fn parse_args() -> Args {
                      [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
                      [--target <0..1>] [--max-gain <idx>] [--min-fps <fps>] \
                      [--threads <n>] [--on-demand auto|on|off] [--measure-delay] \
-                     [--colour-config <path>] [--snapshot-dir <dir>]"
+                     [--colour-config <path>] [--snapshot-dir <dir>] [--full-range]"
                 );
                 std::process::exit(0);
             }
@@ -639,6 +647,7 @@ fn parse_args() -> Args {
         on_demand,
         colour_config,
         snapshot_dir,
+        yuv_range,
     }
 }
 
@@ -1150,9 +1159,16 @@ fn main() {
     // before choosing on-demand vs always-on: the loopback must stay open so the
     // virtual webcam is visible to applications while the camera is idle.
     let (mut engine, dst_w, dst_h) = build_engine(&args);
-    let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32)
+    let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32, args.yuv_range)
         .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
-    println!("output: {} {dst_w}x{dst_h} YUYV", args.device);
+    let range = match args.yuv_range {
+        YuvRange::Limited => "limited",
+        YuvRange::Full => "full",
+    };
+    println!(
+        "output: {} {dst_w}x{dst_h} YUYV, {range} range",
+        args.device
+    );
 
     // On-demand gating: subscribe to the v4l2loopback client-usage event so the
     // camera runs only while a consumer captures. Unavailable (un-patched

@@ -35,6 +35,54 @@ const V4L2_FIELD_NONE: u32 = 1;
 const V4L2_COLORSPACE_SRGB: u32 = 8;
 /// `V4L2_QUANTIZATION_FULL_RANGE` (full-range YCbCr, matches our sRGB output).
 const V4L2_QUANTIZATION_FULL_RANGE: u32 = 1;
+/// `V4L2_QUANTIZATION_LIM_RANGE` (Y 16..235, Cb/Cr 16..240).
+const V4L2_QUANTIZATION_LIM_RANGE: u32 = 2;
+
+/// YCbCr range of the frames written to the loopback. The pipeline always
+/// produces full-range BT.601; with `Limited` the bytes are rescaled to the
+/// studio range while they are copied into the device buffer. Chromium-based
+/// capture (browsers, Electron call clients) ignores the declared quantization
+/// and reads YUYV as limited range, so full-range output there gains ~16%
+/// contrast, crushed shadows and stronger saturation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YuvRange {
+    Limited,
+    Full,
+}
+
+/// Full-range to limited-range byte maps, for luma and for chroma.
+struct RangeLuts {
+    y: [u8; 256],
+    c: [u8; 256],
+}
+
+impl RangeLuts {
+    fn limited() -> RangeLuts {
+        let mut y = [0u8; 256];
+        let mut c = [0u8; 256];
+        for v in 0..256 {
+            let f = v as f32;
+            y[v] = (16.0 + f * 219.0 / 255.0).round() as u8;
+            c[v] = (128.0 + (f - 128.0) * 224.0 / 255.0).round() as u8;
+        }
+        RangeLuts { y, c }
+    }
+}
+
+/// Copy a packed YUYV frame into `dst`, rescaling it to the limited range
+/// (Y at even offsets, Cb/Cr at odd ones). Row-parallel, so it costs about as
+/// much as the plain copy it replaces.
+fn copy_limited(dst: &mut [u8], src: &[u8], luts: &RangeLuts) {
+    const CHUNK: usize = 64 * 1024; // even, so Y/C parity holds in every chunk
+    dst.par_chunks_mut(CHUNK)
+        .zip(src.par_chunks(CHUNK))
+        .for_each(|(d, s)| {
+            for (dp, sp) in d.chunks_exact_mut(2).zip(s.chunks_exact(2)) {
+                dp[0] = luts.y[sp[0] as usize];
+                dp[1] = luts.c[sp[1] as usize];
+            }
+        });
+}
 
 /// `struct v4l2_pix_format` (uapi/linux/videodev2.h), 48 bytes on all ABIs.
 #[repr(C)]
@@ -279,6 +327,8 @@ pub struct LoopbackOutput {
     /// Buffer indices we currently own (dequeued / not yet queued). When empty,
     /// every buffer is in flight and the next write reclaims one via `DQBUF`.
     free: Vec<u32>,
+    /// Range maps when the output is limited range; `None` copies as is.
+    luts: Option<Box<RangeLuts>>,
 }
 
 impl LoopbackOutput {
@@ -288,7 +338,12 @@ impl LoopbackOutput {
 
     /// Open `path`, set its output format to YUYV `width`x`height`, allocate and
     /// map the MMAP output buffers, and start streaming.
-    pub fn open<P: AsRef<Path>>(path: P, width: u32, height: u32) -> io::Result<LoopbackOutput> {
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        width: u32,
+        height: u32,
+        range: YuvRange,
+    ) -> io::Result<LoopbackOutput> {
         // Guard the hand-laid ABI: a wrong size would make the kernel reject
         // (or mis-copy) the ioctl.
         const _: () = assert!(core::mem::size_of::<V4l2Format>() == 208);
@@ -304,7 +359,10 @@ impl LoopbackOutput {
             bytesperline: width * 2,
             sizeimage: width * height * 2,
             colorspace: V4L2_COLORSPACE_SRGB,
-            quantization: V4L2_QUANTIZATION_FULL_RANGE,
+            quantization: match range {
+                YuvRange::Limited => V4L2_QUANTIZATION_LIM_RANGE,
+                YuvRange::Full => V4L2_QUANTIZATION_FULL_RANGE,
+            },
             ..Default::default()
         };
         let mut fmt = V4l2Format {
@@ -379,6 +437,7 @@ impl LoopbackOutput {
             height,
             buffers,
             free,
+            luts: (range == YuvRange::Limited).then(|| Box::new(RangeLuts::limited())),
         })
     }
 
@@ -453,9 +512,12 @@ impl LoopbackOutput {
             )));
         }
         // SAFETY: `mb.ptr` maps `mb.len` writable bytes; we copy at most that many.
-        unsafe {
-            std::slice::from_raw_parts_mut(mb.ptr.as_ptr() as *mut u8, mb.len)[..yuyv.len()]
-                .copy_from_slice(yuyv);
+        let dst = unsafe {
+            &mut std::slice::from_raw_parts_mut(mb.ptr.as_ptr() as *mut u8, mb.len)[..yuyv.len()]
+        };
+        match &self.luts {
+            Some(l) => copy_limited(dst, yuyv, l),
+            None => dst.copy_from_slice(yuyv),
         }
 
         let mut qb = V4l2Buffer {
@@ -905,6 +967,27 @@ const TINT_CR: u8 = 230;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The limited-range maps hit the studio-range end points and keep the
+    /// chroma zero, and the parallel copy maps every Y and C byte by parity
+    /// (chunk boundaries included).
+    #[test]
+    fn limited_range_copy_maps_y_and_c() {
+        let l = RangeLuts::limited();
+        assert_eq!((l.y[0], l.y[255]), (16, 235));
+        assert_eq!((l.c[0], l.c[128], l.c[255]), (16, 128, 240));
+        let src: Vec<u8> = (0..300_000).map(|i| (i * 7 % 256) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        copy_limited(&mut dst, &src, &l);
+        for (i, (&d, &s)) in dst.iter().zip(&src).enumerate() {
+            let want = if i % 2 == 0 {
+                l.y[s as usize]
+            } else {
+                l.c[s as usize]
+            };
+            assert_eq!(d, want, "byte {i}");
+        }
+    }
 
     /// YUYV unpacking inverts the packing to within rounding.
     #[test]

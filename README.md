@@ -434,6 +434,7 @@ ffplay -f v4l2 /dev/video0
 | `--on-demand auto\|on\|off` | `auto` | open the camera and run the ISP only while an application is capturing (see [Roadmap](#roadmap)). `auto` self-gates when v4l2loopback exposes the client-usage event and otherwise streams always-on; `on` requires the event (warns and falls back if absent); `off` forces always-on. While idle the camera sensor stays runtime-suspended; the producer only writes cheap black keepalive frames so consumers can still negotiate the format. |
 | `--colour-config <path>` | `/etc/gc2607-isp/colour.conf` | run-time colour tuning file, re-read on every change (see [Run-time colour tuning](#run-time-colour-tuning)). An absent file means the built-in tuning. |
 | `--snapshot-dir <dir>` | `/var/lib/gc2607-isp/snapshots` | where debug snapshots are written (see [Run-time colour tuning](#run-time-colour-tuning)). |
+| `--full-range` | off (limited range) | write full-range YCbCr (Y 0..255) instead of the default limited range (Y 16..235, Cb/Cr 16..240). Chromium-based capture (browsers, Electron call clients) reads YUYV as limited range whatever the device declares, so full-range output shows there with ~16% more contrast, crushed shadows and stronger saturation. |
 
 Performance (Core Ultra 185H): `mhc` sustains the sensor's 30 fps at 8 threads
 (~29 at 4); `half` reaches 30 fps at 4 threads (~27 single-threaded). The
