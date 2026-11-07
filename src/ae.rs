@@ -150,17 +150,58 @@ impl Default for AeConfig {
     }
 }
 
+/// Split an exposure-time x gain product (lines x multiplier) into the sensor
+/// state that delivers it: exposure first within 30 fps, then a longer frame
+/// down to the `min_fps` floor, then gain (capped at `max_gain_index`).
+fn split_product(cfg: &AeConfig, product: f64) -> AeState {
+    let product = product.max(EXPOSURE_MIN as f64);
+    let vblank_floor = vblank_for_fps(cfg.min_fps);
+    let exp_cap_30fps = exposure_max(VBLANK_MIN) as f64;
+    let exp_cap_floor = exposure_max(vblank_floor);
+
+    let (exposure, vblank, gain_index) = if product <= exp_cap_30fps {
+        // Fits within 30 fps at unity gain.
+        let e = (product.round() as i32).clamp(EXPOSURE_MIN, exposure_max(VBLANK_MIN));
+        (e, VBLANK_MIN, 0u8)
+    } else if product <= exp_cap_floor as f64 {
+        // Extend the frame (lower fps) at unity gain before touching gain.
+        let needed_vts = product.round() as i32 + EXPOSURE_MARGIN;
+        let vb = (needed_vts - NATIVE_HEIGHT).clamp(VBLANK_MIN, vblank_floor);
+        let e = (product.round() as i32).clamp(EXPOSURE_MIN, exposure_max(vb));
+        (e, vb, 0u8)
+    } else {
+        // Exposure saturated at the fps floor: make up the rest with gain.
+        let e = exp_cap_floor;
+        let g = pick_gain_index(product / e as f64).min(cfg.max_gain_index);
+        (e, vblank_floor, g)
+    };
+    AeState {
+        exposure,
+        gain_index,
+        vblank,
+    }
+}
+
 /// Compute the next sensor state from the current state and the brightness
 /// `metric` (mean linear signal as a fraction of full scale, 0..1) measured on
 /// the frame captured with `state`.
 ///
-/// Returns `state` unchanged when the metric is within the deadband.
+/// Within the deadband the brightness is left alone, but a state whose frame
+/// length or gain does not match the current `min_fps` floor (one inherited
+/// from the sensor, or set under another floor) is re-split at the same
+/// product; otherwise `state` is returned unchanged.
 pub fn step(cfg: &AeConfig, state: AeState, metric: f64) -> AeState {
     let metric = metric.max(1e-4);
     let ratio = cfg.target / metric;
 
-    // Converged: leave the sensor untouched to avoid wobble.
+    let cur_product = state.exposure as f64 * GAIN_TABLE[state.gain_index as usize];
+
+    // Converged: leave the brightness untouched to avoid wobble.
     if (1.0 - cfg.deadband..=1.0 + cfg.deadband).contains(&ratio) {
+        let even = split_product(cfg, cur_product);
+        if even.vblank != state.vblank || even.gain_index != state.gain_index {
+            return even;
+        }
         return state;
     }
 
@@ -169,32 +210,12 @@ pub fn step(cfg: &AeConfig, state: AeState, metric: f64) -> AeState {
         .powf(cfg.damping)
         .clamp(1.0 / cfg.max_step, cfg.max_step);
 
-    let cur_mult = GAIN_TABLE[state.gain_index as usize];
-    let cur_product = state.exposure as f64 * cur_mult;
     // Desired exposure-time * gain product, in (lines * multiplier) units.
-    let target_product = (cur_product * r).max(EXPOSURE_MIN as f64);
-
-    let vblank_floor = vblank_for_fps(cfg.min_fps);
-    let exp_cap_30fps = exposure_max(VBLANK_MIN) as f64;
-    let exp_cap_floor = exposure_max(vblank_floor);
-
-    let (exposure, vblank, gain_index) = if target_product <= exp_cap_30fps {
-        // Fits within 30 fps at unity gain.
-        let e = (target_product.round() as i32).clamp(EXPOSURE_MIN, exposure_max(VBLANK_MIN));
-        (e, VBLANK_MIN, 0u8)
-    } else if target_product <= exp_cap_floor as f64 {
-        // Extend the frame (lower fps) at unity gain before touching gain.
-        let needed_vts = target_product.round() as i32 + EXPOSURE_MARGIN;
-        let vb = (needed_vts - NATIVE_HEIGHT).clamp(VBLANK_MIN, vblank_floor);
-        let e = (target_product.round() as i32).clamp(EXPOSURE_MIN, exposure_max(vb));
-        (e, vb, 0u8)
-    } else {
-        // Exposure saturated at the fps floor: make up the rest with gain.
-        let e = exp_cap_floor;
-        let remaining = target_product / e as f64;
-        let g = pick_gain_index(remaining).min(cfg.max_gain_index);
-        (e, vblank_floor, g)
-    };
+    let AeState {
+        exposure,
+        gain_index,
+        vblank,
+    } = split_product(cfg, cur_product * r);
 
     let mut next = AeState {
         exposure,
@@ -260,6 +281,93 @@ mod tests {
         };
         // metric == target -> ratio 1.0, inside deadband.
         assert_eq!(step(&cfg, st, cfg.target), st);
+    }
+
+    #[test]
+    fn converged_inherited_30fps_split_moves_to_the_fps_floor() {
+        // The sensor kept a 30 fps exposure with gain from a session run at a
+        // higher fps floor; on target brightness the split must still follow
+        // the current floor (longer exposure, less gain).
+        let cfg = AeConfig {
+            min_fps: 24.0,
+            ..AeConfig::default()
+        };
+        let st = AeState {
+            exposure: exposure_max(VBLANK_MIN),
+            gain_index: 11,
+            vblank: VBLANK_MIN,
+        };
+        let next = step(&cfg, st, cfg.target);
+        assert_eq!(next.vblank, vblank_for_fps(24.0));
+        assert_eq!(next.exposure, exposure_max(vblank_for_fps(24.0)));
+        assert!(next.gain_index < st.gain_index, "{next:?}");
+    }
+
+    #[test]
+    fn converged_frame_longer_than_the_floor_shortens() {
+        // The floor was raised (e.g. 15 -> 30 fps): a converged state running
+        // slower than the floor must come back to it.
+        let cfg = AeConfig {
+            min_fps: 30.0,
+            ..AeConfig::default()
+        };
+        let st = AeState {
+            exposure: exposure_max(vblank_for_fps(15.0)),
+            gain_index: 2,
+            vblank: vblank_for_fps(15.0),
+        };
+        let next = step(&cfg, st, cfg.target);
+        assert_eq!(next.vblank, VBLANK_MIN);
+        assert!(next.gain_index > st.gain_index, "{next:?}");
+    }
+
+    #[test]
+    fn converged_split_at_the_floor_holds() {
+        let cfg = AeConfig {
+            min_fps: 24.0,
+            ..AeConfig::default()
+        };
+        let vb = vblank_for_fps(24.0);
+        let st = AeState {
+            exposure: exposure_max(vb),
+            gain_index: 10,
+            vblank: vb,
+        };
+        assert_eq!(step(&cfg, st, cfg.target), st);
+        // A converged state that needs no gain holds too, whatever its frame.
+        let short = AeState {
+            exposure: 900,
+            gain_index: 0,
+            vblank: VBLANK_MIN,
+        };
+        assert_eq!(step(&cfg, short, cfg.target), short);
+    }
+
+    #[test]
+    fn dark_scene_settles_without_oscillation_at_a_lowered_floor() {
+        // Start from a 30 fps state with gain (as inherited from the sensor)
+        // in a scene that needs gain even at the 24 fps floor; once settled,
+        // the state must stop changing.
+        let cfg = AeConfig {
+            min_fps: 24.0,
+            target: 0.36,
+            ..AeConfig::default()
+        };
+        let k = cfg.target / 12_000.0; // metric = k * product
+        let mut st = AeState {
+            exposure: exposure_max(VBLANK_MIN),
+            gain_index: 11,
+            vblank: VBLANK_MIN,
+        };
+        let mut history = Vec::new();
+        for _ in 0..80 {
+            let product = st.exposure as f64 * GAIN_TABLE[st.gain_index as usize];
+            st = step(&cfg, st, (k * product).min(1.0));
+            history.push(st);
+        }
+        let tail = &history[history.len() - 30..];
+        assert!(tail.iter().all(|s| *s == tail[0]), "{tail:?}");
+        assert_eq!(tail[0].vblank, vblank_for_fps(24.0));
     }
 
     #[test]
