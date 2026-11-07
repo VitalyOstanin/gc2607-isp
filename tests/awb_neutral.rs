@@ -57,15 +57,20 @@ fn awb_ignores_dominant_saturated_object() {
     // 30% neutral, 70% saturated yellow: the yellow is the majority of bright
     // pixels, so an ungated median lands on the yellow chroma.
     let planes = yellow_dominated_scene(120, 100, 3);
-    let est = pipeline::estimate(&planes);
+    // The synthetic planes have no vignetting, so the measurement runs on the
+    // planes as they are; lens-shading correction would tint the flat surface.
+    let tuning = gc2607_isp::colour::ColourTuning {
+        awb_lsc: false,
+        ..Default::default()
+    };
+    let est = pipeline::estimate_tuned(&planes, &tuning);
 
     // Correct white balance neutralises the neutral surface: its raw chroma is
-    // (NEUTRAL_RG, NEUTRAL_BG), so the gains are the reciprocals — except the
-    // blue gain also carries the Axis-1 cooling trim (WB_BLUE_TRIM), applied on
-    // top of the neutral inverse. The test's point is robustness to the yellow
-    // object, so the expected blue includes the trim.
-    let want_r = 1.0 / NEUTRAL_RG as f64; // ~1.394
-    let want_b = (1.0 / NEUTRAL_BG as f64) * pipeline::WB_BLUE_TRIM; // ~2.690 * 1.05
+    // (NEUTRAL_RG, NEUTRAL_BG), so the gains are the reciprocals times the
+    // red/blue trims (WB_RED_TRIM, WB_BLUE_TRIM). The test's point is
+    // robustness to the yellow object, so the expected gains include the trims.
+    let want_r = (1.0 / NEUTRAL_RG as f64) * pipeline::WB_RED_TRIM; // ~1.394 * 1.05
+    let want_b = (1.0 / NEUTRAL_BG as f64) * pipeline::WB_BLUE_TRIM; // ~2.690 * 0.95
 
     assert!(
         (est.gains[0] - want_r).abs() < 0.05,

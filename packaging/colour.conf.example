@@ -9,8 +9,8 @@
 # White balance. Trims multiply the estimated red/blue gains (>1 adds that
 # colour). wb_fixed_rg/bg replace the AWB scene chroma (r/g, b/g; see "rg="
 # and "bg=" in the service log); set both, or 0 for automatic.
-wb_red_trim = 1.0       # 0.5..2.0
-wb_blue_trim = 1.05     # 0.5..2.0
+wb_red_trim = 1.05      # 0.5..2.0
+wb_blue_trim = 0.95     # 0.5..2.0
 wb_fixed_rg = 0         # 0 or 0.1..4.0
 wb_fixed_bg = 0         # 0 or 0.1..4.0
 
@@ -22,11 +22,11 @@ acm_strength = 1.0      # 0..1
 # Inside [lo, hi], with linear ramps of width soft at the edges, the chroma is
 # scaled by desat_k (<1 paler) and the hue rotated by hue_shift (positive:
 # toward orange, which turns a pinkish skin cast natural).
-skin_hue_lo = -20       # -180..180
+skin_hue_lo = -40       # -180..180
 skin_hue_hi = 45        # -180..180, above lo
 skin_hue_soft = 10      # 0.5..90
 skin_desat_k = 0.35     # 0..1.5
-skin_hue_shift = 0      # -60..60
+skin_hue_shift = 5      # -60..60
 
 # Yellow band, same meaning.
 yellow_hue_lo = 35
@@ -44,7 +44,7 @@ ae_target = 0           # 0 or 0.02..0.6
 # so the vignetting no longer leaves the frame centre to decide alone.
 # awb_locus_dist is how far from the white locus (raw r/g, b/g) a pixel may lie
 # and still count as neutral; lower rejects skin and other off-white colours.
-awb_lsc = 0             # 0 or 1
+awb_lsc = 1             # 0 or 1
 awb_locus_dist = 0.12   # 0.02..0.5
 
 # Chroma denoise (box blur on the chroma grid, blended back with a strength).

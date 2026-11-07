@@ -99,15 +99,20 @@ def m_robust_neutral(rgb, locus):
     return m[0] / m[1], m[2] / m[1]
 
 
-# Axis 1 white-balance cooling: the blue WB gain is scaled by WB_BLUE_TRIM so
-# the emitted white point matches the external USB reference more closely.
-# CCT estimation runs on the untouched chroma, so CCM/ACM selection is
-# unaffected. Mirrors pipeline::WB_BLUE_TRIM (must stay identical).
-WB_BLUE_TRIM = 1.05
+# White-balance trims on the red and blue WB gains. CCT estimation runs on the
+# untouched chroma, so CCM/ACM selection is unaffected. Mirrors
+# pipeline::WB_RED_TRIM / WB_BLUE_TRIM (must stay identical).
+WB_RED_TRIM = 1.05
+WB_BLUE_TRIM = 0.95
+
+# Measure the AWB chroma on lens-shading corrected planes (mirrors
+# pipeline::AWB_LSC and pipeline::awb_measure).
+AWB_LSC = True
 
 
 def gains_from_chroma(rg, bg):
-    return np.array([1.0 / rg, 1.0, (1.0 / bg) * WB_BLUE_TRIM], dtype=np.float64)
+    return np.array([(1.0 / rg) * WB_RED_TRIM, 1.0, (1.0 / bg) * WB_BLUE_TRIM],
+                    dtype=np.float64)
 
 
 def load_ccm_tuning():
@@ -141,18 +146,17 @@ LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
 
 # Axis 2 skin-red desaturation band. Mirrors pipeline.rs SKIN_* constants
 # (must stay identical).
-SKIN_HUE_LO = -20.0
+SKIN_HUE_LO = -40.0
 SKIN_HUE_HI = 45.0
 SKIN_HUE_SOFT = 10.0
 SKIN_DESAT_K = 0.35
+SKIN_HUE_SHIFT = 5.0
 
 
-def desaturate_band(rgb, lo, hi, soft, k):
-    """Scale chroma of pixels whose hue falls in the trapezoidal window
-    [lo, hi] (ramps of width `soft`) toward luminance gray by `k`, preserving
-    luma and hue (mirrors pipeline::desaturate_band). `rgb` is corrected linear
-    RGB (..,3); pixels outside the window and neutrals pass through."""
-    flat = rgb.reshape(-1, 3)
+def band_window(flat, lo, hi, soft):
+    """Weight of the trapezoidal hue window [lo, hi] (ramps of width `soft`)
+    per pixel of `flat` (P,3): 1 on the flat top, 0 outside and for neutrals
+    (mirrors pipeline::band_window)."""
     lr = np.maximum(flat[:, 0], 0.0)
     lg = np.maximum(flat[:, 1], 0.0)
     lb = np.maximum(flat[:, 2], 0.0)
@@ -169,10 +173,51 @@ def desaturate_band(rgb, lo, hi, soft, k):
     h = np.where(h > 180.0, h - 360.0, h)
     rise = np.clip((h - lo) / soft, 0.0, 1.0)
     fall = np.clip((hi - h) / soft, 0.0, 1.0)
-    win = np.where(safe, np.minimum(rise, fall), 0.0)
-    keff = 1.0 - win * (1.0 - k)
+    return np.where(safe, np.minimum(rise, fall), 0.0)
+
+
+def scale_chroma(flat, keff):
+    """Scale chroma toward luminance gray by per-pixel `keff`, keeping luma."""
     y = (flat * LUMA_WEIGHTS).sum(1)
-    out = y[:, None] + keff[:, None] * (flat - y[:, None])
+    return y[:, None] + keff[:, None] * (flat - y[:, None])
+
+
+def rotate_hue(flat, deg):
+    """Rotate hue by per-pixel `deg` degrees around the gray axis (positive:
+    red toward yellow), then restore the original luma (mirrors
+    pipeline::rotate_hue)."""
+    rad = np.radians(deg)
+    s, c = np.sin(rad), np.cos(rad)
+    a = (1.0 - c) / 3.0
+    q = s / np.sqrt(3.0)
+    r, g, b = flat[:, 0], flat[:, 1], flat[:, 2]
+    r2 = (c + a) * r + (a - q) * g + (a + q) * b
+    g2 = (a + q) * r + (c + a) * g + (a - q) * b
+    b2 = (a - q) * r + (a + q) * g + (c + a) * b
+    out = np.stack([r2, g2, b2], axis=1)
+    dy = (flat * LUMA_WEIGHTS).sum(1) - (out * LUMA_WEIGHTS).sum(1)
+    return out + dy[:, None]
+
+
+def desaturate_band(rgb, lo, hi, soft, k):
+    """Scale chroma of pixels whose hue falls in the trapezoidal window
+    [lo, hi] (ramps of width `soft`) toward luminance gray by `k`, preserving
+    luma and hue (mirrors pipeline::desaturate_band). `rgb` is corrected linear
+    RGB (..,3); pixels outside the window and neutrals pass through."""
+    flat = rgb.reshape(-1, 3)
+    win = band_window(flat, lo, hi, soft)
+    return scale_chroma(flat, 1.0 - win * (1.0 - k)).reshape(rgb.shape)
+
+
+def adjust_skin(rgb):
+    """Skin band: rotate the hue by SKIN_HUE_SHIFT and scale the chroma by
+    SKIN_DESAT_K, both weighted by the window (mirrors pipeline::adjust_skin)."""
+    flat = rgb.reshape(-1, 3)
+    win = band_window(flat, SKIN_HUE_LO, SKIN_HUE_HI, SKIN_HUE_SOFT)
+    if SKIN_HUE_SHIFT != 0.0:
+        flat = np.where((win > 0.0)[:, None], rotate_hue(flat, SKIN_HUE_SHIFT * win), flat)
+    out = np.where((win > 0.0)[:, None],
+                   scale_chroma(flat, 1.0 - win * (1.0 - SKIN_DESAT_K)), flat)
     return out.reshape(rgb.shape)
 
 
@@ -252,7 +297,7 @@ def apply_acm(rgb01, ccm, sectors, hue0, hue_step):
     meff = ccmf[None, :] * (1.0 - w)[:, None] + ms * w[:, None]          # (P,9)
     m = meff.reshape(-1, 3, 3)
     out = np.einsum("pij,pj->pi", m, flat)
-    out = desaturate_band(out, SKIN_HUE_LO, SKIN_HUE_HI, SKIN_HUE_SOFT, SKIN_DESAT_K)
+    out = adjust_skin(out)
     return desaturate_yellow(out).reshape(rgb01.shape)
 
 
@@ -340,6 +385,19 @@ def process(raw_path):
 
     rgb_lin = planes_to_rgb(gr, r, b, gb)               # pre-LSC, for estimation
     rg, bg = m_robust_neutral(rgb_lin, locus)
+    if AWB_LSC:
+        # Measure again on planes corrected with the grids of the source the
+        # uncorrected chroma points to, and once more if the corrected chroma
+        # points to another source (pipeline::awb_measure, first estimate).
+        def corrected(ls):
+            g = [bilinear_resize(grids[ls, c], hh, ww) for c in range(4)]
+            return m_robust_neutral(
+                planes_to_rgb(gr * g[0], r * g[1], b * g[2], gb * g[3]), locus)
+        ls0 = select_ls((rg, bg), lsc_chroma)
+        rg, bg = corrected(ls0)
+        ls1 = select_ls((rg, bg), lsc_chroma)
+        if ls1 != ls0:
+            rg, bg = corrected(ls1)
     gains = gains_from_chroma(rg, bg)
     cct = estimate_cct(rg, bg, ccts, locus)
     ccm = interp_ccm(cct, ccts, ccms)

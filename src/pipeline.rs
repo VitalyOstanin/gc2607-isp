@@ -194,7 +194,7 @@ const AWB_MIN_SAMPLES: usize = 100;
 /// collapses to fewer samples than before.
 pub(crate) const AWB_LOCUS_MAX_DIST: f64 = 0.12;
 
-/// Reusable scratch buffers for [`robust_neutral_into`] so the live runtimes do
+/// Reusable scratch buffers for [`robust_neutral_gated`] so the live runtimes do
 /// not reallocate the per-estimate working vectors every AWB interval. Held by
 /// `Processor`/`GpuProcessor`; cleared and refilled each estimate.
 #[derive(Default)]
@@ -284,16 +284,12 @@ fn awb_try_mask<P: Fn(usize) -> bool>(
 }
 
 /// Robust-neutral AWB: median chroma over bright, non-clipped pixels, with
-/// graceful fallbacks so the selection never collapses to empty. Allocates a
-/// throwaway scratch; live callers should prefer [`robust_neutral_into`].
-pub(crate) fn robust_neutral(p: &Planes) -> (f32, f32) {
-    robust_neutral_into(p, &mut AwbScratch::default())
-}
-
-/// As [`robust_neutral`], but reuses caller-owned scratch buffers. Result is
-/// bit-identical to the previous sort-based implementation: the same predicates
-/// select the same index sets and the percentile/median order statistics match.
-pub(crate) fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) {
+/// graceful fallbacks so the selection never collapses to empty, using
+/// caller-owned scratch buffers. Result is bit-identical to the previous
+/// sort-based implementation: the same predicates select the same index sets
+/// and the percentile/median order statistics match.
+#[cfg(test)]
+fn robust_neutral_into(p: &Planes, s: &mut AwbScratch) -> (f32, f32) {
     robust_neutral_gated(p, s, AWB_LOCUS_MAX_DIST)
 }
 
@@ -309,7 +305,7 @@ fn robust_neutral_gated(p: &Planes, s: &mut AwbScratch, locus_max: f64) -> (f32,
     raw
 }
 
-/// The mask cascade of [`robust_neutral_into`]; returns the chroma and the
+/// The mask cascade of [`robust_neutral_gated`]; returns the chroma and the
 /// 1-based number of the mask that produced it (7 = mean fallback).
 fn robust_neutral_select(p: &Planes, s: &mut AwbScratch, locus_max: f64) -> ((f32, f32), u8) {
     let n = p.hh * p.ww;
@@ -396,7 +392,8 @@ fn robust_neutral_select(p: &Planes, s: &mut AwbScratch, locus_max: f64) -> ((f3
 /// skewed by the vignetting (the dark, colour-shifted corners otherwise drop out
 /// and the frame centre decides alone). The grids are those of the previous
 /// light source, or, on the first estimate, of the source the uncorrected
-/// measurement points to.
+/// measurement points to (once more with the source the corrected one points
+/// to, if that differs).
 pub(crate) fn awb_measure(
     p: &Planes,
     s: &mut AwbScratch,
@@ -406,10 +403,26 @@ pub(crate) fn awb_measure(
     if !t.awb_lsc {
         return robust_neutral_gated(p, s, t.awb_locus_dist);
     }
-    let ls = prev_ls.unwrap_or_else(|| {
-        let (rg, bg) = robust_neutral_gated(p, s, t.awb_locus_dist);
-        select_ls_hyst(rg as f64, bg as f64, None)
-    });
+    if let Some(ls) = prev_ls {
+        return measure_lsc_corrected(p, s, ls, t.awb_locus_dist);
+    }
+    // First estimate: the uncorrected chroma picks the source; when the
+    // corrected measurement points to another one, measure once more with its
+    // grids, so the next (corrected, `prev_ls`) measurements of a steady scene
+    // repeat this one instead of stepping after the first frame.
+    let (rg, bg) = robust_neutral_gated(p, s, t.awb_locus_dist);
+    let ls0 = select_ls_hyst(rg as f64, bg as f64, None);
+    let (rg, bg) = measure_lsc_corrected(p, s, ls0, t.awb_locus_dist);
+    let ls1 = select_ls_hyst(rg as f64, bg as f64, None);
+    if ls1 == ls0 {
+        return (rg, bg);
+    }
+    measure_lsc_corrected(p, s, ls1, t.awb_locus_dist)
+}
+
+/// Robust-neutral chroma of the planes corrected with the lens-shading grids
+/// of light source `ls` (cached in the scratch across calls).
+fn measure_lsc_corrected(p: &Planes, s: &mut AwbScratch, ls: usize, gate: f64) -> (f32, f32) {
     if s.lsc_grids.as_ref().map(|g| (g.ls, g.hh, g.ww)) != Some((ls, p.hh, p.ww)) {
         s.lsc_grids = Some(build_grids(ls, p.hh, p.ww));
     }
@@ -434,7 +447,7 @@ pub(crate) fn awb_measure(
         scale(&mut corr.b, &p.b, &g.g_b);
         scale(&mut corr.gb, &p.gb, &g.g_gb);
     }
-    let out = robust_neutral_gated(&corr, s, t.awb_locus_dist);
+    let out = robust_neutral_gated(&corr, s, gate);
     s.lsc_planes = Some(corr);
     out
 }
@@ -799,21 +812,28 @@ const LUMA_B: f64 = 0.0722;
 /// yellow / orange-yellow hues toward their luminance gray by [`YELLOW_DESAT_K`],
 /// preserving luma and hue and leaving every other hue (and neutrals) untouched.
 /// Constants mirror reference_pipeline.py and the WGSL shader (`gpu.rs`).
-/// Axis 1 white-balance cooling. The calibrated AWB renders neutrals warmer
-/// than an external USB reference on the same scene (blue deficit ΔB/G ≈ −0.23).
-/// This multiplies the blue WB gain so the output white point shifts toward the
-/// reference. Applied to the gain only — CCT estimation and CCM/ACM selection
-/// run on the untouched scene chroma, so matrix choice (the colour-correction
-/// physics) is unchanged; only the emitted white point cools. One value for all
-/// CCTs (a deliberate simplification; cross-CCT safety is the sample-raw sanity
-/// check). Mirrors reference_pipeline.py::gains_from_chroma. Final value set by
-/// offline tuning (see docs/superpowers/plans).
-pub const WB_BLUE_TRIM: f64 = 1.05;
+/// White-balance trims: multipliers on the red and blue WB gains, applied to
+/// the gains only — CCT estimation and CCM/ACM selection run on the untouched
+/// scene chroma, so matrix choice (the colour-correction physics) is unchanged;
+/// only the emitted white point moves. One pair for all CCTs (a deliberate
+/// simplification). Set from live captures with the AWB measured on
+/// lens-shading corrected planes ([`AWB_LSC`]): a white door frame in daylight
+/// (CCT ~6400 K) and white headphones under LED room light (~3500 K) both land
+/// within ~3% of neutral in red, and blue is neutral under both. The exact
+/// trims are 1.08 in daylight and 1.02 under the lamp, so 1.05 splits the
+/// difference. Mirrors reference_pipeline.py::gains_from_chroma.
+pub const WB_RED_TRIM: f64 = 1.05;
+pub const WB_BLUE_TRIM: f64 = 0.95;
 
-/// The trim must cool, not warm: a value at or below 1.0 would shift the white
-/// point the wrong way. Checked at compile time so a mistuned constant fails the
-/// build rather than a test.
-const _: () = assert!(WB_BLUE_TRIM > 1.0);
+// The trims must stay within the range the run-time tuning file accepts.
+const _: () = assert!(WB_RED_TRIM >= 0.5 && WB_RED_TRIM <= 2.0);
+const _: () = assert!(WB_BLUE_TRIM >= 0.5 && WB_BLUE_TRIM <= 2.0);
+
+/// Measure the AWB scene chroma on lens-shading corrected planes (see
+/// [`awb_measure`]). Without it the vignetting darkens the frame corners below
+/// the brightness percentile, so the centre of the frame decides alone and a
+/// face there enters the white estimate.
+pub const AWB_LSC: bool = true;
 
 pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
 pub(crate) const YELLOW_HUE_LO: f64 = 35.0;
@@ -826,10 +846,14 @@ pub(crate) const YELLOW_HUE_SOFT: f64 = 12.0;
 /// skin, ~0 on neutrals). This compresses the chroma of that band toward luma.
 /// Constants mirror reference_pipeline.py and the WGSL shader (gpu.rs). Final
 /// SKIN_DESAT_K set by offline tuning (see docs/superpowers/plans).
-pub(crate) const SKIN_HUE_LO: f64 = -20.0;
+/// The band starts at -40 deg so pinkish skin (down to about -30 deg under
+/// the calibrated matrices) is inside the window, not on its ramp, and
+/// SKIN_HUE_SHIFT turns it slightly toward orange.
+pub(crate) const SKIN_HUE_LO: f64 = -40.0;
 pub(crate) const SKIN_HUE_HI: f64 = 45.0;
 pub(crate) const SKIN_HUE_SOFT: f64 = 10.0;
 pub(crate) const SKIN_DESAT_K: f64 = 0.35;
+pub(crate) const SKIN_HUE_SHIFT: f64 = 5.0;
 
 /// Weight of the trapezoidal hue window `[lo, hi]` (linear ramps of width
 /// `soft` at each edge) at the hue of corrected linear `(r, g, b)`: 1 on the
@@ -1056,14 +1080,9 @@ pub(crate) fn smooth_chroma(prev: Option<(f32, f32)>, rg: f32, bg: f32) -> (f32,
 }
 
 /// Build a full scene estimate (gains, CCT, LSC source, CCM) from an already
-/// chosen scene chroma. `prev_ls` enables LSC switch hysteresis for the live
-/// runtimes; stateless callers pass `None`.
-pub(crate) fn estimate_from_chroma(rg: f32, bg: f32, prev_ls: Option<usize>) -> Estimate {
-    estimate_from_chroma_tuned(rg, bg, prev_ls, &ColourTuning::default())
-}
-
-/// [`estimate_from_chroma`] with the run-time tuning: a fixed scene chroma
-/// replaces the measured one, and the red/blue trims scale the gains.
+/// chosen scene chroma under the run-time tuning: a fixed scene chroma replaces
+/// the measured one, and the red/blue trims scale the gains. `prev_ls` enables
+/// LSC switch hysteresis for the live runtimes; stateless callers pass `None`.
 pub(crate) fn estimate_from_chroma_tuned(
     rg: f32,
     bg: f32,
@@ -1078,8 +1097,8 @@ pub(crate) fn estimate_from_chroma_tuned(
     // to neutral so the gains stay finite instead of becoming inf/NaN.
     let rg = if rg.is_finite() && rg > 0.0 { rg } else { 1.0 };
     let bg = if bg.is_finite() && bg > 0.0 { bg } else { 1.0 };
-    // Blue gain carries the Axis-1 cooling trim; CCT below still uses the raw
-    // chroma, so matrix selection is unaffected.
+    // The gains carry the red/blue trims; CCT below still uses the raw chroma,
+    // so matrix selection is unaffected.
     let gains = [
         (1.0 / rg as f64) * t.wb_red_trim,
         1.0,
@@ -1101,12 +1120,19 @@ pub(crate) fn estimate_from_chroma_tuned(
     }
 }
 
-/// Estimate WB gains, CCT, LSC light source and CCM from the (pre-LSC) planes.
-/// Stateless (no temporal smoothing, plain nearest LSC source) — this is the
-/// reference path the golden test pins; the live runtimes smooth on top of it.
+/// Estimate WB gains, CCT, LSC light source and CCM from the planes with the
+/// built-in tuning. Stateless (no temporal smoothing, plain nearest LSC source)
+/// — this is the reference path the golden test pins; the live runtimes smooth
+/// on top of it, and their first frame reproduces it exactly.
 pub fn estimate(p: &Planes) -> Estimate {
-    let (rg, bg) = robust_neutral(p);
-    estimate_from_chroma(rg, bg, None)
+    estimate_tuned(p, &ColourTuning::default())
+}
+
+/// [`estimate`] with an explicit run-time tuning (AWB measurement switches and
+/// trims).
+pub fn estimate_tuned(p: &Planes, t: &ColourTuning) -> Estimate {
+    let (rg, bg) = awb_measure(p, &mut AwbScratch::default(), None, t);
+    estimate_from_chroma_tuned(rg, bg, None, t)
 }
 
 /// Bilinear resize of a `gh*gw` grid to `out_h*out_w` (numpy linspace semantics).
@@ -2125,8 +2151,8 @@ mod tests {
         }
     }
 
-    /// With the default tuning the live AWB measurement is the reference one;
-    /// with `awb_lsc` the corrected planes give a finite chroma and keep the
+    /// Without `awb_lsc` the live AWB measurement is the plain robust-neutral
+    /// one; with it the corrected planes give a finite chroma and keep the
     /// selection on the plane grid.
     #[test]
     fn awb_measure_default_is_reference() {
@@ -2142,7 +2168,10 @@ mod tests {
         };
         let mut a = AwbScratch::default();
         let mut b = AwbScratch::default();
-        let t = ColourTuning::default();
+        let t = ColourTuning {
+            awb_lsc: false,
+            ..ColourTuning::default()
+        };
         assert_eq!(
             awb_measure(&p, &mut a, None, &t),
             robust_neutral_into(&p, &mut b)
@@ -2195,11 +2224,13 @@ mod tests {
         assert!((r3 - r).abs() < 1e-12 && (g3 - g).abs() < 1e-12 && (b3 - b).abs() < 1e-12);
     }
 
-    /// With no hue shift the skin adjustment is exactly the band desaturation,
-    /// so the default tuning reproduces the reference render.
+    /// With no hue shift the skin adjustment is exactly the band desaturation.
     #[test]
     fn adjust_skin_without_shift_is_desaturate_band() {
-        let t = ColourTuning::default();
+        let t = ColourTuning {
+            skin_hue_shift: 0.0,
+            ..ColourTuning::default()
+        };
         for &(r, g, b) in &[
             (0.60, 0.15, 0.22),
             (0.5, 0.3, 0.2),
@@ -2240,23 +2271,21 @@ mod tests {
         }
     }
 
-    /// Axis 1: the blue WB gain is the neutral inverse times WB_BLUE_TRIM, and
-    /// the red/green gains stay the plain neutral inverse. A trim > 1 cools the
-    /// white point (more blue) without touching CCT selection.
+    /// The red and blue WB gains are the neutral inverse times the trims, the
+    /// green gain stays 1, and CCT selection ignores the trims.
     #[test]
-    fn blue_gain_carries_wb_blue_trim() {
+    fn gains_carry_wb_trims() {
         let (rg, bg) = (0.638_f32, 0.447_f32); // a real on-locus scene chroma
-        let est = estimate_from_chroma(rg, bg, None);
+        let est = estimate_from_chroma_tuned(rg, bg, None, &ColourTuning::default());
         assert!(
-            (est.gains[0] - 1.0 / rg as f64).abs() < 1e-12,
-            "red gain unchanged"
+            (est.gains[0] - (1.0 / rg as f64) * WB_RED_TRIM).abs() < 1e-12,
+            "red gain = (1/rg) * WB_RED_TRIM"
         );
         assert!((est.gains[1] - 1.0).abs() < 1e-12, "green gain is 1");
         assert!(
             (est.gains[2] - (1.0 / bg as f64) * WB_BLUE_TRIM).abs() < 1e-12,
             "blue gain = (1/bg) * WB_BLUE_TRIM"
         );
-        // That the trim cools rather than warms is asserted at compile time
-        // where the constant is defined.
+        assert_eq!(est.cct, estimate_cct(rg as f64, bg as f64));
     }
 }

@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::pipeline::{
-    AWB_LOCUS_MAX_DIST, SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO, SKIN_HUE_SOFT, WB_BLUE_TRIM,
-    YELLOW_DESAT_K, YELLOW_HUE_HI, YELLOW_HUE_LO, YELLOW_HUE_SOFT,
+    AWB_LOCUS_MAX_DIST, AWB_LSC, SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO, SKIN_HUE_SHIFT,
+    SKIN_HUE_SOFT, WB_BLUE_TRIM, WB_RED_TRIM, YELLOW_DESAT_K, YELLOW_HUE_HI, YELLOW_HUE_LO,
+    YELLOW_HUE_SOFT,
 };
 
 /// Default location of the run-time tuning file.
@@ -119,7 +120,7 @@ impl Default for Debug {
 impl Default for ColourTuning {
     fn default() -> Self {
         ColourTuning {
-            wb_red_trim: 1.0,
+            wb_red_trim: WB_RED_TRIM,
             wb_blue_trim: WB_BLUE_TRIM,
             wb_fixed: None,
             acm_strength: 1.0,
@@ -129,7 +130,7 @@ impl Default for ColourTuning {
                 soft: SKIN_HUE_SOFT,
                 k: SKIN_DESAT_K,
             },
-            skin_hue_shift: 0.0,
+            skin_hue_shift: SKIN_HUE_SHIFT,
             yellow: Band {
                 lo: YELLOW_HUE_LO,
                 hi: YELLOW_HUE_HI,
@@ -138,7 +139,7 @@ impl Default for ColourTuning {
             },
             saturation: 1.0,
             ae_target: None,
-            awb_lsc: false,
+            awb_lsc: AWB_LSC,
             awb_locus_dist: AWB_LOCUS_MAX_DIST,
             denoise_chroma_radius: None,
             denoise_chroma_strength: None,
@@ -433,7 +434,7 @@ mod tests {
     #[test]
     fn defaults_equal_constants() {
         let t = ColourTuning::default();
-        assert_eq!(t.wb_blue_trim, WB_BLUE_TRIM);
+        assert_eq!((t.wb_red_trim, t.wb_blue_trim), (WB_RED_TRIM, WB_BLUE_TRIM));
         assert_eq!(
             (t.skin.lo, t.skin.hi, t.skin.soft, t.skin.k),
             (SKIN_HUE_LO, SKIN_HUE_HI, SKIN_HUE_SOFT, SKIN_DESAT_K)
@@ -448,16 +449,11 @@ mod tests {
             )
         );
         assert_eq!(
-            (
-                t.wb_red_trim,
-                t.acm_strength,
-                t.skin_hue_shift,
-                t.saturation
-            ),
-            (1.0, 1.0, 0.0, 1.0)
+            (t.acm_strength, t.skin_hue_shift, t.saturation),
+            (1.0, SKIN_HUE_SHIFT, 1.0)
         );
         assert_eq!((t.wb_fixed, t.ae_target), (None, None));
-        assert_eq!((t.awb_lsc, t.awb_locus_dist), (false, AWB_LOCUS_MAX_DIST));
+        assert_eq!((t.awb_lsc, t.awb_locus_dist), (AWB_LSC, AWB_LOCUS_MAX_DIST));
     }
 
     /// The shipped example lists every key at its default value.

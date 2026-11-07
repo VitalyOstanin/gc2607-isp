@@ -171,7 +171,9 @@ raw SGRBG10 (1928x1088)
 ```
 
 White balance, CCT and the lens-shading light source are estimated on the
-post-BLC frame, before LSC is applied.
+post-BLC frame. The white balance is measured on lens-shading corrected data
+(with the grids of the source the uncorrected frame points to, then of the
+current one), so the dark frame corners count as much as the centre.
 
 The colour step is hue-sectored: beyond the single global matrix, 24 per-hue
 matrices refine the correction by the colour's hue, fading to the global matrix
