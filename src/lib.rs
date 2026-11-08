@@ -10,6 +10,7 @@ pub mod colour;
 pub mod pipeline;
 pub mod raw;
 pub mod recovery;
+pub mod tune_file;
 pub mod tuning;
 pub mod tuning_data;
 
