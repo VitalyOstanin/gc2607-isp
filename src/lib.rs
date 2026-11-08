@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod presets;
 pub mod raw;
 pub mod recovery;
+pub mod snapshot_request;
 pub mod tune_file;
 pub mod tuning;
 pub mod tuning_data;
