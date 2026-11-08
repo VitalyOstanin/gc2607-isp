@@ -138,7 +138,7 @@ ACM_SAT_KNEE = 0.10
 # from a saturated yellow, rendering it far purer than ground truth. This scales
 # yellow / orange-yellow chroma toward luminance gray by YELLOW_DESAT_K,
 # preserving luma and hue. Mirrors pipeline::desaturate_yellow (Rust / WGSL).
-YELLOW_DESAT_K = 0.70
+YELLOW_DESAT_K = 0.95
 YELLOW_HUE_LO = 35.0
 YELLOW_HUE_HI = 80.0
 YELLOW_HUE_SOFT = 12.0
@@ -146,11 +146,14 @@ LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
 
 # Axis 2 skin-red desaturation band. Mirrors pipeline.rs SKIN_* constants
 # (must stay identical).
-SKIN_HUE_LO = -40.0
+SKIN_HUE_LO = -75.0
 SKIN_HUE_HI = 45.0
 SKIN_HUE_SOFT = 10.0
-SKIN_DESAT_K = 0.35
-SKIN_HUE_SHIFT = 5.0
+SKIN_DESAT_K = 0.55
+SKIN_HUE_SHIFT = 15.0
+
+# Global chroma factor after the bands; mirrors pipeline.rs SATURATION.
+SATURATION = 1.15
 
 
 def band_window(flat, lo, hi, soft):
@@ -298,7 +301,11 @@ def apply_acm(rgb01, ccm, sectors, hue0, hue_step):
     m = meff.reshape(-1, 3, 3)
     out = np.einsum("pij,pj->pi", m, flat)
     out = adjust_skin(out)
-    return desaturate_yellow(out).reshape(rgb01.shape)
+    out = desaturate_yellow(out)
+    if SATURATION != 1.0:
+        flat = out.reshape(-1, 3)
+        out = scale_chroma(flat, np.full(len(flat), SATURATION))
+    return out.reshape(rgb01.shape)
 
 
 def project_to_locus(chroma, locus):

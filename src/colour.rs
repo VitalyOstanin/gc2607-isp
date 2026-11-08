@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::pipeline::{
-    AWB_LOCUS_MAX_DIST, AWB_LSC, SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO, SKIN_HUE_SHIFT,
-    SKIN_HUE_SOFT, WB_BLUE_TRIM, WB_RED_TRIM, YELLOW_DESAT_K, YELLOW_HUE_HI, YELLOW_HUE_LO,
-    YELLOW_HUE_SOFT,
+    AWB_LOCUS_MAX_DIST, AWB_LSC, SATURATION, SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO,
+    SKIN_HUE_SHIFT, SKIN_HUE_SOFT, WB_BLUE_TRIM, WB_RED_TRIM, YELLOW_DESAT_K, YELLOW_HUE_HI,
+    YELLOW_HUE_LO, YELLOW_HUE_SOFT,
 };
 
 /// Default location of the run-time tuning file.
@@ -137,7 +137,7 @@ impl Default for ColourTuning {
                 soft: YELLOW_HUE_SOFT,
                 k: YELLOW_DESAT_K,
             },
-            saturation: 1.0,
+            saturation: SATURATION,
             ae_target: None,
             awb_lsc: AWB_LSC,
             awb_locus_dist: AWB_LOCUS_MAX_DIST,
@@ -248,7 +248,7 @@ pub const KEYS: &[KeySpec] = &[
     key("yellow_hue_hi", K::Number, -180.0, 180.0, YELLOW_HUE_HI, G::Yellow),
     key("yellow_hue_soft", K::Number, 0.5, 90.0, YELLOW_HUE_SOFT, G::Yellow),
     key("yellow_desat_k", K::Number, 0.0, 1.5, YELLOW_DESAT_K, G::Yellow),
-    key("saturation", K::Number, 0.0, 2.0, 1.0, G::Colour),
+    key("saturation", K::Number, 0.0, 2.0, SATURATION, G::Colour),
     key("ae_target", K::NumberOrAuto, 0.02, 0.6, 0.0, G::Exposure),
     key("awb_lsc", K::Switch, 0.0, 1.0, AWB_LSC as u8 as f64, G::Awb),
     key("awb_locus_dist", K::Number, 0.02, 0.5, AWB_LOCUS_MAX_DIST, G::Awb),
@@ -506,7 +506,7 @@ mod tests {
         );
         assert_eq!(
             (t.acm_strength, t.skin_hue_shift, t.saturation),
-            (1.0, SKIN_HUE_SHIFT, 1.0)
+            (1.0, SKIN_HUE_SHIFT, SATURATION)
         );
         assert_eq!((t.wb_fixed, t.ae_target), (None, None));
         assert_eq!((t.awb_lsc, t.awb_locus_dist), (AWB_LSC, AWB_LOCUS_MAX_DIST));

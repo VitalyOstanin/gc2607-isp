@@ -835,7 +835,10 @@ const _: () = assert!(WB_BLUE_TRIM >= 0.5 && WB_BLUE_TRIM <= 2.0);
 /// face there enters the white estimate.
 pub const AWB_LSC: bool = true;
 
-pub(crate) const YELLOW_DESAT_K: f64 = 0.70;
+/// [`YELLOW_DESAT_K`] 0.95 (nearly off): with the skin band below and the
+/// global [`SATURATION`] lift, a stronger yellow cut left beige surfaces and
+/// faces pale on video calls (live comparison, November 2026).
+pub(crate) const YELLOW_DESAT_K: f64 = 0.95;
 pub(crate) const YELLOW_HUE_LO: f64 = 35.0;
 pub(crate) const YELLOW_HUE_HI: f64 = 80.0;
 pub(crate) const YELLOW_HUE_SOFT: f64 = 12.0;
@@ -846,14 +849,20 @@ pub(crate) const YELLOW_HUE_SOFT: f64 = 12.0;
 /// skin, ~0 on neutrals). This compresses the chroma of that band toward luma.
 /// Constants mirror reference_pipeline.py and the WGSL shader (gpu.rs). Final
 /// SKIN_DESAT_K set by offline tuning (see docs/superpowers/plans).
-/// The band starts at -40 deg so pinkish skin (down to about -30 deg under
-/// the calibrated matrices) is inside the window, not on its ramp, and
-/// SKIN_HUE_SHIFT turns it slightly toward orange.
-pub(crate) const SKIN_HUE_LO: f64 = -40.0;
+/// The band starts at -75 deg so pinkish-magenta skin in shadow (under the chin
+/// on video calls, down to about -60 deg) is inside the window, not on its
+/// ramp, and SKIN_HUE_SHIFT turns it toward orange. Set from live captures in
+/// lamp light and daylight (November 2026): skin lands at 25..28 deg.
+pub(crate) const SKIN_HUE_LO: f64 = -75.0;
 pub(crate) const SKIN_HUE_HI: f64 = 45.0;
 pub(crate) const SKIN_HUE_SOFT: f64 = 10.0;
-pub(crate) const SKIN_DESAT_K: f64 = 0.35;
-pub(crate) const SKIN_HUE_SHIFT: f64 = 5.0;
+pub(crate) const SKIN_DESAT_K: f64 = 0.55;
+pub(crate) const SKIN_HUE_SHIFT: f64 = 15.0;
+
+/// Global chroma factor applied after the hue bands (1 = unchanged). A mild
+/// lift: with the skin and yellow bands alone, faces and beige surfaces read
+/// pale next to a phone camera on the same call. Mirrors reference_pipeline.py.
+pub(crate) const SATURATION: f64 = 1.15;
 
 /// Weight of the trapezoidal hue window `[lo, hi]` (linear ramps of width
 /// `soft` at each edge) at the hue of corrected linear `(r, g, b)`: 1 on the
@@ -2098,7 +2107,15 @@ mod tests {
     #[test]
     fn band_matches_legacy_yellow() {
         let (r, g, b) = (0.50, 0.50, 0.03);
-        let (rb, gb, bb) = desaturate_band(r, g, b, 35.0, 80.0, 12.0, 0.70);
+        let (rb, gb, bb) = desaturate_band(
+            r,
+            g,
+            b,
+            YELLOW_HUE_LO,
+            YELLOW_HUE_HI,
+            YELLOW_HUE_SOFT,
+            YELLOW_DESAT_K,
+        );
         let (ry, gy, by) = desaturate_yellow(r, g, b);
         assert!((rb - ry).abs() < 1e-12 && (gb - gy).abs() < 1e-12 && (bb - by).abs() < 1e-12);
     }

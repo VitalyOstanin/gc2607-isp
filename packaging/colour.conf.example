@@ -22,20 +22,20 @@ acm_strength = 1.0      # 0..1
 # Inside [lo, hi], with linear ramps of width soft at the edges, the chroma is
 # scaled by desat_k (<1 paler) and the hue rotated by hue_shift (positive:
 # toward orange, which turns a pinkish skin cast natural).
-skin_hue_lo = -40       # -180..180
+skin_hue_lo = -75       # -180..180
 skin_hue_hi = 45        # -180..180, above lo
 skin_hue_soft = 10      # 0.5..90
-skin_desat_k = 0.35     # 0..1.5
-skin_hue_shift = 5      # -60..60
+skin_desat_k = 0.55     # 0..1.5
+skin_hue_shift = 15     # -60..60
 
 # Yellow band, same meaning.
 yellow_hue_lo = 35
 yellow_hue_hi = 80
 yellow_hue_soft = 12
-yellow_desat_k = 0.70
+yellow_desat_k = 0.95
 
 # Global chroma factor, applied last.
-saturation = 1.0        # 0..2
+saturation = 1.15       # 0..2
 
 # Auto-exposure target in linear light; 0 keeps the --target value (0.15).
 ae_target = 0           # 0 or 0.02..0.6
