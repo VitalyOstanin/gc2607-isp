@@ -891,9 +891,15 @@ fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
 
 /// Inverse of [`rgb_to_ycbcr`] (full-range BT.601) for one pixel.
 fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
-    let y = y as f32;
-    let cb = cb as f32 - CHROMA_NEUTRAL;
-    let cr = cr as f32 - CHROMA_NEUTRAL;
+    ycbcr_f32_to_rgb(
+        y as f32,
+        cb as f32 - CHROMA_NEUTRAL,
+        cr as f32 - CHROMA_NEUTRAL,
+    )
+}
+
+/// Full-range BT.601 `Y'CbCr` to RGB8; `cb` and `cr` are centred on 0.
+fn ycbcr_f32_to_rgb(y: f32, cb: f32, cr: f32) -> [u8; 3] {
     let px = |v: f32| v.round().clamp(0.0, 255.0) as u8;
     [
         px(y + 1.402 * cr),
@@ -916,6 +922,34 @@ pub fn yuyv_to_rgb(yuyv: &[u8], w: usize, h: usize) -> Vec<u8> {
         out[3..].copy_from_slice(&ycbcr_to_rgb(y1, cb, cr));
     }
     rgb
+}
+
+/// Unpack a YUYV frame to RGBA8 for display, keeping every `step`-th pixel of
+/// every `step`-th row (`step` >= 1). `limited` expands limited range
+/// (Y 16..235, C 16..240) to full range first, as browsers do.
+pub fn yuyv_to_rgba(yuyv: &[u8], w: usize, h: usize, limited: bool, step: usize) -> Vec<u8> {
+    let step = step.max(1);
+    let (ow, oh) = (w.div_ceil(step), h.div_ceil(step));
+    let mut out = Vec::with_capacity(ow * oh * 4);
+    let (y_off, y_gain, c_gain) = if limited {
+        (16.0, 255.0 / 219.0, 255.0 / 224.0)
+    } else {
+        (0.0, 1.0, 1.0)
+    };
+    for y in (0..h).step_by(step) {
+        let row = &yuyv[y * w * 2..(y + 1) * w * 2];
+        for x in (0..w).step_by(step) {
+            let word = &row[(x & !1) * 2..(x & !1) * 2 + 4];
+            let luma = if x & 1 == 0 { word[0] } else { word[2] };
+            let rgb = ycbcr_f32_to_rgb(
+                (luma as f32 - y_off) * y_gain,
+                (word[1] as f32 - CHROMA_NEUTRAL) * c_gain,
+                (word[3] as f32 - CHROMA_NEUTRAL) * c_gain,
+            );
+            out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+    }
+    out
 }
 
 /// Where the output frame sits on the half-res AWB planes: the output is a
@@ -974,6 +1008,31 @@ const TINT_CR: u8 = 230;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn yuyv_to_rgba_handles_both_ranges() {
+        // One YUYV word = two pixels: black then white, neutral chroma.
+        let limited = [16u8, 128, 235, 128];
+        let rgba = yuyv_to_rgba(&limited, 2, 1, true, 1);
+        assert_eq!(rgba, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        let full = [0u8, 128, 255, 128];
+        let rgba = yuyv_to_rgba(&full, 2, 1, false, 1);
+        assert_eq!(rgba, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+        // Limited-range chroma extremes reach the full-range ones: Cr 240
+        // limited is Cr 255.5 full, so red clips at 255 in both.
+        let red_l = yuyv_to_rgba(&[81u8, 90, 81, 240], 2, 1, true, 1);
+        let red_f = yuyv_to_rgba(&[76u8, 85, 76, 255], 2, 1, false, 1);
+        for (a, b) in red_l.iter().zip(&red_f) {
+            assert!(a.abs_diff(*b) <= 3, "{red_l:?} vs {red_f:?}");
+        }
+        // step 2 keeps every second pixel of every second row: 4x2 -> 2x1,
+        // and odd pixels take the second luma of their word.
+        let frame: Vec<u8> = [16u8, 128, 235, 128].repeat(4);
+        let small = yuyv_to_rgba(&frame, 4, 2, true, 2);
+        assert_eq!(small, vec![0, 0, 0, 255, 0, 0, 0, 255]);
+        let odd = yuyv_to_rgba(&[16u8, 128, 235, 128], 2, 1, true, 1);
+        assert_eq!(&odd[4..], &[255, 255, 255, 255]);
+    }
 
     /// The limited-range maps hit the studio-range end points and keep the
     /// chroma zero, and the parallel copy maps every Y and C byte by parity
