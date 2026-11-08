@@ -27,6 +27,11 @@ rayon = { version = "1.12", optional = true }
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
+# Run-time tuning window (gc2607-tune). Optional: only the tuning tool needs a
+# GUI toolkit; the service binary stays without it. Rendered through OpenGL
+# (glow) rather than wgpu: eframe tracks a newer wgpu major than the GPU
+# backend, and two wgpu stacks in one build double the compile time.
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 
 [features]
 # Live video runtime: V4L2 sensor control (AE), v4l2loopback output, and
@@ -36,6 +41,8 @@ video = ["dep:nix", "dep:rayon"]
 capture = ["dep:libcamera", "video"]
 # GPU backend (wgpu/Vulkan). Self-contained; selectable at runtime (--backend gpu).
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Run-time tuning window (gc2607-tune): edits colour.conf, shows the camera.
+tune = ["dep:eframe", "video"]
 
 [dev-dependencies]
 # Reference Malvar-He-Cutler implementation. Used only by the validation test
@@ -69,6 +76,11 @@ required-features = ["capture"]
 name = "gpu-probe"
 path = "src/bin/gpu_probe.rs"
 required-features = ["gpu"]
+
+[[bin]]
+name = "gc2607-tune"
+path = "src/bin/tune.rs"
+required-features = ["tune"]
 
 [profile.release]
 opt-level = 3
