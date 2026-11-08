@@ -547,7 +547,7 @@ The project has three build profiles with different system requirements:
 
 The offline CLI and the GPU backend are pure Rust and build on any distribution
 with a current stable toolchain; they were developed and tested with Rust
-1.88.0 (pinned in `Containerfile`). Only the `capture` feature needs system
+1.99.1 (pinned in `Containerfile`). Only the `capture` feature needs system
 libraries.
 
 ### libcamera version

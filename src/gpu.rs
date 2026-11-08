@@ -621,7 +621,7 @@ pub struct DenoiseParams {
 pub fn copy_from_mapped(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     #[cfg(target_arch = "x86_64")]
-    if src.as_ptr() as usize % 16 == 0 && std::arch::is_x86_feature_detected!("sse4.1") {
+    if (src.as_ptr() as usize).is_multiple_of(16) && std::arch::is_x86_feature_detected!("sse4.1") {
         // SAFETY: SSE4.1 is present (checked above), and `src` is 16-byte
         // aligned as `_mm_stream_load_si128` requires.
         unsafe { copy_stream_sse41(dst, src) };
@@ -1225,7 +1225,7 @@ impl GpuProcessor {
         self.timing.estimate = None;
         let prev_ls = self.est.as_ref().map(|e| e.ls);
         let first = self.est.is_none();
-        let due = self.frame % self.interval == 0 || self.force_estimate;
+        let due = self.frame.is_multiple_of(self.interval) || self.force_estimate;
         let (started, measured) = self.awb.step(bytes, first, due, prev_ls, &self.tuning)?;
         if started {
             self.force_estimate = false;
@@ -1414,7 +1414,10 @@ mod tests {
             })
             .unwrap();
         let data = slice.get_mapped_range();
-        eprintln!("mapped ptr align 64: {}", data.as_ptr() as usize % 64 == 0);
+        eprintln!(
+            "mapped ptr align 64: {}",
+            (data.as_ptr() as usize).is_multiple_of(64)
+        );
         let mut dst = vec![0u8; n];
         for round in 0..3 {
             let t = std::time::Instant::now();

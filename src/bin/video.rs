@@ -1650,7 +1650,7 @@ fn run_live(
                 // Make the failure observable (throttled) so a systematic ISP/GPU
                 // fault does not look like a silently idle daemon.
                 errors += 1;
-                if errors <= 5 || errors % 100 == 0 {
+                if errors <= 5 || errors.is_multiple_of(100) {
                     eprintln!("frame {frames}: skipped ({errors} total): {reason}");
                 }
                 false
@@ -1835,7 +1835,7 @@ fn run_on_demand(
     // test/splash source. (A single priming write is not enough: consumers need a
     // continuously streaming producer to negotiate and pre-roll.)
     let mut standby = vec![0u8; out.frame_size()];
-    for px in standby.chunks_exact_mut(2) {
+    for px in standby.as_chunks_mut::<2>().0 {
         px[1] = 128;
     }
 

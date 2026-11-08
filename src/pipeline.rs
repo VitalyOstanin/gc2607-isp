@@ -1932,7 +1932,7 @@ impl Processor {
         // measurement is applied here; the first frame waits for its own.
         let prev_ls = self.est.as_ref().map(|e| e.ls);
         let first = self.est.is_none();
-        let due = self.frame % self.interval == 0 || self.force_estimate;
+        let due = self.frame.is_multiple_of(self.interval) || self.force_estimate;
         let (started, measured) = self.awb.step(bytes, first, due, prev_ls, &self.tuning)?;
         if started {
             self.force_estimate = false;

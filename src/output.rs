@@ -77,7 +77,12 @@ fn copy_limited(dst: &mut [u8], src: &[u8], luts: &RangeLuts) {
     dst.par_chunks_mut(CHUNK)
         .zip(src.par_chunks(CHUNK))
         .for_each(|(d, s)| {
-            for (dp, sp) in d.chunks_exact_mut(2).zip(s.chunks_exact(2)) {
+            for (dp, sp) in d
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(s.as_chunks::<2>().0)
+            {
                 dp[0] = luts.y[sp[0] as usize];
                 dp[1] = luts.c[sp[1] as usize];
             }
@@ -642,7 +647,7 @@ pub fn rgb_to_yuyv_crop(
     dst_w: usize,
     dst_h: usize,
 ) {
-    debug_assert!(dst_w % 2 == 0);
+    debug_assert!(dst_w.is_multiple_of(2));
     debug_assert!(dst_w <= src_w && dst_h <= src_h);
     debug_assert_eq!(dst.len(), dst_w * dst_h * 2);
 
@@ -687,7 +692,7 @@ pub fn rgb_to_yuyv_crop(
 /// chroma sample. `radius == 0` or `strength <= 0` is a no-op.
 pub fn denoise_chroma_yuyv(buf: &mut [u8], w: usize, h: usize, radius: usize, strength: f64) {
     debug_assert_eq!(buf.len(), w * h * 2);
-    debug_assert!(w % 2 == 0);
+    debug_assert!(w.is_multiple_of(2));
     if radius == 0 || strength <= 0.0 {
         return;
     }
@@ -901,8 +906,10 @@ fn ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
 pub fn yuyv_to_rgb(yuyv: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut rgb = vec![0u8; w * h * 3];
     for (word, out) in yuyv[..w * h * 2]
-        .chunks_exact(4)
-        .zip(rgb.chunks_exact_mut(6))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgb.as_chunks_mut::<6>().0)
     {
         let (y0, cb, y1, cr) = (word[0], word[1], word[2], word[3]);
         out[..3].copy_from_slice(&ycbcr_to_rgb(y0, cb, cr));
@@ -949,7 +956,7 @@ pub fn tint_selection_yuyv(
         .enumerate()
         .for_each(|(y, row)| {
             let py = (off_y + y) / map.scale;
-            for (pair, word) in row.chunks_exact_mut(4).enumerate() {
+            for (pair, word) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let x = pair * 2;
                 let hit = |dx: usize| mask[py * map.plane_w + (off_x + x + dx) / map.scale];
                 if hit(0) || hit(1) {

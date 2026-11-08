@@ -564,7 +564,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now gc2607-camera
 
 Офлайн-CLI и GPU-бэкенд написаны на чистом Rust и собираются на любом
 дистрибутиве с актуальным стабильным toolchain; разрабатывались и тестировались
-на Rust 1.88.0 (зафиксирован в `Containerfile`). Системные библиотеки нужны
+на Rust 1.99.1 (зафиксирован в `Containerfile`). Системные библиотеки нужны
 только фиче `capture`.
 
 ### Версия libcamera
