@@ -152,66 +152,123 @@ impl Default for ColourTuning {
 /// Largest accepted chroma-denoise radius (the blur cost grows with it).
 pub const DENOISE_CHROMA_RADIUS_MAX: usize = 8;
 
-/// Accepted range per key: `(key, min, max)`. Keys whose value 0 means "off"
-/// or "automatic" (`ZERO_MEANS_OFF`) accept 0 in addition to the range.
-const RANGES: &[(&str, f64, f64)] = &[
-    ("wb_red_trim", 0.5, 2.0),
-    ("wb_blue_trim", 0.5, 2.0),
-    ("wb_fixed_rg", 0.1, 4.0),
-    ("wb_fixed_bg", 0.1, 4.0),
-    ("acm_strength", 0.0, 1.0),
-    ("skin_hue_lo", -180.0, 180.0),
-    ("skin_hue_hi", -180.0, 180.0),
-    ("skin_hue_soft", 0.5, 90.0),
-    ("skin_desat_k", 0.0, 1.5),
-    ("skin_hue_shift", -60.0, 60.0),
-    ("yellow_hue_lo", -180.0, 180.0),
-    ("yellow_hue_hi", -180.0, 180.0),
-    ("yellow_hue_soft", 0.5, 90.0),
-    ("yellow_desat_k", 0.0, 1.5),
-    ("saturation", 0.0, 2.0),
-    ("ae_target", 0.02, 0.6),
-    ("awb_lsc", 0.0, 1.0),
-    ("awb_locus_dist", 0.02, 0.5),
-    (
-        "denoise_chroma_radius",
-        1.0,
-        DENOISE_CHROMA_RADIUS_MAX as f64,
-    ),
-    ("denoise_chroma_strength", 0.01, 1.0),
-    ("debug_lsc", 0.0, 1.0),
-    ("debug_ccm", 0.0, 1.0),
-    ("debug_bands", 0.0, 1.0),
-    ("debug_denoise", 0.0, 1.0),
-    ("debug_lca", 0.0, 1.0),
-    ("debug_awb", 0.0, 1.0),
-    ("debug_awb_map", 0.0, 1.0),
-    ("debug_timing", 0.0, 1.0),
-    ("snapshot", 0.0, 1e9),
+/// How a key's value is read and shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// Any number in `min..=max`.
+    Number,
+    /// A whole number in `min..=max`.
+    Integer,
+    /// 0 or 1.
+    Switch,
+    /// 0 means automatic/off; otherwise a number in `min..=max`.
+    NumberOrAuto,
+    /// 0 means automatic/off; otherwise a whole number in `min..=max`.
+    IntegerOrAuto,
+}
+
+impl KeyKind {
+    /// 0 is accepted outside the range and means automatic/off.
+    pub fn zero_is_auto(self) -> bool {
+        matches!(self, KeyKind::NumberOrAuto | KeyKind::IntegerOrAuto)
+    }
+
+    /// Only whole numbers are accepted.
+    pub fn is_whole(self) -> bool {
+        matches!(
+            self,
+            KeyKind::Integer | KeyKind::Switch | KeyKind::IntegerOrAuto
+        )
+    }
+}
+
+/// Which section of the file (and of the tuning window) a key belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyGroup {
+    WhiteBalance,
+    Matrices,
+    Skin,
+    Yellow,
+    Colour,
+    Exposure,
+    Awb,
+    Denoise,
+    Debug,
+    Snapshot,
+}
+
+/// One key of the tuning file: the single source for the parser's checks and
+/// the tuning window's controls.
+#[derive(Debug, Clone, Copy)]
+pub struct KeySpec {
+    pub name: &'static str,
+    pub kind: KeyKind,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+    pub group: KeyGroup,
+}
+
+const fn key(
+    name: &'static str,
+    kind: KeyKind,
+    min: f64,
+    max: f64,
+    default: f64,
+    group: KeyGroup,
+) -> KeySpec {
+    KeySpec {
+        name,
+        kind,
+        min,
+        max,
+        default,
+        group,
+    }
+}
+
+use KeyGroup as G;
+use KeyKind as K;
+
+/// Every key of the tuning file, in file order. One line per key, so the
+/// table reads as a table.
+#[rustfmt::skip]
+pub const KEYS: &[KeySpec] = &[
+    key("wb_red_trim", K::Number, 0.5, 2.0, WB_RED_TRIM, G::WhiteBalance),
+    key("wb_blue_trim", K::Number, 0.5, 2.0, WB_BLUE_TRIM, G::WhiteBalance),
+    key("wb_fixed_rg", K::NumberOrAuto, 0.1, 4.0, 0.0, G::WhiteBalance),
+    key("wb_fixed_bg", K::NumberOrAuto, 0.1, 4.0, 0.0, G::WhiteBalance),
+    key("acm_strength", K::Number, 0.0, 1.0, 1.0, G::Matrices),
+    key("skin_hue_lo", K::Number, -180.0, 180.0, SKIN_HUE_LO, G::Skin),
+    key("skin_hue_hi", K::Number, -180.0, 180.0, SKIN_HUE_HI, G::Skin),
+    key("skin_hue_soft", K::Number, 0.5, 90.0, SKIN_HUE_SOFT, G::Skin),
+    key("skin_desat_k", K::Number, 0.0, 1.5, SKIN_DESAT_K, G::Skin),
+    key("skin_hue_shift", K::Number, -60.0, 60.0, SKIN_HUE_SHIFT, G::Skin),
+    key("yellow_hue_lo", K::Number, -180.0, 180.0, YELLOW_HUE_LO, G::Yellow),
+    key("yellow_hue_hi", K::Number, -180.0, 180.0, YELLOW_HUE_HI, G::Yellow),
+    key("yellow_hue_soft", K::Number, 0.5, 90.0, YELLOW_HUE_SOFT, G::Yellow),
+    key("yellow_desat_k", K::Number, 0.0, 1.5, YELLOW_DESAT_K, G::Yellow),
+    key("saturation", K::Number, 0.0, 2.0, 1.0, G::Colour),
+    key("ae_target", K::NumberOrAuto, 0.02, 0.6, 0.0, G::Exposure),
+    key("awb_lsc", K::Switch, 0.0, 1.0, AWB_LSC as u8 as f64, G::Awb),
+    key("awb_locus_dist", K::Number, 0.02, 0.5, AWB_LOCUS_MAX_DIST, G::Awb),
+    key("denoise_chroma_radius", K::IntegerOrAuto, 1.0, DENOISE_CHROMA_RADIUS_MAX as f64, 0.0, G::Denoise),
+    key("denoise_chroma_strength", K::NumberOrAuto, 0.01, 1.0, 0.0, G::Denoise),
+    key("debug_lsc", K::Switch, 0.0, 1.0, 1.0, G::Debug),
+    key("debug_ccm", K::Switch, 0.0, 1.0, 1.0, G::Debug),
+    key("debug_bands", K::Switch, 0.0, 1.0, 1.0, G::Debug),
+    key("debug_denoise", K::Switch, 0.0, 1.0, 1.0, G::Debug),
+    key("debug_lca", K::Switch, 0.0, 1.0, 1.0, G::Debug),
+    key("debug_awb", K::Switch, 0.0, 1.0, 0.0, G::Debug),
+    key("debug_awb_map", K::Switch, 0.0, 1.0, 0.0, G::Debug),
+    key("debug_timing", K::Switch, 0.0, 1.0, 0.0, G::Debug),
+    key("snapshot", K::Integer, 0.0, 1e9, 0.0, G::Snapshot),
 ];
 
-/// Keys that take only whole numbers (switches are 0 or 1).
-const INTEGER_KEYS: &[&str] = &[
-    "awb_lsc",
-    "denoise_chroma_radius",
-    "debug_lsc",
-    "debug_ccm",
-    "debug_bands",
-    "debug_denoise",
-    "debug_lca",
-    "debug_awb",
-    "debug_awb_map",
-    "debug_timing",
-    "snapshot",
-];
-
-const ZERO_MEANS_OFF: &[&str] = &[
-    "wb_fixed_rg",
-    "wb_fixed_bg",
-    "ae_target",
-    "denoise_chroma_radius",
-    "denoise_chroma_strength",
-];
+/// The spec of `name`, if it is a known key.
+pub fn key_spec(name: &str) -> Option<&'static KeySpec> {
+    KEYS.iter().find(|k| k.name == name)
+}
 
 impl ColourTuning {
     /// Parse a tuning file's text over the defaults. Unknown keys, malformed
@@ -233,17 +290,16 @@ impl ColourTuning {
                 .trim()
                 .parse()
                 .map_err(|_| format!("line {lineno}: {key}: not a number: {:?}", value.trim()))?;
-            let &(_, min, max) = RANGES
-                .iter()
-                .find(|(k, _, _)| *k == key)
-                .ok_or_else(|| format!("line {lineno}: unknown key {key:?}"))?;
-            let off = value == 0.0 && ZERO_MEANS_OFF.contains(&key);
-            if !off && !(min..=max).contains(&value) {
+            let spec =
+                key_spec(key).ok_or_else(|| format!("line {lineno}: unknown key {key:?}"))?;
+            let off = value == 0.0 && spec.kind.zero_is_auto();
+            if !off && !(spec.min..=spec.max).contains(&value) {
                 return Err(format!(
-                    "line {lineno}: {key} = {value} is outside {min}..{max}"
+                    "line {lineno}: {key} = {value} is outside {}..{}",
+                    spec.min, spec.max
                 ));
             }
-            if INTEGER_KEYS.contains(&key) && value.fract() != 0.0 {
+            if spec.kind.is_whole() && value.fract() != 0.0 {
                 return Err(format!(
                     "line {lineno}: {key} = {value} must be a whole number"
                 ));
@@ -281,7 +337,7 @@ impl ColourTuning {
                 "debug_awb_map" => t.debug.awb_map = on,
                 "debug_timing" => t.debug.timing = on,
                 "snapshot" => t.snapshot = value as u64,
-                _ => unreachable!("every key in RANGES is matched"),
+                _ => unreachable!("every key in KEYS is matched"),
             }
         }
         t.wb_fixed = match (fixed_rg > 0.0, fixed_bg > 0.0) {
@@ -456,17 +512,47 @@ mod tests {
         assert_eq!((t.awb_lsc, t.awb_locus_dist), (AWB_LSC, AWB_LOCUS_MAX_DIST));
     }
 
-    /// The shipped example lists every key at its default value.
+    /// The shipped example lists every key, each at its `KEYS` default, and
+    /// parses to `ColourTuning::default()`.
     #[test]
     fn example_file_is_the_defaults() {
         let text = include_str!("../packaging/colour.conf.example");
         assert_eq!(ColourTuning::parse(text).unwrap(), ColourTuning::default());
-        for (key, _, _) in RANGES {
-            assert!(
-                text.lines().any(|l| l.trim_start().starts_with(key)),
-                "example lacks {key}"
-            );
+        let value_of = |name: &str| -> f64 {
+            let line = text
+                .lines()
+                .map(|l| l.split('#').next().unwrap())
+                .find(|l| l.split('=').next().unwrap().trim() == name)
+                .unwrap_or_else(|| panic!("example lacks {name}"));
+            line.split('=').nth(1).unwrap().trim().parse().unwrap()
+        };
+        for k in KEYS {
+            assert_eq!(value_of(k.name), k.default, "{} default", k.name);
         }
+    }
+
+    /// A file of every key at its `KEYS` default is the built-in tuning, so
+    /// the table and `ColourTuning::default()` cannot drift apart.
+    #[test]
+    fn key_defaults_parse_to_the_built_in_tuning() {
+        let text: String = KEYS
+            .iter()
+            .map(|k| format!("{} = {}\n", k.name, k.default))
+            .collect();
+        assert_eq!(ColourTuning::parse(&text).unwrap(), ColourTuning::default());
+    }
+
+    #[test]
+    fn key_kinds_match_parser_rules() {
+        let kind = |n: &str| key_spec(n).unwrap().kind;
+        assert_eq!(kind("awb_lsc"), KeyKind::Switch);
+        assert_eq!(kind("denoise_chroma_radius"), KeyKind::IntegerOrAuto);
+        assert_eq!(kind("ae_target"), KeyKind::NumberOrAuto);
+        assert_eq!(kind("snapshot"), KeyKind::Integer);
+        assert!(key_spec("no_such_key").is_none());
+        assert!(ColourTuning::parse("awb_lsc = 0.5").is_err());
+        assert!(ColourTuning::parse("ae_target = 0").is_ok());
+        assert!(ColourTuning::parse("ae_target = 0.01").is_err());
     }
 
     #[test]
