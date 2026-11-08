@@ -5,8 +5,8 @@ use crate::colour::ColourTuning;
 use crate::raw::{RawFrame, H, MAXLIN, W};
 use crate::tuning;
 use crate::tuning_data::{
-    ACM, ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, CCM, CCM_CT, CCM_LOCUS, LCA_CELL_X, LCA_CELL_Y, LCA_GH,
-    LCA_GW, LSC_CHROMA, LSC_GH, LSC_GW, NUM_CCM,
+    ACM, ACM_HUE0, ACM_HUE_STEP, ACM_NSEC, AWB_LOCUS, CCM, CCM_CT, CCM_LOCUS, LCA_CELL_X,
+    LCA_CELL_Y, LCA_GH, LCA_GW, LSC_CHROMA, LSC_GH, LSC_GW, NUM_CCM,
 };
 
 #[cfg(feature = "video")]
@@ -182,11 +182,11 @@ const AWB_CLIP_FRACTION: f32 = 0.95;
 const AWB_MIN_SAMPLES: usize = 100;
 
 /// Maximum distance, in raw `(r/g, b/g)` chroma space, from a pixel's chroma to
-/// the calibrated white locus ([`CCM_LOCUS`]) for it to be trusted as a
+/// the white locus ([`locus_distance`]) for it to be trusted as a
 /// near-neutral AWB sample. Saturated colour objects (a yellow shirt, a green
 /// plant) sit well off the locus; without this gate they bias the gray-world
 /// median and impose a colour cast on genuinely neutral whites. The locus spans
-/// r/g 0.41..0.72 and b/g 0.37..0.69, so 0.12 admits real neutrals (plus sensor
+/// r/g 0.37..0.87 and b/g 0.31..0.71, so 0.12 admits real neutrals (plus sensor
 /// noise and a modest off-locus illuminant) while rejecting saturated colours,
 /// which land 0.3+ away. The gate is applied only in the two strictest masks;
 /// when too few near-locus pixels exist (an unusual illuminant) the ungated
@@ -661,17 +661,23 @@ fn estimate_cct(rg: f64, bg: f64) -> f64 {
     CCM_CT[i] as f64 * (1.0 - t) + CCM_CT[i + 1] as f64 * t
 }
 
-/// Minimum Euclidean distance from chromaticity `(rg, bg)` to the white-locus
-/// polyline ([`CCM_LOCUS`]), in raw `(r/g, b/g)` space. Mirrors the per-segment
-/// clamped projection of [`project_to_locus`] but returns the distance itself,
-/// used by the AWB near-neutral gate ([`AWB_LOCUS_MAX_DIST`]).
+/// Minimum Euclidean distance from chromaticity `(rg, bg)` to the white locus,
+/// in raw `(r/g, b/g)` space: the nearer of the CCM calibration polyline
+/// ([`CCM_LOCUS`], which kinks through two fluorescent sources) and the
+/// sensor's response to Planckian-like sources ([`AWB_LOCUS`], about
+/// 2300..7500 K). Mirrors the per-segment clamped projection of
+/// [`project_to_locus`] but returns the distance itself, used by the AWB
+/// near-neutral gate ([`AWB_LOCUS_MAX_DIST`]).
 fn locus_distance(rg: f64, bg: f64) -> f64 {
-    (0..NUM_CCM - 1)
-        .map(|i| {
-            let ax = CCM_LOCUS[i][0] as f64;
-            let ay = CCM_LOCUS[i][1] as f64;
-            let bx = CCM_LOCUS[i + 1][0] as f64;
-            let by = CCM_LOCUS[i + 1][1] as f64;
+    polyline_distance(&CCM_LOCUS, rg, bg).min(polyline_distance(&AWB_LOCUS, rg, bg))
+}
+
+/// Distance from `(rg, bg)` to a polyline, clamped per-segment projection.
+fn polyline_distance(line: &[[f32; 2]], rg: f64, bg: f64) -> f64 {
+    line.windows(2)
+        .map(|w| {
+            let (ax, ay) = (w[0][0] as f64, w[0][1] as f64);
+            let (bx, by) = (w[1][0] as f64, w[1][1] as f64);
             let abx = bx - ax;
             let aby = by - ay;
             let denom = abx * abx + aby * aby;
@@ -2198,6 +2204,17 @@ mod tests {
         let (rg, bg) = awb_measure(&p, &mut a, None, &t);
         assert!(rg.is_finite() && bg.is_finite() && rg > 0.0 && bg > 0.0);
         assert!(a.selection().iter().all(|&i| i < n));
+    }
+
+    /// A white under a ~2300 K lamp lies beyond the warm end of the CCM locus
+    /// (2963 K) but on the sensor's light-source locus, so the AWB gate admits
+    /// it; a saturated orange stays outside.
+    #[test]
+    fn warm_lamp_white_passes_the_locus_gate() {
+        let (rg, bg) = (AWB_LOCUS[0][0] as f64, AWB_LOCUS[0][1] as f64);
+        assert!(polyline_distance(&CCM_LOCUS, rg, bg) > AWB_LOCUS_MAX_DIST);
+        assert!(locus_distance(rg, bg) < 1e-9);
+        assert!(locus_distance(1.6, 0.25) > AWB_LOCUS_MAX_DIST);
     }
 
     /// The AWB statistics name the mask used and expose exactly its pixels.

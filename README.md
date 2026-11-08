@@ -192,6 +192,12 @@ Tuning is parsed from the camera's `.aiqb` tuning file:
   (strong vignetting). File [data/gc2607_lsc.npz](data/gc2607_lsc.npz).
 - **LCA** — lateral chromatic aberration shift grids (red/blue vs green).
   File [data/gc2607_lca.npz](data/gc2607_lca.npz).
+- **AWB locus** — the sensor's white response to 6 reference light sources,
+  about 2300..7500 K (CMC record 15). The AWB near-neutral gate measures the
+  distance to the nearer of this polyline and the CCM locus, so whites under a
+  warm lamp beyond 2963 K still count as neutral samples.
+  File [data/gc2607_awb_locus.json](data/gc2607_awb_locus.json), extracted by
+  [tools/extract_awb_locus.py](tools/extract_awb_locus.py).
 
 The tone curve is not extractable (parsed by Intel's closed parser), so a
 standard sRGB gamma is used.

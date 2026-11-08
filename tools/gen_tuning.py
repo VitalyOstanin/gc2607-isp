@@ -4,6 +4,7 @@
 Inputs (in ../data, relative to this script):
   gc2607_ccms.json  -- 5 CCMs with cct, chroma [r/g, b/g], ccm[9]
   gc2607_lsc.npz    -- LSC grids (5,4,47,63) float gain, chroma (5,2), scale
+  gc2607_awb_locus.json -- optional white response to 6 light sources (id=15)
 
 Outputs:
   ../src/tuning_data.rs  -- const arrays (CCT, locus, CCM, LSC chroma, dims)
@@ -104,6 +105,21 @@ def main():
         lines.append(f"    [{fmt_f32(rg)}, {fmt_f32(bg)}],")
     lines.append("];")
     lines.append("")
+    # Sensor white response to reference light sources (CMC id=15), warm to
+    # cool: a second white-locus polyline for the AWB gate, wider than the CCM
+    # calibration points (optional: only if extracted).
+    awb_path = os.path.join(DATA, "gc2607_awb_locus.json")
+    if os.path.exists(awb_path):
+        awb = json.load(open(awb_path))
+        lines.append("/// Sensor white response [r/g, b/g] to reference light sources, warm to")
+        lines.append("/// cool (about 2300..7500 K; CMC id=15). A second white locus for the AWB")
+        lines.append("/// gate, wider than the CCM calibration points.")
+        lines.append(f"pub const AWB_LOCUS: [[f32; 2]; {len(awb)}] = [")
+        for pt in awb:
+            rg, bg = pt["chroma"]
+            lines.append(f"    [{fmt_f32(rg)}, {fmt_f32(bg)}],")
+        lines.append("];")
+        lines.append("")
     lines.append("/// Colour-correction matrices (row-major 3x3), luminance-preserving.")
     lines.append("pub const CCM: [[f32; 9]; NUM_CCM] = [")
     for m in mats:

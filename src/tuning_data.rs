@@ -23,6 +23,18 @@ pub const CCM_LOCUS: [[f32; 2]; NUM_CCM] = [
     [0.408805013f32, 0.685534596f32],
 ];
 
+/// Sensor white response [r/g, b/g] to reference light sources, warm to
+/// cool (about 2300..7500 K; CMC id=15). A second white locus for the AWB
+/// gate, wider than the CCM calibration points.
+pub const AWB_LOCUS: [[f32; 2]; 6] = [
+    [0.869140625f32, 0.309570312f32],
+    [0.70703125f32, 0.36328125f32],
+    [0.54296875f32, 0.46875f32],
+    [0.469726562f32, 0.547851562f32],
+    [0.390625f32, 0.671875f32],
+    [0.369140625f32, 0.71484375f32],
+];
+
 /// Colour-correction matrices (row-major 3x3), luminance-preserving.
 pub const CCM: [[f32; 9]; NUM_CCM] = [
     [

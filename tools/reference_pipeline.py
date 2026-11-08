@@ -3,7 +3,7 @@
 
 This mirrors the validated PoC pipeline and is the numeric reference the Rust
 implementation must reproduce. Reads tuning from ../data (gc2607_ccms.json,
-gc2607_lsc.npz); takes a raw SGRBG10 frame.
+gc2607_lsc.npz, gc2607_awb_locus.json); takes a raw SGRBG10 frame.
 
 Pipeline: BLC(64) -> LSC(per Bayer channel, light source by scene chroma) ->
 robust-neutral AWB -> half-res debayer -> CCM(interp by CCT) -> sRGB gamma.
@@ -68,6 +68,24 @@ def locus_distance(rg, bg, locus):
     return best
 
 
+def load_awb_locus():
+    """Sensor white response to reference light sources (CMC id=15), warm to
+    cool; a second white-locus polyline for the AWB gate. Mirrors AWB_LOCUS in
+    the Rust tuning data. Empty when not extracted."""
+    path = os.path.join(DATA, "gc2607_awb_locus.json")
+    if not os.path.exists(path):
+        return np.zeros((0, 2))
+    return np.array([p["chroma"] for p in json.load(open(path))], dtype=np.float64)
+
+
+AWB_LOCUS = load_awb_locus()
+
+
+def awb_locus_distance(rg, bg, locus):
+    """Distance to the nearer of the CCM locus and AWB_LOCUS."""
+    return np.minimum(locus_distance(rg, bg, locus), locus_distance(rg, bg, AWB_LOCUS))
+
+
 def m_robust_neutral(rgb, locus):
     """Median chroma over bright, non-clipped pixels, with graceful fallbacks.
 
@@ -84,7 +102,7 @@ def m_robust_neutral(rgb, locus):
     # Per-pixel chroma; non-positive green is excluded by valid_g in every mask,
     # so its (irrelevant) distance is computed against a guarded denominator.
     gsafe = np.where(g > 0.0, g, 1.0)
-    near_locus = locus_distance(flat[:, 0] / gsafe, flat[:, 2] / gsafe, locus) <= AWB_LOCUS_MAX_DIST
+    near_locus = awb_locus_distance(flat[:, 0] / gsafe, flat[:, 2] / gsafe, locus) <= AWB_LOCUS_MAX_DIST
     for mask in (not_clipped & bright & valid_g & near_locus,
                  not_clipped & valid_g & near_locus,
                  not_clipped & bright & valid_g,
