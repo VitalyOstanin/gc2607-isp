@@ -8,6 +8,7 @@
 pub mod ae;
 pub mod colour;
 pub mod pipeline;
+pub mod presets;
 pub mod raw;
 pub mod recovery;
 pub mod tune_file;
