@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use gc2607_isp::colour::ColourTuning;
 use gc2607_isp::gpu::{DenoiseParams, GpuProcessor, OUT_H, OUT_W};
-use gc2607_isp::output::{denoise_chroma_yuyv, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv};
+use gc2607_isp::output::{
+    denoise_chroma_yuyv, limited_chroma, limited_luma, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv,
+};
 use gc2607_isp::pipeline::{self, DebayerMode, Processor};
 use gc2607_isp::raw;
 
@@ -98,6 +100,51 @@ fn gpu_yuyv_matches_cpu_mhc() {
         max_diff <= 4 && frac < 0.01,
         "GPU diverges from CPU MHC: max_diff={max_diff}, fraction |diff|>2 = {frac:.5}"
     );
+}
+
+/// The GPU limited-range pass maps every byte exactly as the CPU maps do: the
+/// first frame of a limited processor equals the first frame of a full-range
+/// one put through `limited_luma` / `limited_chroma`.
+#[test]
+fn gpu_limited_output_matches_cpu_range_maps() {
+    let _gpu = gpu_lock();
+    let raw_path = data("sample-raw.bin");
+    if !raw_path.exists() {
+        eprintln!("gpu: skipped (no local sample-raw.bin in tests/data/)");
+        return;
+    }
+    let bytes = std::fs::read(&raw_path).expect("raw");
+    let first_frame = |limited: bool| -> Option<Vec<u8>> {
+        let mut proc = match GpuProcessor::new(8, true) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("gpu: skipped (no usable Vulkan device: {e})");
+                return None;
+            }
+        };
+        proc.set_limited_output(limited);
+        Some(
+            proc.process(&bytes, DenoiseParams::default())
+                .expect("gpu process")
+                .to_vec(),
+        )
+    };
+    let (Some(full), Some(limited)) = (first_frame(false), first_frame(true)) else {
+        return;
+    };
+    let want: Vec<u8> = full
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if i % 2 == 0 {
+                limited_luma(v)
+            } else {
+                limited_chroma(v)
+            }
+        })
+        .collect();
+    let bad = limited.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert_eq!(bad, 0, "{bad} bytes differ from the CPU range maps");
 }
 
 /// With every run-time colour knob away from its default, the GPU shader and

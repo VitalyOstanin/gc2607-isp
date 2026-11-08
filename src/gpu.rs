@@ -591,6 +591,24 @@ fn temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     prev_y[p1] = y1;
     yuyv[idx] = (w & 0xFF00FF00u) | y0 | (y1 << 16u);
 }
+
+// Final pass when the output is limited range: map every byte of the packed
+// YUYV in place, after denoise (whose thresholds are in full-range codes).
+// Integer forms of output::limited_luma / limited_chroma, exact for every
+// byte: round(v * 219 / 255) + 16 and round(128 + (v - 128) * 224 / 255).
+fn lim_y(v: u32) -> u32 { return 16u + (v * 438u + 255u) / 510u; }
+fn lim_c(v: u32) -> u32 { return (v * 448u + 8191u) / 510u; }
+
+@compute @workgroup_size(64)
+fn to_limited(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= P.misc.y * P.out_dims.y) { return; }
+    let w = yuyv[idx];
+    yuyv[idx] = lim_y(w & 0xFFu)
+        | (lim_c((w >> 8u) & 0xFFu) << 8u)
+        | (lim_y((w >> 16u) & 0xFFu) << 16u)
+        | (lim_c(w >> 24u) << 24u);
+}
 "#;
 
 /// GPU-resident ISP for the live webcam path. Holds the device, both compute
@@ -680,6 +698,7 @@ pub struct GpuProcessor {
     chroma_h_pipeline: wgpu::ComputePipeline,
     chroma_v_pipeline: wgpu::ComputePipeline,
     temporal_pipeline: wgpu::ComputePipeline,
+    limited_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     raw_buf: wgpu::Buffer,
@@ -695,6 +714,9 @@ pub struct GpuProcessor {
     interval: u64,
     frame: u64,
     lca_on: bool,
+    // Whether the output is converted to limited range on the GPU (see
+    // `set_limited_output`).
+    limited: bool,
     // Whether temporal denoise ran on the previous frame, to seed the history
     // (reset) when it (re)starts after being off.
     temporal_was_on: bool,
@@ -747,6 +769,7 @@ struct Pipelines {
     chroma_h: wgpu::ComputePipeline,
     chroma_v: wgpu::ComputePipeline,
     temporal: wgpu::ComputePipeline,
+    limited: wgpu::ComputePipeline,
 }
 
 impl GpuProcessor {
@@ -773,6 +796,7 @@ impl GpuProcessor {
             chroma_h_pipeline: pipelines.chroma_h,
             chroma_v_pipeline: pipelines.chroma_v,
             temporal_pipeline: pipelines.temporal,
+            limited_pipeline: pipelines.limited,
             bind_group,
             params_buf: bufs.params,
             raw_buf: bufs.raw,
@@ -784,6 +808,7 @@ impl GpuProcessor {
             interval: awb_interval.max(1),
             frame: 0,
             lca_on: lca,
+            limited: false,
             temporal_was_on: false,
             est: None,
             chroma: None,
@@ -1082,6 +1107,7 @@ impl GpuProcessor {
             chroma_h: make_pipeline("chroma_h"),
             chroma_v: make_pipeline("chroma_v"),
             temporal: make_pipeline("temporal"),
+            limited: make_pipeline("to_limited"),
         };
         (bind_group, pipelines)
     }
@@ -1097,6 +1123,15 @@ impl GpuProcessor {
     }
 
     /// Apply a new run-time colour tuning from the next frame on.
+    /// Produce limited-range YCbCr (Y 16..235, C 16..240) instead of full
+    /// range, converted on the GPU after denoise. The frame can then go to a
+    /// limited-range loopback as a plain copy, without the per-byte table
+    /// pass on the CPU, which under a busy CPU cost about as much as the
+    /// whole GPU frame.
+    pub fn set_limited_output(&mut self, on: bool) {
+        self.limited = on;
+    }
+
     pub fn set_tuning(&mut self, tuning: ColourTuning) {
         self.tuning = tuning;
         self.force_estimate = true;
@@ -1336,6 +1371,15 @@ impl GpuProcessor {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.temporal_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(dn_groups, 1, 1);
+        }
+        if self.limited {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("to_limited"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.limited_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.dispatch_workgroups(dn_groups, 1, 1);
         }

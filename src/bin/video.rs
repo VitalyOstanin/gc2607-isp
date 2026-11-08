@@ -59,8 +59,9 @@ use gc2607_isp::ae::{self, AeConfig, AeState, HighlightConfig, HighlightGuard};
 use gc2607_isp::camera as cam_setup;
 use gc2607_isp::colour::{self, Poll, TuningWatcher};
 use gc2607_isp::output::{
-    denoise_chroma_yuyv, find_loopback_by_label, rgb_to_yuyv_crop, temporal_denoise_luma_yuyv,
-    tint_selection_yuyv, LoopbackOutput, PlaneMapping, YuvRange,
+    denoise_chroma_yuyv, expand_limited_yuyv, find_loopback_by_label, limited_luma,
+    rgb_to_yuyv_crop, temporal_denoise_luma_yuyv, tint_selection_yuyv, LoopbackOutput,
+    PlaneMapping, YuvRange,
 };
 use gc2607_isp::pipeline::{AwbStats, DebayerMode, Estimate, Processor};
 use gc2607_isp::recovery;
@@ -176,6 +177,20 @@ impl Engine {
             Engine::Cpu { proc, .. } => proc.awb_stats(),
             #[cfg(feature = "gpu")]
             Engine::Gpu(p) => p.awb_stats(),
+        }
+    }
+
+    /// Ask the engine to produce limited-range YUYV itself; returns whether it
+    /// does (the GPU backend converts after denoise, the CPU backend leaves it
+    /// to the loopback writer).
+    fn set_limited_output(&mut self, on: bool) -> bool {
+        match self {
+            Engine::Cpu { .. } => false,
+            #[cfg(feature = "gpu")]
+            Engine::Gpu(p) => {
+                p.set_limited_output(on);
+                true
+            }
         }
     }
 
@@ -767,6 +782,21 @@ fn srgb_to_linear_lut() -> &'static [f64; 256] {
     })
 }
 
+/// The same table for a limited-range Y byte (16..235 spans 0..1, clamped
+/// outside), for frames that leave the GPU already in limited range.
+fn limited_to_linear_lut() -> &'static [f64; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[f64; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f64; 256];
+        for (b, e) in t.iter_mut().enumerate() {
+            let v = ((b as f64 - 16.0) / 219.0).clamp(0.0, 1.0);
+            *e = gc2607_isp::pipeline::srgb_to_linear(v);
+        }
+        t
+    })
+}
+
 /// Mean *linear* luminance of a packed YUYV frame, as a fraction of full scale
 /// (0..1). Each sampled Y byte is mapped back through the inverse sRGB EOTF
 /// before averaging, so the result is mean scene luminance in linear light, not
@@ -788,8 +818,16 @@ fn srgb_to_linear_lut() -> &'static [f64; 256] {
 ///
 /// The same pass counts the samples at or above [`ae::CLIP_LEVEL`], returned
 /// as a fraction, for the highlight guard ([`ae::HighlightGuard`]).
-fn mean_linear_luma(yuyv: &[u8]) -> (f64, f64) {
-    let lut = srgb_to_linear_lut();
+///
+/// `limited` says the frame is already in limited range (converted on the
+/// GPU); the table and the clip level are then taken in that range, so the
+/// result is the same as metering the full-range frame.
+fn mean_linear_luma(yuyv: &[u8], limited: bool) -> (f64, f64) {
+    let (lut, clip_level) = if limited {
+        (limited_to_linear_lut(), limited_luma(ae::CLIP_LEVEL))
+    } else {
+        (srgb_to_linear_lut(), ae::CLIP_LEVEL)
+    };
     let mut sum = 0f64;
     let mut n = 0u64;
     let mut clipped = 0u64;
@@ -797,7 +835,7 @@ fn mean_linear_luma(yuyv: &[u8]) -> (f64, f64) {
     while i < yuyv.len() {
         let y = yuyv[i]; // Y of every fourth pixel (2 bytes/px, step 8)
         sum += lut[y as usize];
-        clipped += u64::from(y >= ae::CLIP_LEVEL);
+        clipped += u64::from(y >= clip_level);
         n += 1;
         i += 8;
     }
@@ -1172,9 +1210,14 @@ fn main() {
     let (mut engine, dst_w, dst_h) = build_engine(&args);
     let mut out = LoopbackOutput::open(&args.device, dst_w as u32, dst_h as u32, args.yuv_range)
         .unwrap_or_else(|e| panic!("open loopback {}: {e}", args.device));
-    let range = match args.yuv_range {
-        YuvRange::Limited => "limited",
-        YuvRange::Full => "full",
+    // A limited-range output is converted on the GPU when there is one, so
+    // the frame goes to the loopback as a plain copy.
+    let converted = out.is_limited() && engine.set_limited_output(true);
+    out.set_source_converted(converted);
+    let range = match (args.yuv_range, converted) {
+        (YuvRange::Limited, true) => "limited (converted on the GPU)",
+        (YuvRange::Limited, false) => "limited",
+        (YuvRange::Full, _) => "full",
     };
     println!(
         "output: {} {dst_w}x{dst_h} YUYV, {range} range",
@@ -1380,11 +1423,16 @@ fn process_and_write(
                     dn.chroma_strength,
                     dn.temporal_alpha,
                 );
+                // Snapshots are full range, whatever range the output has.
+                let mut snap_yuyv = live.frame.clone();
+                if out.source_converted() {
+                    expand_limited_yuyv(&mut snap_yuyv);
+                }
                 spawn_snapshot(
                     live.snapshot_dir.clone(),
                     Snapshot {
                         raw: buf.to_vec(),
-                        yuyv: live.frame.clone(),
+                        yuyv: snap_yuyv,
                         w,
                         h,
                         info,
@@ -1406,7 +1454,7 @@ fn process_and_write(
                 Err(e) => return FrameOutcome::Skipped(e.to_string()),
             }
         };
-        let (luma, clipped) = mean_linear_luma(yuyv);
+        let (luma, clipped) = mean_linear_luma(yuyv, out.source_converted());
         let t_write = Instant::now();
         let written = out.write_frame(yuyv, timestamp_ns);
         live.timing.write.add(t_write.elapsed());

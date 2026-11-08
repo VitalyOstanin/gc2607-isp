@@ -50,6 +50,44 @@ pub enum YuvRange {
     Full,
 }
 
+/// Full-range luma byte to limited range: `round(v * 219 / 255) + 16`, in
+/// integers (the GPU `to_limited` pass uses the same form). No input lands on
+/// a tie, so this equals the rounded real value for every byte.
+pub fn limited_luma(v: u8) -> u8 {
+    (16 + (v as u32 * 438 + 255) / 510) as u8
+}
+
+/// Full-range chroma byte to limited range: `round(128 + (v - 128) * 224 /
+/// 255)`, in integers, like [`limited_luma`].
+pub fn limited_chroma(v: u8) -> u8 {
+    ((v as u32 * 448 + 8191) / 510) as u8
+}
+
+/// Limited-range luma byte back to full range (clamped), for diagnostics on a
+/// frame converted on the GPU.
+pub fn full_luma(v: u8) -> u8 {
+    ((v as f32 - 16.0) * 255.0 / 219.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+/// Limited-range chroma byte back to full range (clamped).
+pub fn full_chroma(v: u8) -> u8 {
+    (128.0 + (v as f32 - 128.0) * 255.0 / 224.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+/// Expand a limited-range YUYV frame to full range in place (Y at even
+/// offsets, Cb/Cr at odd ones). Lossy by at most one code; used for snapshots
+/// of a frame that left the GPU already in limited range.
+pub fn expand_limited_yuyv(yuyv: &mut [u8]) {
+    for p in yuyv.as_chunks_mut::<2>().0 {
+        p[0] = full_luma(p[0]);
+        p[1] = full_chroma(p[1]);
+    }
+}
+
 /// Full-range to limited-range byte maps, for luma and for chroma.
 struct RangeLuts {
     y: [u8; 256],
@@ -60,10 +98,9 @@ impl RangeLuts {
     fn limited() -> RangeLuts {
         let mut y = [0u8; 256];
         let mut c = [0u8; 256];
-        for v in 0..256 {
-            let f = v as f32;
-            y[v] = (16.0 + f * 219.0 / 255.0).round() as u8;
-            c[v] = (128.0 + (f - 128.0) * 224.0 / 255.0).round() as u8;
+        for v in 0..=255u8 {
+            y[v as usize] = limited_luma(v);
+            c[v as usize] = limited_chroma(v);
         }
         RangeLuts { y, c }
     }
@@ -334,6 +371,9 @@ pub struct LoopbackOutput {
     free: Vec<u32>,
     /// Range maps when the output is limited range; `None` copies as is.
     luts: Option<Box<RangeLuts>>,
+    /// Frames arrive already in the output range (converted on the GPU), so
+    /// they are copied as is even into a limited-range output.
+    source_converted: bool,
 }
 
 impl LoopbackOutput {
@@ -443,7 +483,25 @@ impl LoopbackOutput {
             buffers,
             free,
             luts: (range == YuvRange::Limited).then(|| Box::new(RangeLuts::limited())),
+            source_converted: false,
         })
+    }
+
+    /// Whether this output expects limited-range frames (and converts
+    /// full-range ones itself unless [`Self::set_source_converted`] is on).
+    pub fn is_limited(&self) -> bool {
+        self.luts.is_some()
+    }
+
+    /// Declare that the frames handed to [`Self::write_frame`] are already in
+    /// the output range, so they are copied without conversion.
+    pub fn set_source_converted(&mut self, on: bool) {
+        self.source_converted = on;
+    }
+
+    /// Whether frames are expected already in the output range.
+    pub fn source_converted(&self) -> bool {
+        self.source_converted
     }
 
     /// Frame size in bytes (YUYV: 2 bytes per pixel).
@@ -521,8 +579,8 @@ impl LoopbackOutput {
             &mut std::slice::from_raw_parts_mut(mb.ptr.as_ptr() as *mut u8, mb.len)[..yuyv.len()]
         };
         match &self.luts {
-            Some(l) => copy_limited(dst, yuyv, l),
-            None => dst.copy_from_slice(yuyv),
+            Some(l) if !self.source_converted => copy_limited(dst, yuyv, l),
+            _ => dst.copy_from_slice(yuyv),
         }
 
         let mut qb = V4l2Buffer {
@@ -1037,6 +1095,28 @@ mod tests {
     /// The limited-range maps hit the studio-range end points and keep the
     /// chroma zero, and the parallel copy maps every Y and C byte by parity
     /// (chunk boundaries included).
+    /// The integer range maps equal the rounded real formulas for every byte,
+    /// and expanding back is within one code.
+    #[test]
+    fn limited_range_integer_maps_are_exact() {
+        for v in 0..=255u8 {
+            let f = v as f64;
+            assert_eq!(
+                limited_luma(v),
+                (16.0 + f * 219.0 / 255.0).round() as u8,
+                "y {v}"
+            );
+            assert_eq!(
+                limited_chroma(v),
+                (128.0 + (f - 128.0) * 224.0 / 255.0).round() as u8,
+                "c {v}"
+            );
+            assert!(full_luma(limited_luma(v)).abs_diff(v) <= 1, "y {v}");
+            assert!(full_chroma(limited_chroma(v)).abs_diff(v) <= 1, "c {v}");
+        }
+        assert_eq!((full_luma(0), full_luma(255)), (0, 255));
+    }
+
     #[test]
     fn limited_range_copy_maps_y_and_c() {
         let l = RangeLuts::limited();
