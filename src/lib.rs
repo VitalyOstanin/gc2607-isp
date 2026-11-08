@@ -23,6 +23,9 @@ pub mod output;
 pub mod sensor;
 #[cfg(feature = "video")]
 pub mod snapshot;
+// Live view for the tuning window: V4L2 capture from the loopback node.
+#[cfg(feature = "tune")]
+pub mod v4l2_capture;
 
 // GPU backend (wgpu / Vulkan): per-pixel ISP stages as compute shaders. Gated to
 // keep the host build dependency-light when not used.

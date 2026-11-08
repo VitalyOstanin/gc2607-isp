@@ -34,9 +34,9 @@ const V4L2_FIELD_NONE: u32 = 1;
 /// `V4L2_COLORSPACE_SRGB`.
 const V4L2_COLORSPACE_SRGB: u32 = 8;
 /// `V4L2_QUANTIZATION_FULL_RANGE` (full-range YCbCr, matches our sRGB output).
-const V4L2_QUANTIZATION_FULL_RANGE: u32 = 1;
+pub(crate) const V4L2_QUANTIZATION_FULL_RANGE: u32 = 1;
 /// `V4L2_QUANTIZATION_LIM_RANGE` (Y 16..235, Cb/Cr 16..240).
-const V4L2_QUANTIZATION_LIM_RANGE: u32 = 2;
+pub(crate) const V4L2_QUANTIZATION_LIM_RANGE: u32 = 2;
 
 /// YCbCr range of the frames written to the loopback. The pipeline always
 /// produces full-range BT.601; with `Limited` the bytes are rescaled to the
@@ -129,30 +129,43 @@ fn copy_limited(dst: &mut [u8], src: &[u8], luts: &RangeLuts) {
 /// `struct v4l2_pix_format` (uapi/linux/videodev2.h), 48 bytes on all ABIs.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct V4l2PixFormat {
-    width: u32,
-    height: u32,
-    pixelformat: u32,
-    field: u32,
-    bytesperline: u32,
-    sizeimage: u32,
-    colorspace: u32,
-    private: u32,
-    flags: u32,
-    enc: u32, // union { ycbcr_enc; hsv_enc }
-    quantization: u32,
-    xfer_func: u32,
+pub(crate) struct V4l2PixFormat {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pixelformat: u32,
+    pub(crate) field: u32,
+    pub(crate) bytesperline: u32,
+    pub(crate) sizeimage: u32,
+    pub(crate) colorspace: u32,
+    pub(crate) private: u32,
+    pub(crate) flags: u32,
+    pub(crate) enc: u32, // union { ycbcr_enc; hsv_enc }
+    pub(crate) quantization: u32,
+    pub(crate) xfer_func: u32,
 }
 
 /// `struct v4l2_format`. The kernel's `fmt` union is 8-aligned (it contains
 /// `v4l2_window`, which has pointers) and starts at offset 8; the whole struct
 /// is 208 bytes on 64-bit. `pix` is the first union member.
 #[repr(C, align(8))]
-struct V4l2Format {
-    type_: u32,
+pub(crate) struct V4l2Format {
+    pub(crate) type_: u32,
     _pad: u32,
-    pix: V4l2PixFormat,
+    pub(crate) pix: V4l2PixFormat,
     _tail: [u8; 152],
+}
+
+impl V4l2Format {
+    /// A zeroed format of buffer type `type_`, ready for `VIDIOC_G_FMT`.
+    #[cfg(feature = "tune")]
+    pub(crate) fn zeroed(type_: u32) -> Self {
+        V4l2Format {
+            type_,
+            _pad: 0,
+            pix: V4l2PixFormat::default(),
+            _tail: [0; 152],
+        }
+    }
 }
 
 // VIDIOC_S_FMT = _IOWR('V', 5, struct v4l2_format)
@@ -169,25 +182,25 @@ nix::ioctl_readwrite!(vidioc_s_fmt, b'V', 5, V4l2Format);
 // v4l2loopback supports only V4L2_MEMORY_MMAP for buffers (USERPTR is rejected).
 
 /// `V4L2_MEMORY_MMAP`.
-const V4L2_MEMORY_MMAP: u32 = 1;
+pub(crate) const V4L2_MEMORY_MMAP: u32 = 1;
 
 /// `struct v4l2_requestbuffers` (uapi videodev2.h), 20 bytes on 64-bit.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct V4l2RequestBuffers {
-    count: u32,
-    type_: u32,
-    memory: u32,
-    capabilities: u32,
-    flags: u8,
-    reserved: [u8; 3],
+pub(crate) struct V4l2RequestBuffers {
+    pub(crate) count: u32,
+    pub(crate) type_: u32,
+    pub(crate) memory: u32,
+    pub(crate) capabilities: u32,
+    pub(crate) flags: u8,
+    pub(crate) reserved: [u8; 3],
 }
 
 /// `struct timeval` as embedded in `v4l2_buffer` (64-bit kernel ABI: both fields
 /// are `__kernel_long_t`/`__kernel_suseconds_t`, 8 bytes each).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct V4l2Timeval {
+pub(crate) struct V4l2Timeval {
     tv_sec: i64,
     tv_usec: i64,
 }
@@ -195,7 +208,7 @@ struct V4l2Timeval {
 /// `struct v4l2_timecode` (uapi videodev2.h), 16 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct V4l2Timecode {
+pub(crate) struct V4l2Timecode {
     type_: u32,
     flags: u32,
     frames: u8,
@@ -211,20 +224,20 @@ struct V4l2Timecode {
 /// trailing pad; the offsets are asserted below against the kernel layout.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct V4l2Buffer {
-    index: u32,
-    type_: u32,
-    bytesused: u32,
-    flags: u32,
-    field: u32,
-    timestamp: V4l2Timeval,
-    timecode: V4l2Timecode,
-    sequence: u32,
-    memory: u32,
-    m: u64,
-    length: u32,
-    reserved2: u32,
-    request_fd: u32,
+pub(crate) struct V4l2Buffer {
+    pub(crate) index: u32,
+    pub(crate) type_: u32,
+    pub(crate) bytesused: u32,
+    pub(crate) flags: u32,
+    pub(crate) field: u32,
+    pub(crate) timestamp: V4l2Timeval,
+    pub(crate) timecode: V4l2Timecode,
+    pub(crate) sequence: u32,
+    pub(crate) memory: u32,
+    pub(crate) m: u64,
+    pub(crate) length: u32,
+    pub(crate) reserved2: u32,
+    pub(crate) request_fd: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<V4l2RequestBuffers>() == 20);
