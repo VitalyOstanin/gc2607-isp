@@ -55,7 +55,7 @@ use libcamera::{
     stream::Stream,
 };
 
-use gc2607_isp::ae::{self, AeConfig, AeState};
+use gc2607_isp::ae::{self, AeConfig, AeState, HighlightConfig, HighlightGuard};
 use gc2607_isp::camera as cam_setup;
 use gc2607_isp::colour::{self, Poll, TuningWatcher};
 use gc2607_isp::output::{
@@ -380,6 +380,7 @@ fn poll_tuning(
     watcher: &mut TuningWatcher,
     engine: &mut Engine,
     ae_cfg: &mut AeConfig,
+    hl_cfg: &mut HighlightConfig,
     live: &mut LiveDebug,
     args: &Args,
 ) {
@@ -389,6 +390,10 @@ fn poll_tuning(
             let t = *t;
             println!("colour tuning ({source}): {t}");
             ae_cfg.target = t.ae_target.unwrap_or(args.target);
+            *hl_cfg = HighlightConfig {
+                clip_max: t.ae_clip_max,
+                floor: t.ae_clip_floor,
+            };
             if live.snapshot_seen.is_some_and(|s| s != t.snapshot) && t.snapshot != 0 {
                 live.snapshot_pending = true;
             }
@@ -780,20 +785,26 @@ fn srgb_to_linear_lut() -> &'static [f64; 256] {
 /// the inverse is applied to the BT.601 luma byte rather than to R, G, B
 /// separately (the YUYV frame carries only luma); for a scalar AE metric this is
 /// a standard, monotonic approximation of scene luminance.
-fn mean_linear_luma(yuyv: &[u8]) -> f64 {
+///
+/// The same pass counts the samples at or above [`ae::CLIP_LEVEL`], returned
+/// as a fraction, for the highlight guard ([`ae::HighlightGuard`]).
+fn mean_linear_luma(yuyv: &[u8]) -> (f64, f64) {
     let lut = srgb_to_linear_lut();
     let mut sum = 0f64;
     let mut n = 0u64;
+    let mut clipped = 0u64;
     let mut i = 0;
     while i < yuyv.len() {
-        sum += lut[yuyv[i] as usize]; // Y of every fourth pixel (2 bytes/px, step 8)
+        let y = yuyv[i]; // Y of every fourth pixel (2 bytes/px, step 8)
+        sum += lut[y as usize];
+        clipped += u64::from(y >= ae::CLIP_LEVEL);
         n += 1;
         i += 8;
     }
     if n == 0 {
-        0.0
+        (0.0, 0.0)
     } else {
-        sum / n as f64
+        (sum / n as f64, clipped as f64 / n as f64)
     }
 }
 
@@ -1266,10 +1277,11 @@ fn queue_initial(session: &mut cam_setup::Session<'_>) {
 /// Outcome of processing and writing one frame (see `process_and_write`).
 enum FrameOutcome {
     /// Written to the loopback. Carries the output mean linear luminance (the AE
-    /// control variable; see [`mean_linear_luma`]) and the applied denoise
-    /// strengths (chroma radius and strength, temporal alpha).
+    /// control variable; see [`mean_linear_luma`]), the clipped fraction and the
+    /// applied denoise strengths (chroma radius and strength, temporal alpha).
     Written {
         luma: f64,
+        clipped: f64,
         chroma_radius: usize,
         chroma_strength: f64,
         temporal_alpha: f64,
@@ -1394,13 +1406,14 @@ fn process_and_write(
                 Err(e) => return FrameOutcome::Skipped(e.to_string()),
             }
         };
-        let luma = mean_linear_luma(yuyv);
+        let (luma, clipped) = mean_linear_luma(yuyv);
         let t_write = Instant::now();
         let written = out.write_frame(yuyv, timestamp_ns);
         live.timing.write.add(t_write.elapsed());
         match written {
             Ok(()) => FrameOutcome::Written {
                 luma,
+                clipped,
                 chroma_radius: dn.chroma_radius,
                 chroma_strength: dn.chroma_strength,
                 temporal_alpha: dn.temporal_alpha,
@@ -1511,7 +1524,16 @@ fn run_live(
     // every TUNING_POLL so an edited file takes effect during a call.
     let mut tuning = TuningWatcher::new(&args.colour_config);
     let mut live = LiveDebug::new(args);
-    poll_tuning(&mut tuning, engine, &mut ae_cfg, &mut live, args);
+    let mut hl_cfg = HighlightConfig::default();
+    let mut guard = HighlightGuard::default();
+    poll_tuning(
+        &mut tuning,
+        engine,
+        &mut ae_cfg,
+        &mut hl_cfg,
+        &mut live,
+        args,
+    );
     let mut last_tuning_poll = Instant::now();
 
     let mut frames = 0u64;
@@ -1525,6 +1547,8 @@ fn run_live(
     let mut report_frames = 0u64;
     // Last metered output mean linear luminance (0..1), for the telemetry line.
     let mut last_luma = 0f64;
+    // Last metered clipped fraction (0..1), for the telemetry line.
+    let mut last_clipped = 0f64;
     // Last applied denoise strengths, for the telemetry line. (The temporal
     // history and any scratch now live inside the engine; see `Engine::process`.)
     let mut last_dn = 0usize;
@@ -1622,6 +1646,7 @@ fn run_live(
         // (see `process_and_write`). The output luma is metered inside as the AE
         // control variable; denoise is a no-op at low gain (the common case).
         let mut luma = None;
+        let mut clipped = 0f64;
         let processed = match process_and_write(
             engine,
             out,
@@ -1636,11 +1661,13 @@ fn run_live(
         ) {
             FrameOutcome::Written {
                 luma: m,
+                clipped: c,
                 chroma_radius,
                 chroma_strength,
                 temporal_alpha,
             } => {
                 luma = Some(m);
+                clipped = c;
                 last_dn = chroma_radius;
                 last_ds = chroma_strength;
                 last_ta = temporal_alpha;
@@ -1664,12 +1691,20 @@ fn run_live(
             // AE from this frame's output luma, with apply-delay settling.
             if let Some(m) = luma {
                 last_luma = m;
+                last_clipped = clipped;
             }
             if args.ae {
                 if ae_hold > 0 {
                     ae_hold -= 1;
                 } else if let (Some(m), Some(s)) = (luma, sensor) {
-                    let next = ae::step(&ae_cfg, *state, m);
+                    // The guard reads the frame metered at the settled state,
+                    // like the step itself.
+                    let scale = guard.update(&hl_cfg, *state, m, clipped);
+                    let cfg = AeConfig {
+                        target: ae_cfg.target * scale,
+                        ..ae_cfg
+                    };
+                    let next = ae::step(&cfg, *state, m);
                     if next != *state {
                         if let Err(e) = s.apply(next) {
                             // Don't kill the stream on a transient subdev write
@@ -1698,7 +1733,20 @@ fn run_live(
         }
 
         if last_tuning_poll.elapsed() >= TUNING_POLL {
-            poll_tuning(&mut tuning, engine, &mut ae_cfg, &mut live, args);
+            let hl_before = hl_cfg;
+            poll_tuning(
+                &mut tuning,
+                engine,
+                &mut ae_cfg,
+                &mut hl_cfg,
+                &mut live,
+                args,
+            );
+            // New protection settings start from the full target, not from a
+            // factor and ceiling reached under the old ones.
+            if hl_cfg != hl_before {
+                guard = HighlightGuard::default();
+            }
             last_tuning_poll = Instant::now();
         }
 
@@ -1716,10 +1764,12 @@ fn run_live(
             };
             println!(
                 "{frames} frames, {fps:.1} fps processed, {dropped} dropped, {errors} errors, \
-                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, denoise_r={last_dn}, denoise_s={last_ds:.2}, temporal_a={last_ta:.2}, {colour}",
+                 exposure={} gain_idx={} ({:.1} fps sensor), Ylin={last_luma:.3}, clip={:.1}% ae_scale={:.2}, denoise_r={last_dn}, denoise_s={last_ds:.2}, temporal_a={last_ta:.2}, {colour}",
                 state.exposure,
                 state.gain_index,
                 ae::frame_rate(state.vblank),
+                100.0 * last_clipped,
+                guard.scale(),
             );
             if live.tuning.debug.awb {
                 println!("{}", awb_line(&engine.awb_stats()));

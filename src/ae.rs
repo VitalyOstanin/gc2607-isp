@@ -245,9 +245,266 @@ pub fn step(cfg: &AeConfig, state: AeState, metric: f64) -> AeState {
     next
 }
 
+/// Output luma code at or above which a sample counts as clipped (full-range
+/// 8-bit output, so 255 is white; a few codes of margin catch highlights the
+/// tone curve has already flattened).
+pub const CLIP_LEVEL: u8 = 250;
+
+/// Highlight protection settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HighlightConfig {
+    /// Largest tolerated fraction of clipped samples (0 disables the guard).
+    pub clip_max: f64,
+    /// Lowest factor the guard may apply to the AE target.
+    pub floor: f64,
+}
+
+/// Default largest tolerated clipped fraction.
+pub const CLIP_MAX: f64 = 0.02;
+/// Default lowest target factor of the highlight guard: 0.36 goes no lower
+/// than about 0.22, where a face still reads well in daylight.
+pub const CLIP_FLOOR: f64 = 0.6;
+
+impl Default for HighlightConfig {
+    fn default() -> Self {
+        HighlightConfig {
+            clip_max: CLIP_MAX,
+            floor: CLIP_FLOOR,
+        }
+    }
+}
+
+/// Per-decision factor by which the guard lowers the target while too much
+/// of the frame is clipped.
+const GUARD_DOWN: f64 = 0.92;
+/// Per-decision factor by which the guard gives the target back once the
+/// highlights are well clear; slower than the descent.
+const GUARD_UP: f64 = 1.02;
+/// The guard releases only below this share of `clip_max`; between it and
+/// `clip_max` the factor holds (hysteresis).
+const GUARD_RELEASE: f64 = 0.25;
+/// Per-decision growth of the release ceiling: about +8 % a minute at 25
+/// decisions a second. In a scene that keeps clipping, the release tries one
+/// step brighter about once a minute; one that stopped clipping (a white
+/// shirt left the frame) regains the full target within several minutes.
+const CEILING_RELAX: f64 = 1.00005;
+/// A scene this much darker (same exposure, lower metric) than the one that
+/// clipped lifts the release ceiling at once.
+const SCENE_DARKER: f64 = 0.7;
+
+/// Highlight protection: lowers the AE target while more than `clip_max` of
+/// the frame is clipped, down to `floor` times the target, and gives it back
+/// slowly once the clipped share falls well below the limit. A face-weighted
+/// target such as 0.36 suits a dim room but burns a white shirt or a window
+/// in daylight; this keeps the brighter target where it is harmless.
+///
+/// The AE deadband moves the exposure in steps of at least 12 %, and in a
+/// scene with a large bright area one such step can carry the clipped share
+/// from above the limit to below the release level. Giving the target back
+/// would then clip again and pump. The guard therefore remembers the factor
+/// at which the frame last clipped and releases only to just below it; that
+/// ceiling lifts slowly with time, and at once when the scene gets darker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HighlightGuard {
+    scale: f64,
+    /// Factor at which the frame last clipped; the release stops one
+    /// `GUARD_DOWN` step below it. `1 / GUARD_DOWN` means no limit.
+    ceiling: f64,
+    /// Scene brightness (metric per unit exposure-gain product) when the
+    /// frame last clipped.
+    clip_scene: f64,
+}
+
+impl Default for HighlightGuard {
+    fn default() -> Self {
+        HighlightGuard {
+            scale: 1.0,
+            ceiling: 1.0 / GUARD_DOWN,
+            clip_scene: 0.0,
+        }
+    }
+}
+
+impl HighlightGuard {
+    /// The factor currently applied to the AE target (`floor..=1`).
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Update the factor from the frame metered at `state`: its clipped
+    /// fraction and its brightness `metric`. Returns the new factor.
+    pub fn update(
+        &mut self,
+        cfg: &HighlightConfig,
+        state: AeState,
+        metric: f64,
+        clipped: f64,
+    ) -> f64 {
+        let floor = cfg.floor.clamp(0.0, 1.0);
+        if cfg.clip_max <= 0.0 {
+            *self = HighlightGuard::default();
+            return 1.0;
+        }
+        let product = state.exposure as f64 * GAIN_TABLE[state.gain_index as usize];
+        let scene = metric / product.max(1.0);
+        if clipped > cfg.clip_max {
+            self.ceiling = self.scale.min(self.ceiling);
+            self.clip_scene = scene;
+            self.scale = (self.scale * GUARD_DOWN).max(floor);
+        } else if clipped < cfg.clip_max * GUARD_RELEASE {
+            let open = 1.0 / GUARD_DOWN;
+            self.ceiling = if scene < self.clip_scene * SCENE_DARKER {
+                open
+            } else {
+                (self.ceiling * CEILING_RELAX).min(open)
+            };
+            let cap = (self.ceiling * GUARD_DOWN).min(1.0);
+            if self.scale < cap {
+                self.scale = (self.scale * GUARD_UP).min(cap);
+            }
+        }
+        self.scale = self.scale.max(floor);
+        self.scale
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ST: AeState = AeState {
+        exposure: 600,
+        gain_index: 0,
+        vblank: VBLANK_MIN,
+    };
+
+    #[test]
+    fn guard_lowers_target_down_to_the_floor() {
+        let cfg = HighlightConfig::default();
+        let mut g = HighlightGuard::default();
+        for _ in 0..100 {
+            g.update(&cfg, ST, 0.36, 0.12);
+        }
+        assert!((g.scale() - cfg.floor).abs() < 1e-12, "{g:?}");
+    }
+
+    #[test]
+    fn guard_holds_inside_the_hysteresis_band() {
+        let cfg = HighlightConfig::default();
+        let mut g = HighlightGuard::default();
+        g.update(&cfg, ST, 0.36, 0.05);
+        g.update(&cfg, ST, 0.36, 0.05);
+        let s = g.scale();
+        assert!(s < 1.0);
+        // Between clip_max / 4 and clip_max the factor holds.
+        for clipped in [0.006, 0.01, 0.02] {
+            assert_eq!(g.update(&cfg, ST, 0.36, clipped), s, "{clipped}");
+        }
+    }
+
+    #[test]
+    fn guard_releases_below_the_factor_that_clipped() {
+        let cfg = HighlightConfig::default();
+        let mut g = HighlightGuard::default();
+        // Clips at full target, then at 0.92; settles one step lower.
+        g.update(&cfg, ST, 0.36, 0.05);
+        g.update(&cfg, ST, 0.33, 0.05);
+        let clipped_at = 0.92;
+        for _ in 0..50 {
+            g.update(&cfg, ST, 0.30, 0.0);
+        }
+        let cap = clipped_at * GUARD_DOWN;
+        assert!(g.scale() <= cap * CEILING_RELAX.powi(50) + 1e-12, "{g:?}");
+        assert!(g.scale() > cap * 0.99, "{g:?}");
+    }
+
+    #[test]
+    fn guard_ceiling_lifts_with_time() {
+        let cfg = HighlightConfig::default();
+        let mut g = HighlightGuard::default();
+        for _ in 0..100 {
+            g.update(&cfg, ST, 0.36, 0.2);
+        }
+        let mut steps = 0;
+        while g.scale() < 1.0 {
+            // Same scene (same metric at the same exposure), clear of clipping.
+            g.update(&cfg, ST, 0.36, 0.0);
+            steps += 1;
+            assert!(steps < 50_000, "{g:?}");
+        }
+        // Minutes at 25 decisions a second, not a few frames.
+        assert!(steps > 1_000, "{steps}");
+    }
+
+    #[test]
+    fn guard_releases_at_once_when_the_scene_darkens() {
+        let cfg = HighlightConfig::default();
+        let mut g = HighlightGuard::default();
+        for _ in 0..100 {
+            g.update(&cfg, ST, 0.36, 0.2);
+        }
+        let mut steps = 0;
+        while g.scale() < 1.0 {
+            // Same exposure, half the brightness: the light went down.
+            g.update(&cfg, ST, 0.18, 0.0);
+            steps += 1;
+        }
+        assert!(steps < 40, "{steps}");
+    }
+
+    #[test]
+    fn guard_off_keeps_the_target() {
+        let cfg = HighlightConfig {
+            clip_max: 0.0,
+            ..HighlightConfig::default()
+        };
+        let mut g = HighlightGuard::default();
+        assert_eq!(g.update(&cfg, ST, 0.36, 0.9), 1.0);
+    }
+
+    /// Run the guarded loop in a scene where a bright area clips as the
+    /// exposure grows; `clipped_at` maps the metric to the clipped share.
+    fn run_guarded(clipped_at: impl Fn(f64) -> f64) -> Vec<(AeState, f64, f64)> {
+        let ae_cfg = AeConfig {
+            target: 0.36,
+            ..AeConfig::default()
+        };
+        let hl = HighlightConfig::default();
+        let k = 0.36 / 900.0; // metric = k * product
+        let mut g = HighlightGuard::default();
+        let mut st = AeState::default();
+        let mut history = Vec::new();
+        for _ in 0..1000 {
+            let product = st.exposure as f64 * GAIN_TABLE[st.gain_index as usize];
+            let m = (k * product).min(1.0);
+            let scale = g.update(&hl, st, m, clipped_at(m));
+            let cfg = AeConfig {
+                target: ae_cfg.target * scale,
+                ..ae_cfg
+            };
+            st = step(&cfg, st, m);
+            history.push((st, m, clipped_at(m)));
+        }
+        history
+    }
+
+    #[test]
+    fn guarded_loop_settles_in_a_steeply_clipping_scene() {
+        // One AE step carries the clipped share across the whole hysteresis
+        // band: the ceiling must stop the loop from pumping.
+        let h = run_guarded(|m| (0.25 * (m / 0.36 - 0.7) / 0.3).clamp(0.0, 0.25));
+        let tail = &h[h.len() - 300..];
+        assert!(tail.iter().all(|s| s.0 == tail[0].0), "{:?}", &tail[..5]);
+        assert!(tail[0].1 < 0.36 * 0.9, "metric {}", tail[0].1);
+        assert!(tail[0].2 <= 0.02, "clipped {}", tail[0].2);
+    }
+
+    #[test]
+    fn guarded_loop_keeps_the_target_without_highlights() {
+        let h = run_guarded(|_| 0.0);
+        let m = h.last().unwrap().1;
+        assert!((m / 0.36 - 1.0).abs() <= 0.12, "metric {m}");
+    }
 
     #[test]
     fn gain_table_anchors() {

@@ -15,6 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::ae::{CLIP_FLOOR, CLIP_MAX};
 use crate::pipeline::{
     AWB_LOCUS_MAX_DIST, AWB_LSC, SATURATION, SKIN_DESAT_K, SKIN_HUE_HI, SKIN_HUE_LO,
     SKIN_HUE_SHIFT, SKIN_HUE_SOFT, WB_BLUE_TRIM, WB_RED_TRIM, YELLOW_DESAT_K, YELLOW_HUE_HI,
@@ -59,6 +60,11 @@ pub struct ColourTuning {
     pub saturation: f64,
     /// AE target in linear light, or `None` to keep the command-line value.
     pub ae_target: Option<f64>,
+    /// Largest tolerated fraction of clipped output samples before the AE
+    /// target is lowered (0 disables the highlight guard).
+    pub ae_clip_max: f64,
+    /// Lowest factor the highlight guard may apply to the AE target.
+    pub ae_clip_floor: f64,
     /// Measure the AWB on lens-shading corrected planes (off: on the raw
     /// planes, where the vignetting lets the frame centre decide alone).
     pub awb_lsc: bool,
@@ -139,6 +145,8 @@ impl Default for ColourTuning {
             },
             saturation: SATURATION,
             ae_target: None,
+            ae_clip_max: CLIP_MAX,
+            ae_clip_floor: CLIP_FLOOR,
             awb_lsc: AWB_LSC,
             awb_locus_dist: AWB_LOCUS_MAX_DIST,
             denoise_chroma_radius: None,
@@ -250,6 +258,8 @@ pub const KEYS: &[KeySpec] = &[
     key("yellow_desat_k", K::Number, 0.0, 1.5, YELLOW_DESAT_K, G::Yellow),
     key("saturation", K::Number, 0.0, 2.0, SATURATION, G::Colour),
     key("ae_target", K::NumberOrAuto, 0.02, 0.6, 0.0, G::Exposure),
+    key("ae_clip_max", K::Number, 0.0, 0.5, CLIP_MAX, G::Exposure),
+    key("ae_clip_floor", K::Number, 0.3, 1.0, CLIP_FLOOR, G::Exposure),
     key("awb_lsc", K::Switch, 0.0, 1.0, AWB_LSC as u8 as f64, G::Awb),
     key("awb_locus_dist", K::Number, 0.02, 0.5, AWB_LOCUS_MAX_DIST, G::Awb),
     key("denoise_chroma_radius", K::IntegerOrAuto, 1.0, DENOISE_CHROMA_RADIUS_MAX as f64, 0.0, G::Denoise),
@@ -322,6 +332,8 @@ impl ColourTuning {
                 "yellow_desat_k" => t.yellow.k = value,
                 "saturation" => t.saturation = value,
                 "ae_target" => t.ae_target = (!off).then_some(value),
+                "ae_clip_max" => t.ae_clip_max = value,
+                "ae_clip_floor" => t.ae_clip_floor = value,
                 "awb_lsc" => t.awb_lsc = on,
                 "awb_locus_dist" => t.awb_locus_dist = value,
                 "denoise_chroma_radius" => {
@@ -384,6 +396,11 @@ impl fmt::Display for ColourTuning {
             self.yellow.soft,
             self.yellow.k,
             self.saturation,
+        )?;
+        write!(
+            f,
+            " clip_max={:.3} clip_floor={:.2}",
+            self.ae_clip_max, self.ae_clip_floor
         )?;
         write!(
             f,

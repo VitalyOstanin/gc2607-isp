@@ -40,6 +40,13 @@ saturation = 1.15       # 0..2
 # Auto-exposure target in linear light; 0 keeps the --target value (0.15).
 ae_target = 0           # 0 or 0.02..0.6
 
+# Highlight protection: while more than ae_clip_max of the frame is clipped
+# (output luma 250 and above), the AE target is lowered step by step, down to
+# ae_clip_floor times the target; it comes back slowly once the highlights
+# clear. ae_clip_max = 0 turns the protection off.
+ae_clip_max = 0.02      # 0..0.5
+ae_clip_floor = 0.6     # 0.3..1
+
 # Auto white balance. awb_lsc = 1 measures on lens-shading corrected planes,
 # so the vignetting no longer leaves the frame centre to decide alone.
 # awb_locus_dist is how far from the white locus (raw r/g, b/g) a pixel may lie
