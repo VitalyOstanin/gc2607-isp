@@ -20,6 +20,9 @@ pub mod tuning_data;
 // keep the offline ISP std-only.
 #[cfg(feature = "video")]
 pub mod output;
+// Power-saver profile hold while a consumer captures (power-profiles-daemon).
+#[cfg(feature = "video")]
+pub mod power_hold;
 #[cfg(feature = "video")]
 pub mod sensor;
 #[cfg(feature = "video")]

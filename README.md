@@ -435,6 +435,7 @@ ffplay -f v4l2 /dev/video0
 | `--colour-config <path>` | `/etc/gc2607-isp/colour.conf` | run-time colour tuning file, re-read on every change (see [Run-time colour tuning](#run-time-colour-tuning)). An absent file means the built-in tuning. |
 | `--snapshot-dir <dir>` | `/var/lib/gc2607-isp/snapshots` | where debug snapshots are written (see [Run-time colour tuning](#run-time-colour-tuning)). |
 | `--full-range` | off (limited range) | write full-range YCbCr (Y 0..255) instead of the default limited range (Y 16..235, Cb/Cr 16..240). Chromium-based capture (browsers, Electron call clients) reads YUYV as limited range whatever the device declares, so full-range output shows there with ~16% more contrast, crushed shadows and stronger saturation. |
+| `--no-power-hold` | off (hold on) | do not hold the power-saver profile while an application captures. By default the service asks power-profiles-daemon (`powerprofilesctl launch`) for power-saver for as long as a consumer streams: on mains power the package otherwise reaches its thermal limit during a call and the integrated GPU stalls long enough to drop frames. The hold ends with the capture, when the service stops, or when the profile is switched by hand. |
 
 Performance (Core Ultra 185H): `mhc` sustains the sensor's 30 fps at 8 threads
 (~29 at 4); `half` reaches 30 fps at 4 threads (~27 single-threaded). The

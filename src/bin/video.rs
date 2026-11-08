@@ -33,11 +33,14 @@
 //!   gc2607-video [--device /dev/videoN] [--device-label <name>] [--backend cpu|gpu]
 //!                [--debayer half|mhc] [--no-ae] [--target <0..1>] [--max-gain <idx>]
 //!                [--min-fps <fps>] [--threads <n>] [--on-demand auto|on|off]
-//!                [--measure-delay] [--full-range]
+//!                [--measure-delay] [--full-range] [--no-power-hold]
 //!
 //! The YUYV output is limited range (Y 16..235) by default: Chromium-based
 //! capture reads YUYV as limited range whatever the device declares.
 //! `--full-range` writes full-range YCbCr (Y 0..255) instead.
+//!
+//! While an application captures, the power-saver profile is held through
+//! power-profiles-daemon (see `power_hold`); `--no-power-hold` turns that off.
 
 use std::collections::VecDeque;
 use std::io;
@@ -64,6 +67,7 @@ use gc2607_isp::output::{
     PlaneMapping, YuvRange,
 };
 use gc2607_isp::pipeline::{AwbStats, DebayerMode, Estimate, Processor};
+use gc2607_isp::power_hold::PowerHold;
 use gc2607_isp::recovery;
 use gc2607_isp::sensor::Sensor;
 use gc2607_isp::snapshot::{self, Snapshot};
@@ -491,6 +495,7 @@ struct Args {
     colour_config: String,
     snapshot_dir: String,
     yuv_range: YuvRange,
+    power_hold: bool,
 }
 
 fn parse_args() -> Args {
@@ -532,6 +537,8 @@ fn parse_args() -> Args {
     let mut colour_config = colour::DEFAULT_PATH.to_string();
     // Where debug snapshots go (see `snapshot` in the tuning file, SIGUSR1).
     let mut snapshot_dir = "/var/lib/gc2607-isp/snapshots".to_string();
+    // Hold the power-saver profile while a consumer captures (see power_hold).
+    let mut power_hold = true;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -575,6 +582,7 @@ fn parse_args() -> Args {
             },
             "--no-ae" => ae = false,
             "--no-lca" => lca = false,
+            "--no-power-hold" => power_hold = false,
             "--no-denoise" => denoise = 0.0,
             "--denoise" => {
                 denoise = it
@@ -630,7 +638,8 @@ fn parse_args() -> Args {
                      [--denoise <scale>] [--no-temporal] [--temporal <scale>] \
                      [--target <0..1>] [--max-gain <idx>] [--min-fps <fps>] \
                      [--threads <n>] [--on-demand auto|on|off] [--measure-delay] \
-                     [--colour-config <path>] [--snapshot-dir <dir>] [--full-range]"
+                     [--colour-config <path>] [--snapshot-dir <dir>] [--full-range] \
+                     [--no-power-hold]"
                 );
                 std::process::exit(0);
             }
@@ -668,6 +677,7 @@ fn parse_args() -> Args {
         colour_config,
         snapshot_dir,
         yuv_range,
+        power_hold,
     }
 }
 
@@ -1937,6 +1947,7 @@ fn run_on_demand(
         px[1] = 128;
     }
 
+    let mut power = PowerHold::power_saver(args.power_hold);
     loop {
         println!(
             "on-demand: camera idle (standby, camera off), waiting for a consumer on {}",
@@ -1961,6 +1972,7 @@ fn run_on_demand(
         }
 
         println!("on-demand: consumer connected, starting camera");
+        power.acquire();
 
         // Keep a live session going for as long as this consumer stays. Only a
         // session that produced no frames counts toward the failure bound, so a
@@ -2000,6 +2012,7 @@ fn run_on_demand(
                 }
             }
         };
+        power.release();
 
         if !keep_running {
             return false;
